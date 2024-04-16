@@ -6,8 +6,7 @@
 static void
 c_rng_random_byte(mrbc_vm *vm, mrbc_value *v, int argc)
 {
-  rng_random_byte();
-  SET_RETURN(*v);
+  SET_INT_RETURN(rng_random_byte());
 }
 
 void
