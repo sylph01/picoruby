@@ -174,9 +174,13 @@ main(void)
     /* Own USB servicing exclusively here: disable the USB IRQ so its
      * tud_task() can't reenter ours (tud_task is not reentrant). */
     irq_set_enabled(USBCTRL_IRQ, false);
+    gpio_init(25); gpio_set_dir(25, GPIO_OUT);
     bool dumped = false;
+    uint32_t hb = 0;
     for (;;) {
       tud_task();
+      /* FAST blink = "in main() keepalive" (mrb_task_run returned). */
+      if (((++hb) & 0x7fffu) == 0) { gpio_xor_mask(1u << 25); }
       if (!dumped && tud_cdc_connected()) {
         const char *hdr = "\r\n[TZ] boot task exited; VM halted.\r\n";
         picorb_hal_write(1, hdr, strlen(hdr));
