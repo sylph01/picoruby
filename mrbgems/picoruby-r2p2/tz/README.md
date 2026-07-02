@@ -206,10 +206,16 @@ All bootrom NS APIs default to *disabled*. The monitor enables exactly:
    otherwise) → regenerate the monitor UF2 → concatenate monitor+NS UF2s
    into `R2P2-TZ-combined.uf2` (UF2 blocks are self-addressing, one
    BOOTSEL drop flashes both).
-4. **Partition table** with the FS partition marked NS_R/NS_W; embedded via
-   `pico_embed_pt_in_binary` / picotool ("partition-table-in-image boot",
-   §5.1.14 — the table rides in the monitor image, loaded as the resident
-   table that `checked_flash_op` validates against). Still TODO.
+4. **Partition table** (`monitor/r2p2_tz_pt.json`, embedded via
+   `pico_embed_pt_in_binary` — "partition-table-in-image boot", §5.1.14).
+   Two partitions: `firmware` (0–0x340000, `nonsecure:""` so NS cannot
+   reflash the monitor/NS image; accepts both `rp2350-arm-s` and
+   `rp2350-arm-ns` families so the combined UF2 drop routes both halves)
+   and `fs` (0x340000–end, `nonsecure:"rw"` — what makes `flash_ns.c`'s NS
+   writes accepted by `checked_flash_op`). The table rides in the monitor
+   image, loaded as the resident table `checked_flash_op` validates
+   against. **On-target TODO:** confirm the combined-UF2 family routing and
+   `partition info` on real silicon (this dev picotool lacks the subcommand).
 5. Boot: bootrom verifies the monitor image + enters it (S) → monitor
    SHA-256-verifies the NS region against `.ns_manifest` (dev builds with
    an unpatched manifest skip this) → derives keys from OTP + ratchets
