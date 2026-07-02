@@ -14,9 +14,13 @@ function(r2p2_apply_tz_ns TARGET)
     )
 
     # Strong overrides for the __weak stages that must behave differently
-    # in NS (early resets / clocks / post-clock resets).
+    # in NS (early resets / clocks / post-clock resets), plus the
+    # link-level pico_rand replacement (TRNG is Secure-only; rand_ns.c
+    # backs get_rand_* with the sg_random_bytes veneer, which transitively
+    # fixes picoruby-rng, pico_mbedtls entropy, and lwIP's RNG).
     target_sources(${TARGET} PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/runtime_init_ns.c
+        ${CMAKE_CURRENT_LIST_DIR}/rand_ns.c
     )
 
     target_include_directories(${TARGET} PRIVATE
@@ -38,6 +42,7 @@ function(r2p2_apply_tz_ns TARGET)
     #    signing with the monitor, partition table with the FS partition
     #    marked NS_R/NS_W.
     #  - gem source substitutions for the TZ build (see tz/README.md
-    #    "NS build: gem impact"): rng, flash HALs, mbedtls entropy,
-    #    machine sleep paths; exclude psg/pitchdetector.
+    #    "NS build: gem impact"): flash HALs (checked_flash_op), machine
+    #    sleep paths; exclude psg/pitchdetector. (rng/mbedtls/lwIP rand
+    #    needs are already covered by rand_ns.c above.)
 endfunction()

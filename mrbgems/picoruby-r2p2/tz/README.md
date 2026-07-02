@@ -234,13 +234,13 @@ Gems that must change (or go) to fit the security model:
 | Gem | Impact | What changes |
 |-----|--------|--------------|
 | `picoruby-machine` | **modify** | `Machine.deep_sleep`/`sleep` touch XOSC/ROSC dormancy, CLOCKS, VREG/POWMAN — all Secure-only → `sg_deep_sleep()` veneer (phase 2) or disabled. `Machine.using_usb?`-style paths, unique-id via bootrom `get_sys_info` (NS API enabled) keep working. `Machine.read_memory` of Secure addresses now SecureFaults (hardware-enforced; consider removing anyway for UX). Time-of-day via `pico_aon_timer` sits on POWMAN (Secure-only) → needs an `sg_time_*` veneer or NS timekeeping on TIMER0 — open decision. |
-| `picoruby-rng` | **modify** | `get_rand_32()` → RP2350 TRNG, which is Secure-only and faults from NS. TZ build calls `sg_random_bytes()` instead (the fresh non-TZ fix stays for stock builds). |
+| `picoruby-rng` | unchanged | keeps calling `get_rand_32()`; the NS image replaces `pico_rand` itself at link level (`ns/rand_ns.c` backs `get_rand_*` with `sg_random_bytes()` — the TRNG is Secure-only and would fault from NS) |
 | `picoruby-filesystem-fat` | **modify** | `flash_disk.c` `flash_range_program/erase` → bootrom `checked_flash_op` NS API (validated against the NS_W partition). |
 | `picoruby-littlefs` | **modify** | same change in `flash_hal.c` |
-| `picoruby-mbedtls` | **modify** | `mbedtls_hardware_poll` → `get_rand_64` → TRNG faults from NS; re-point at `sg_random_bytes()`. Raw-key `Cipher` API unchanged by design. |
+| `picoruby-mbedtls` | unchanged | `mbedtls_hardware_poll` → `get_rand_64` is covered by the `ns/rand_ns.c` override; raw-key `Cipher` API unchanged by design |
 | `picoruby-psg` | **cut (phase 1)** | runs its driver on core 1; NS cannot launch core 1 until `sg_launch_core1_ns()` exists (phase 2) |
 | `picoruby-pitchdetector` | **audit/cut** | ADC+DMA fine per se; cut with psg if it shares the core-1 pattern |
-| `picoruby-cyw43` / `-net` / `-socket` / `-ble` (pico2_w) | **defer/audit** | driver itself uses PIO/DMA/GPIO (all NS-granted incl. NSMASK bits), but lwIP/mbedTLS pull `pico_rand` → TRNG fault. Needs an NS `get_rand_*` replacement backed by `sg_random_bytes()` (link-level override), then re-audit. Phase 1 targets plain pico2. |
+| `picoruby-cyw43` / `-net` / `-socket` / `-ble` (pico2_w) | **defer/audit** | driver itself uses PIO/DMA/GPIO (all NS-granted incl. NSMASK bits); the lwIP/mbedTLS `pico_rand`→TRNG hazard is covered by the `ns/rand_ns.c` override. Remaining: general audit. Phase 1 targets plain pico2. |
 | `picoruby-watchdog` | unchanged | WATCHDOG NS-granted; tick already running (monitor) |
 | `picoruby-gpio/-uart/-i2c/-spi/-adc/-pwm/-pio/-irq/-usb-hid/-io-console` | unchanged | peripherals NS-granted, IRQs in ITNS |
 | shell / require / sandbox / VM gems | unchanged | pure software |
