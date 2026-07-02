@@ -16,6 +16,12 @@ set (R2P2_REVISION  ${CMAKE_REVISION})
 
 project("${R2P2_NAME}-${R2P2_VERSION}-${R2P2_BOARD_NAME}-${R2P2_BUILDDATE}-${R2P2_REVISION}")
 
+# Non-secure half of a TrustZone-split R2P2 (RP2350 / pico2 only). See
+# ${R2P2_GEM_DIR}/tz/README.md. When ON, the runtime-init/rand/flash
+# overrides, the NS linker script, and the monitor's veneer implib are
+# applied via tz/ns/ns_build.cmake (near the end of this file).
+option(R2P2_TRUSTZONE "Build the Non-secure half of a TrustZone-split R2P2 (pico2)" OFF)
+
 add_compile_options(-Wall
   # int != int32_t as far as the compiler is concerned because gcc has int32_t as long int
   -Wno-format
@@ -82,6 +88,14 @@ if(PICORB_VM_MRUBYC)
   list(REMOVE_ITEM SOURCE_FILES ${REMOVE_MRUBY_SRCS})
 endif()
 
+# NOTE: psg/pitchdetector cannot simply be cut by dropping their port .c
+# here — their Ruby-binding src/*.c is compiled into libmruby.a and
+# references the port symbols (psg_drv_*, PSG_tick_start_core1), so removing
+# the ports breaks the link. They therefore stay compiled in the NS build;
+# their core-1 launch will fault at runtime until the sg_launch_core1_ns
+# veneer exists (phase 2). Truly excluding them needs a TZ-specific mruby
+# build_config that drops the gems from the VM. See tz/README.md.
+
 add_executable(${PROJECT_NAME}
   ${SOURCE_FILES}
 )
@@ -142,7 +156,11 @@ if(PICO_BOARD STREQUAL "pico" OR PICO_BOARD STREQUAL "pico_w")
   set(PICORB_STACK_SIZE 0x1000) # 4KB
 elseif(PICO_BOARD STREQUAL "pico2" OR PICO_BOARD STREQUAL "pico2_w")
   set(PICORB_STACK_SIZE 0x2000) # 8KB
-  pico_set_linker_script(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/memmap_rp2350.ld)
+  # The TZ build uses its own NS linker script (set in ns_build.cmake);
+  # skip the default one here.
+  if(NOT R2P2_TRUSTZONE)
+    pico_set_linker_script(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/memmap_rp2350.ld)
+  endif()
 endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
@@ -248,6 +266,15 @@ target_include_directories(${PROJECT_NAME} PRIVATE
   ${PICORUBY_ROOT}/mrbgems/picoruby-net/include
   ${EXTRA_INCLUDE_DIR}
 )
+
+if(R2P2_TRUSTZONE)
+  if(NOT (PICO_BOARD STREQUAL "pico2"))
+    message(FATAL_ERROR "R2P2_TRUSTZONE is pico2-only in phase 1 (RP2350 Arm, non-WiFi)")
+  endif()
+  # NS runtime-init/rand/flash overrides, NS linker script, veneer implib.
+  include(${R2P2_GEM_DIR}/tz/ns/ns_build.cmake)
+  r2p2_apply_tz_ns(${PROJECT_NAME})
+endif()
 
 pico_add_extra_outputs(${PROJECT_NAME})
 

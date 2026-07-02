@@ -13,9 +13,9 @@
  *    monitor's RAM. Main striped SRAM (512 KiB) stays entirely NS, so the
  *    VM heap does not shrink.
  *  - Core 1 stack moves from SCRATCH_X into main RAM, directly below the
- *    core 0 stack. SDK .scratch_x.*/.scratch_y.* input sections are
- *    remapped to main RAM (their per-bank placement was a contention
- *    optimization, not a correctness requirement).
+ *    core 0 stack. SDK scratch_x/scratch_y input sections are remapped to
+ *    main RAM (their per-bank placement was a contention optimization, not
+ *    a correctness requirement).
  *  - The NS image links the monitor's CMSE import library
  *    (r2p2_sg_implib.o) to reach the sg_* veneers at 0x1000f000.
  */

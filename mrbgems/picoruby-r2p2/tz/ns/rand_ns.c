@@ -14,11 +14,15 @@
  * so satisfying the pico/rand.h API here fixes every gem at once with zero
  * gem-source changes.
  *
- * Link mechanics: this file is a direct source of the firmware target
- * (see ns_build.cmake), so its symbol definitions win — the linker only
- * pulls pico_rand's rand.o out of the archive for symbols still
- * undefined, and there are none. No weak-symbol tricks needed; the
- * `pico_rand` entry in target_link_libraries can even stay.
+ * Link mechanics: pico_rand is an SDK INTERFACE library, so its rand.c is
+ * injected as a PEER OBJECT of the executable (not an archive member) — a
+ * plain redefinition would collide ("multiple definition of get_rand_*").
+ * So we use the linker --wrap mechanism (the same one the SDK itself uses
+ * for the AEABI double routines): ns_build.cmake passes
+ * -Wl,--wrap=get_rand_32/64/128, which redirects every caller to the
+ * __wrap_* functions below. The real get_rand_* (still defined in rand.c)
+ * become unreferenced and are dropped by --gc-sections, taking the
+ * Secure-only TRNG path out of the NS image entirely.
  *
  * Cost: one boundary crossing per call (~10^2 cycles); the expensive TRNG
  * conditioning is amortized Secure-side by pico_rand's xoroshiro state.
@@ -32,19 +36,19 @@
 
 #include "../include/r2p2_sg_api.h"
 
-void get_rand_128(rng_128_t *rand128) {
+void __wrap_get_rand_128(rng_128_t *rand128) {
     int rc = sg_random_bytes((uint8_t *)rand128->r, sizeof rand128->r);
     hard_assert(rc == SG_OK);
 }
 
-uint64_t get_rand_64(void) {
+uint64_t __wrap_get_rand_64(void) {
     uint64_t v;
     int rc = sg_random_bytes((uint8_t *)&v, sizeof v);
     hard_assert(rc == SG_OK);
     return v;
 }
 
-uint32_t get_rand_32(void) {
+uint32_t __wrap_get_rand_32(void) {
     uint32_t v;
     int rc = sg_random_bytes((uint8_t *)&v, sizeof v);
     hard_assert(rc == SG_OK);

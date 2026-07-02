@@ -1,7 +1,13 @@
 # TrustZone-partitioned R2P2 (RP2350) — design sketch
 
-Status: **sketch; the monitor builds and links** (SDK 2.2.0, arm-none-eabi-gcc 14.2 — see monitor/CMakeLists.txt). The NS R2P2 build is not wired up yet. This directory holds the shared contract
-between the two firmware images of a Secure/Non-secure split R2P2:
+Status: **sketch; both images build and link** (SDK 2.2.0, arm-none-eabi-gcc
+14.2). The Secure monitor builds standalone (`monitor/CMakeLists.txt`); the
+Non-secure R2P2 builds via `rake r2p2:picoruby:pico2:prod` with
+`R2P2_TRUSTZONE=1` (see `ns/ns_build.cmake`), linking the monitor's veneer
+implib. Neither image is bootable yet — the combined-image signing,
+`EXE_SECURITY=NS` marking, and partition table are still TODO. This
+directory holds the shared contract between the two firmware images of a
+Secure/Non-secure split R2P2:
 
 - `include/r2p2_sg_api.h` — the Secure Gateway (veneer) API, compiled into
   both images
@@ -198,6 +204,26 @@ All bootrom NS APIs default to *disabled*. The monitor enables exactly:
    bootrom NS APIs above → sets VTOR_NS/MSP_NS + NSACR (NS FPU) → `blxns`
    into the NS reset handler. See `monitor/main.c`.
 
+## Building (both images)
+
+```sh
+# 1. Secure monitor (standalone) — produces r2p2_sg_implib.o
+cd mrbgems/picoruby-r2p2/tz/monitor
+PICO_SDK_PATH=/path/to/pico-sdk cmake -B build -S . && cmake --build build
+
+# 2. Non-secure R2P2 — links the implib from step 1
+cd <picoruby root>
+R2P2_TRUSTZONE=1 \
+  PICO_SDK_PATH=/path/to/pico-sdk \
+  PICO_EXTRAS_PATH=/path/to/pico-extras \
+  rake r2p2:picoruby:pico2:prod
+# artifacts in build/r2p2/picoruby/pico2/prod-tz/
+```
+
+`R2P2_TRUSTZONE=1` defaults `R2P2_TZ_IMPLIB` to the monitor's standalone
+build output; set it explicitly to point elsewhere. The rake task appends a
+`-tz` suffix to the build dir so TZ and stock artifacts coexist. pico2 only.
+
 ## Secure boot enable (OTP, irreversible — datasheet §10.5)
 
 For reference, the production one-time procedure: program ≥1 public key
@@ -234,12 +260,12 @@ Gems that must change (or go) to fit the security model:
 | Gem | Impact | What changes |
 |-----|--------|--------------|
 | `picoruby-machine` | **modify** | `Machine.deep_sleep`/`sleep` touch XOSC/ROSC dormancy, CLOCKS, VREG/POWMAN — all Secure-only → `sg_deep_sleep()` veneer (phase 2) or disabled. `Machine.using_usb?`-style paths, unique-id via bootrom `get_sys_info` (NS API enabled) keep working. `Machine.read_memory` of Secure addresses now SecureFaults (hardware-enforced; consider removing anyway for UX). Time-of-day via `pico_aon_timer` sits on POWMAN (Secure-only) → needs an `sg_time_*` veneer or NS timekeeping on TIMER0 — open decision. |
-| `picoruby-rng` | unchanged | keeps calling `get_rand_32()`; the NS image replaces `pico_rand` itself at link level (`ns/rand_ns.c` backs `get_rand_*` with `sg_random_bytes()` — the TRNG is Secure-only and would fault from NS) |
-| `picoruby-filesystem-fat` | unchanged | keeps calling `flash_range_program/erase`; the NS image replaces them at link level (`ns/flash_ns.c` → bootrom `checked_flash_op`, partition-checked against NS_W, + `sg_flash_flush_cache()` since the ROM op does no cache maintenance and the ROM flush is Arm-S-only) |
+| `picoruby-rng` | unchanged | keeps calling `get_rand_32()`; the NS image redirects `get_rand_*` to `sg_random_bytes()` via linker `--wrap` (`ns/rand_ns.c` — the TRNG is Secure-only and would fault from NS) |
+| `picoruby-filesystem-fat` | unchanged | keeps calling `flash_range_program/erase`; the NS image `--wrap`s them (`ns/flash_ns.c` → bootrom `checked_flash_op`, partition-checked against NS_W, + `sg_flash_flush_cache()` since the ROM op does no cache maintenance and the ROM flush is Arm-S-only). NB: this gem's ports are excluded from the non-WiFi build anyway (littlefs is used) — the wrap covers whichever HAL is compiled. |
 | `picoruby-littlefs` | unchanged | same coverage via `ns/flash_ns.c` |
-| `picoruby-mbedtls` | unchanged | `mbedtls_hardware_poll` → `get_rand_64` is covered by the `ns/rand_ns.c` override; raw-key `Cipher` API unchanged by design |
-| `picoruby-psg` | **cut (phase 1)** | runs its driver on core 1; NS cannot launch core 1 until `sg_launch_core1_ns()` exists (phase 2) |
-| `picoruby-pitchdetector` | **audit/cut** | ADC+DMA fine per se; cut with psg if it shares the core-1 pattern |
+| `picoruby-mbedtls` | unchanged | `mbedtls_hardware_poll` → `get_rand_64` is covered by the `get_rand_*` `--wrap`; raw-key `Cipher` API unchanged by design |
+| `picoruby-psg` | compiles; runtime-limited | its Ruby-binding `src/psg.c` is compiled into `libmruby.a` and references the port symbols, so the ports **cannot** be dropped at the R2P2-CMake level without a link error. Left compiled; its core-1 launch will fault at runtime until `sg_launch_core1_ns()` exists (phase 2). Truly excluding it needs a TZ-specific mruby build_config that drops the gem from the VM. |
+| `picoruby-pitchdetector` | compiles; runtime-limited | same coupling as psg |
 | `picoruby-cyw43` / `-net` / `-socket` / `-ble` (pico2_w) | **defer/audit** | driver itself uses PIO/DMA/GPIO (all NS-granted incl. NSMASK bits); the lwIP/mbedTLS `pico_rand`→TRNG hazard is covered by the `ns/rand_ns.c` override. Remaining: general audit. Phase 1 targets plain pico2. |
 | `picoruby-watchdog` | unchanged | WATCHDOG NS-granted; tick already running (monitor) |
 | `picoruby-gpio/-uart/-i2c/-spi/-adc/-pwm/-pio/-irq/-usb-hid/-io-console` | unchanged | peripherals NS-granted, IRQs in ITNS |
