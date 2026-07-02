@@ -162,6 +162,32 @@ main(void)
   else {
     mrb_task_run(mrb);
   }
+#if defined(R2P2_TRUSTZONE)
+  /* TZ bring-up: mrb_task_run returned, so the boot task raised or the
+   * scheduler ended. The VM would normally stop servicing USB and the port
+   * would never come up. Instead, keep USB alive here so the CDC port
+   * enumerates, and print the boot error once the host attaches (DTR). This
+   * turns the dead-end into a readable console. Remove once boot is clean. */
+  {
+    extern void tud_task(void);
+    extern bool tud_cdc_connected(void);
+    bool dumped = false;
+    for (;;) {
+      tud_task();
+      if (!dumped && tud_cdc_connected()) {
+        const char *hdr = "\r\n[TZ] boot task exited; VM halted.\r\n";
+        picorb_hal_write(1, hdr, strlen(hdr));
+        if (mrb->exc) {
+          mrb_print_error(mrb);
+        } else {
+          const char *m = "[TZ] (no exception - scheduler ended)\r\n";
+          picorb_hal_write(1, m, strlen(m));
+        }
+        dumped = true;
+      }
+    }
+  }
+#endif
   if (mrb->exc) {
     mrb_print_error(mrb);
     ret = 1;
