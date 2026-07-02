@@ -198,6 +198,9 @@ alarm_handler(void)
 static void
 usb_irq_handler(void)
 {
+#if defined(R2P2_TRUSTZONE)
+  gpio_xor_mask(1u << 25); /* TEMP: toggle LED each USB IRQ (flicker = IRQ alive) */
+#endif
   tud_task();
 }
 
@@ -248,16 +251,14 @@ picorb_hal_init(void)
 #endif /* !R2P2_TRUSTZONE */
 
   tud_init(TUD_OPT_RHPORT);
-#if defined(R2P2_TRUSTZONE)
-  /* TEMP bring-up breadcrumb: 2 blinks after USB init reached. */
-  gpio_init(25); gpio_set_dir(25, GPIO_OUT);
-  for (int k = 0; k < 2; k++) {
-    gpio_put(25, 1); for (volatile int j = 0; j < 8000000; j++) {}
-    gpio_put(25, 0); for (volatile int j = 0; j < 8000000; j++) {}
-  }
-#endif
   irq_add_shared_handler(USBCTRL_IRQ, usb_irq_handler,
       PICO_SHARED_IRQ_HANDLER_LOWEST_ORDER_PRIORITY);
+#if defined(R2P2_TRUSTZONE)
+  /* Ensure the USB IRQ is enabled for NS (ITNS routes it; the monitor set
+   * that). Without prompt IRQ servicing the CDC bulk endpoints stall. */
+  irq_set_enabled(USBCTRL_IRQ, true);
+  gpio_init(25); gpio_set_dir(25, GPIO_OUT); /* LED owned by our toggles now */
+#endif
 }
 
 #if defined(PICORB_VM_MRUBY)
@@ -297,18 +298,9 @@ picorb_hal_idle_cpu()
 picorb_hal_idle_cpu(mrb_state *mrb)
 #endif
 {
-#if defined(R2P2_TRUSTZONE)
-  /* TZ: USB enumeration is otherwise driven by USBCTRL_IRQ, which may not be
-   * delivered to NS. Poll tud_task() here so the CDC port enumerates from the
-   * scheduler idle. Heartbeat on GPIO25 confirms the VM is looping. TEMP. */
-  {
-    extern void tud_task(void);
-    tud_task();
-    static uint32_t hb = 0;
-    static bool on = false;
-    if (((++hb) & 0x3ffffu) == 0) { on = !on; gpio_put(25, on); }
-  }
-#endif
+  /* NB: do NOT poll tud_task() here — USB is serviced from usb_irq_handler
+   * (USBCTRL_IRQ). tud_task() is not reentrant, so calling it from both the
+   * idle loop and the IRQ corrupts USB. */
 #if defined(PICO_RP2040)
   __wfi();
 #elif defined(PICO_RP2350)
