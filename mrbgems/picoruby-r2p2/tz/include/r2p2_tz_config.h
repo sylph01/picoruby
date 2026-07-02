@@ -43,6 +43,13 @@ typedef struct {
 #define TZ_SG_NSC_LAST    0x1000ffffu
 #define TZ_NS_FLASH_BASE  0x10010000u  /* NS image + filesystem, to end of 4 MiB flash */
 #define TZ_NS_FLASH_LAST  0x103fffffu
+
+/* Filesystem partition as 0-based flash offsets (from r2p2_tz_pt.json:
+ * fs start 3328K, size 768K, nonsecure "rw"). The Secure flash veneers
+ * clamp NS erase/program to this window so NS cannot touch the monitor
+ * (0..60K), the NSC veneers, or the NS code/manifest region. */
+#define TZ_FS_OFFSET  0x00340000u  /* 3328 KiB */
+#define TZ_FS_SIZE    0x000c0000u  /* 768 KiB  */
 #define TZ_NS_RAM_BASE    0x20000000u  /* all 512 KiB striped SRAM */
 #define TZ_NS_RAM_LAST    0x2007ffffu
 

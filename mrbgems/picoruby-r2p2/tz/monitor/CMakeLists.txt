@@ -38,6 +38,7 @@ target_link_libraries(r2p2_tz_monitor
     pico_bootrom    # rom_flash_op lock plumbing, rom_set_ns_api_permission, ...
     pico_rand       # TRNG-backed generator feeding sg_random_bytes
     pico_sha256     # hardware SHA-256 behind sg_sha256 (and HKDF later)
+    hardware_flash  # flash_range_erase/program behind sg_flash_* (RAM-resident)
     hardware_gpio   # gpio_assign_to_ns
     hardware_irq    # irq_assign_to_ns
 )
