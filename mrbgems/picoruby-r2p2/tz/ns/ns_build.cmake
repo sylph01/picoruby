@@ -73,9 +73,6 @@ function(r2p2_apply_tz_ns TARGET)
         LINKER:--wrap=aon_timer_set_time
         LINKER:--wrap=aon_timer_get_time
         LINKER:--wrap=aon_timer_is_running
-        # TEMP bring-up: capture the class of an unhandled exception at the
-        # exc_throw -> mrb_print_error -> abort() point (see exit_ns.c).
-        LINKER:--wrap=mrb_print_error
         # TEMP bring-up: capture WHO calls abort()/exit()/panic()/assert (ns_trap.c).
         LINKER:--wrap=abort
         LINKER:--wrap=exit
