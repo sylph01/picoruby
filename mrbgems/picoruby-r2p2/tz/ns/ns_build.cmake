@@ -22,6 +22,11 @@ function(r2p2_apply_tz_ns TARGET)
         # system-wide; NS bootrom calls go through secure gateways that lock
         # Secure-side, so NS neither can nor needs to hold the lock itself.
         PICO_RUNTIME_SKIP_INIT_BOOTROM_LOCKING_ENABLE=1
+        # boot_locks_reset writes the hardware boot locks at BOOTRAM_BASE +
+        # BOOTRAM_BOOTLOCK0_OFFSET — also Secure-only BOOTRAM (confirmed on
+        # target: BusFault, faulting PC in boot_unlock_unsafe). The monitor
+        # already reset the boot locks; NS must not touch them.
+        PICO_RUNTIME_SKIP_INIT_BOOT_LOCKS_RESET=1
     )
 
     # Strong overrides for the __weak stages that must behave differently
