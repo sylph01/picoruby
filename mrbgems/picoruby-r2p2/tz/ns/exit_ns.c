@@ -72,3 +72,17 @@ void __attribute__((noreturn)) _exit(int status) {
     }
     ns_blink_count(n); /* never returns */
 }
+
+/* mruby's exc_throw() calls mrb_print_error() then abort() when an exception
+ * is raised with no handler (mrb->jmp == NULL) — e.g. during the top-level
+ * requires in main_task.rb, before its begin/rescue. By that abort mrb->exc
+ * is already cleared (why _exit sees none -> N=14), but mrb_print_error()
+ * still has it. Wrap it to blink the class index right there. */
+extern void __real_mrb_print_error(mrb_state *mrb);
+void __wrap_mrb_print_error(mrb_state *mrb) {
+    if (mrb && mrb->exc) {
+        ns_blink_count(ns_exc_index(mrb_obj_classname(mrb, mrb_obj_value(mrb->exc))));
+        /* noreturn */
+    }
+    __real_mrb_print_error(mrb);
+}
