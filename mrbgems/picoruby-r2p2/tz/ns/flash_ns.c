@@ -70,7 +70,11 @@ static int ns_flash_op(cflash_flags_t flags, uint32_t flash_offs,
      * taken during that window would fetch its handler from (now-dead)
      * flash and lock up. Mask interrupts across the call. */
     uint32_t save = save_and_disable_interrupts();
+    /* TEMP: LED ON during the op. Flicker across many ops = completing;
+     * stuck solid ON = still hanging even with IRQs masked. */
+    gpio_init(25); gpio_set_dir(25, GPIO_OUT); gpio_put(25, 1);
     int rc = fn(flags, XIP_BASE + flash_offs, count, buf);
+    gpio_put(25, 0);
     restore_interrupts(save);
     return rc;
 }
