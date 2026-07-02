@@ -48,6 +48,7 @@ function(r2p2_apply_tz_ns TARGET)
         ${R2P2_TZ_NS_DIR}/rand_ns.c
         ${R2P2_TZ_NS_DIR}/flash_ns.c
         ${R2P2_TZ_NS_DIR}/aon_ns.c
+        ${R2P2_TZ_NS_DIR}/exit_ns.c   # TEMP: _exit -> USB console for bring-up
     )
 
     # NB: intentionally NOT linking pico_flash. flash_ns.c calls the bootrom
