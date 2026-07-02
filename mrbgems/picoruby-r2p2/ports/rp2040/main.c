@@ -145,12 +145,21 @@ static int tz_exc_index(const char *cls) {
 static void __attribute__((noreturn)) tz_blink_count(int n) {
   gpio_init(25); gpio_set_dir(25, GPIO_OUT);
   for (;;) {
+    gpio_put(25, 1); tz_busy(TZ_MS(1200)); /* long start marker */
+    gpio_put(25, 0); tz_busy(TZ_MS(700));
     for (int i = 0; i < n; i++) {
-      gpio_put(25, 1); tz_busy(TZ_MS(300));
-      gpio_put(25, 0); tz_busy(TZ_MS(300));
+      gpio_put(25, 1); tz_busy(TZ_MS(250));
+      gpio_put(25, 0); tz_busy(TZ_MS(550));
     }
-    tz_busy(TZ_MS(4000)); /* long gap before repeating the count */
+    tz_busy(TZ_MS(3000)); /* long gap before repeating the count */
   }
+}
+/* Run the scheduler under C-level protection so a task's unhandled exception
+ * is caught here (as mrb_protect_error's result) instead of re-raising at the
+ * top level -> abort() -> _exit. Lets us read the exception class reliably. */
+static mrb_value tz_task_run_thunk(mrb_state *mrb, void *ud) {
+  (void)ud;
+  return mrb_task_run(mrb);
 }
 #endif
 
@@ -189,31 +198,27 @@ main(void)
     ret = 1;
   }
   else {
-    mrb_task_run(mrb);
-  }
 #if defined(R2P2_TRUSTZONE)
-  /* TZ bring-up: mrb_task_run returned, so the boot task raised or the
-   * scheduler ended. The VM would normally stop servicing USB and the port
-   * would never come up. Instead, keep USB alive here so the CDC port
-   * enumerates, and print the boot error once the host attaches (DTR). This
-   * turns the dead-end into a readable console. Remove once boot is clean. */
-  {
-    /* USB CDC has been unreadable in NS bring-up, so report the boot
-     * outcome over the LED instead: blink the first 4 chars of the
-     * exception class name as hex (e.g. "Runt"=0x52756E74 -> RuntimeError,
-     * "Load"=0x4C6F6164 -> LoadError, "Argu"->ArgumentError, "NoMe"/"Name",
-     * "Type", ...), or "NONE"=0x4E4F4E45 if the VM exited with no exception
-     * (clean scheduler end). */
+    /* Protect the scheduler so a task's unhandled exception is caught here
+     * instead of re-raising at the C top level (mrb->jmp==NULL) ->
+     * exc_throw -> abort() -> _exit. Then report the class over the LED
+     * (USB CDC is unreadable in NS bring-up). */
+    mrb_bool tz_err = FALSE;
+    mrb_value tz_res = mrb_protect_error(mrb, tz_task_run_thunk, NULL, &tz_err);
     irq_set_enabled(USBCTRL_IRQ, false);
     int n;
-    if (mrb->exc) {
+    if (tz_err && !mrb_nil_p(tz_res)) {
+      n = tz_exc_index(mrb_obj_classname(mrb, tz_res));
+    } else if (mrb->exc) {
       n = tz_exc_index(mrb_obj_classname(mrb, mrb_obj_value(mrb->exc)));
     } else {
-      n = 1; /* clean exit, no exception (boot completed / shell returned) */
+      n = 1; /* scheduler ended with no exception */
     }
     tz_blink_count(n); /* never returns */
-  }
+#else
+    mrb_task_run(mrb);
 #endif
+  }
   if (mrb->exc) {
     mrb_print_error(mrb);
     ret = 1;
