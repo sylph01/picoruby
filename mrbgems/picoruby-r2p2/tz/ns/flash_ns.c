@@ -50,11 +50,15 @@
  * from NS, rom_func_lookup returns the Non-secure 'FO' entry, which is a
  * secure gateway — the Secure bootrom does the BOOTRAM/QMI work on the
  * Secure side. It also enforces the partition table's NS permissions
- * (only the fs partition is NS-writable), so no seclevel games are needed
- * or allowed from NS. Requires the monitor to have enabled the
- * checked_flash_op NS API (it does). */
+ * (only the fs partition is NS-writable). Requires the monitor to have
+ * enabled the checked_flash_op NS API (it does).
+ *
+ * The SECLEVEL field is mandatory: 0 is not a valid value, so leaving it
+ * unset makes the bootrom reject the flags with BOOTROM_ERROR_INVALID_ARG
+ * (confirmed on target 2026-07-02: rc=-5). From NS it must be NONSECURE. */
 #define TZ_CFLASH(op) ((cflash_flags_t){ .flags = \
         ((op) << CFLASH_OP_LSB) | \
+        (CFLASH_SECLEVEL_VALUE_NONSECURE << CFLASH_SECLEVEL_LSB) | \
         (CFLASH_ASPACE_VALUE_STORAGE << CFLASH_ASPACE_LSB) })
 
 static int ns_flash_op(cflash_flags_t flags, uint32_t flash_offs,
