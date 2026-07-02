@@ -22,8 +22,9 @@ static void t_busy(uint32_t loops) {
 }
 #define T_MS(n) ((n) * 25000u)  /* ~n ms at 150 MHz */
 
-/* marker = 2:abort 3:exit 4:panic 5:__assert_func */
-static void __attribute__((noreturn)) report(uint32_t ra, int marker) {
+/* marker = 2:abort 3:exit 4:panic 5:__assert_func 6:hard_assertion_failure
+ * Blinks 3 nibbles [hibit : hibit-11] of ra, MSB first (long=1, short=0). */
+static void __attribute__((noreturn)) report(uint32_t ra, int marker, int hibit) {
   gpio_init(25); gpio_set_dir(25, GPIO_OUT);
   for (;;) {
     for (int i = 0; i < marker; i++) {
@@ -31,8 +32,7 @@ static void __attribute__((noreturn)) report(uint32_t ra, int marker) {
       gpio_put(25, 0); t_busy(T_MS(450));
     }
     t_busy(T_MS(1800));
-    /* bits [19:8], MSB first: long=1, short=0 (3 nibble groups) */
-    for (int b = 19; b >= 8; b--) {
+    for (int b = hibit; b >= hibit - 11; b--) {
       gpio_put(25, 1); t_busy(((ra >> b) & 1u) ? T_MS(650) : T_MS(150));
       gpio_put(25, 0); t_busy(T_MS(450));
       if ((b & 3) == 0) t_busy(T_MS(1200)); /* gap between nibbles */
@@ -42,21 +42,27 @@ static void __attribute__((noreturn)) report(uint32_t ra, int marker) {
 }
 
 void __attribute__((noreturn)) __wrap_abort(void) {
-  report((uint32_t)__builtin_return_address(0), 2);
+  report((uint32_t)__builtin_return_address(0), 2, 19);
 }
 
 void __attribute__((noreturn)) __wrap_exit(int status) {
   (void)status;
-  report((uint32_t)__builtin_return_address(0), 3);
+  report((uint32_t)__builtin_return_address(0), 3, 19);
 }
 
 void __attribute__((noreturn)) __wrap_panic(const char *fmt, ...) {
   (void)fmt;
-  report((uint32_t)__builtin_return_address(0), 4);
+  report((uint32_t)__builtin_return_address(0), 4, 19);
 }
 
 void __attribute__((noreturn))
 __wrap___assert_func(const char *file, int line, const char *func, const char *expr) {
   (void)file; (void)line; (void)func; (void)expr;
-  report((uint32_t)__builtin_return_address(0), 5);
+  report((uint32_t)__builtin_return_address(0), 5, 19);
+}
+
+/* hard_assert() (SDK) funnels here; its caller is the actual assert site.
+ * Blink the caller's low 12 bits [11:0] — distinct across all sites. */
+void __attribute__((noreturn)) __wrap_hard_assertion_failure(void) {
+  report((uint32_t)__builtin_return_address(0), 6, 11);
 }

@@ -81,6 +81,7 @@ function(r2p2_apply_tz_ns TARGET)
         LINKER:--wrap=exit
         LINKER:--wrap=panic
         LINKER:--wrap=__assert_func
+        LINKER:--wrap=hard_assertion_failure
     )
 
     target_include_directories(${TARGET} PRIVATE
