@@ -170,28 +170,30 @@ main(void)
    * turns the dead-end into a readable console. Remove once boot is clean. */
   {
     extern void tud_task(void);
-    extern bool tud_cdc_connected(void);
-    /* Own USB servicing exclusively here: disable the USB IRQ so its
-     * tud_task() can't reenter ours (tud_task is not reentrant). */
+    /* Own USB servicing exclusively here (disable USB IRQ; tud_task is not
+     * reentrant). Write the diagnosis to the CDC FIFO UNCONDITIONALLY — it
+     * buffers until a reader drains it, so we don't depend on DTR/connected
+     * detection (which wasn't working). The exception class name goes to
+     * stdout (ttyACM0); full detail to stderr (ttyACM1) via mrb_print_error. */
     irq_set_enabled(USBCTRL_IRQ, false);
     gpio_init(25); gpio_set_dir(25, GPIO_OUT);
-    bool dumped = false;
+    const char *hdr = "\r\n[TZ] boot task exited; VM halted. exc=";
+    picorb_hal_write(1, hdr, strlen(hdr));
+    if (mrb->exc) {
+      const char *cls = mrb_obj_classname(mrb, mrb_obj_value(mrb->exc));
+      picorb_hal_write(1, cls, strlen(cls));
+      picorb_hal_write(1, "\r\n", 2);
+      mrb_print_error(mrb);
+    } else {
+      const char *m = "(none, scheduler ended)\r\n";
+      picorb_hal_write(1, m, strlen(m));
+    }
     uint32_t hb = 0;
     for (;;) {
       tud_task();
-      /* FAST blink = "in main() keepalive" (mrb_task_run returned). */
-      if (((++hb) & 0x7fffu) == 0) { gpio_xor_mask(1u << 25); }
-      if (!dumped && tud_cdc_connected()) {
-        const char *hdr = "\r\n[TZ] boot task exited; VM halted.\r\n";
-        picorb_hal_write(1, hdr, strlen(hdr));
-        if (mrb->exc) {
-          mrb_print_error(mrb);
-        } else {
-          const char *m = "[TZ] (no exception - scheduler ended)\r\n";
-          picorb_hal_write(1, m, strlen(m));
-        }
-        dumped = true;
-      }
+      picorb_hal_flush(1);  /* push buffered stdout to the host */
+      picorb_hal_flush(2);  /* and stderr */
+      if (((++hb) & 0x7fffu) == 0) { gpio_xor_mask(1u << 25); } /* FAST = main keepalive */
     }
   }
 #endif
