@@ -44,6 +44,16 @@ target_link_libraries(r2p2_tz_monitor
 
 pico_set_linker_script(r2p2_tz_monitor ${CMAKE_CURRENT_LIST_DIR}/memmap_monitor_s.ld)
 
+# Partition table embedded in the monitor (the boot image) — "partition-
+# table-in-image boot", datasheet §5.1.14. Defines flash permissions:
+# firmware region has nonsecure="" (NS cannot reflash the monitor or NS
+# image via checked_flash_op), the fs partition has nonsecure="rw" (what
+# makes flash_ns.c's NS writes accepted). The firmware partition accepts
+# BOTH rp2350-arm-s and rp2350-arm-ns families so the combined UF2 drop
+# routes the monitor and NS halves correctly. picotool embeds this at
+# POST_BUILD; rake r2p2:tz:package's objcopy/seal run on top afterwards.
+pico_embed_pt_in_binary(r2p2_tz_monitor ${CMAKE_CURRENT_LIST_DIR}/r2p2_tz_pt.json)
+
 # CMSE secure gateway: emit veneers for every cmse_nonsecure_entry function
 # into .gnu.sgstubs (placed at TZ_SG_NSC_BASE by the linker script) and
 # produce the import library the NS image links against.
