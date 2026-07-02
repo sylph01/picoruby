@@ -53,8 +53,30 @@ def r2p2_def_psg_pwm_dma
   "-D PICORUBY_PSG_PWM_DMA=#{enabled ? 'ON' : 'OFF'}"
 end
 
+def r2p2_def_trustzone(vm, board)
+  return "" unless ENV["R2P2_TRUSTZONE"]
+  unless vm == "picoruby" && board == "pico2"
+    raise "R2P2_TRUSTZONE is only supported for picoruby on pico2 (phase 1)"
+  end
+  implib = ENV["R2P2_TZ_IMPLIB"] ||
+           "#{R2P2_GEM_DIR}/tz/monitor/build/r2p2_sg_implib.o"
+  unless File.exist?(implib)
+    raise <<~MSG
+      Monitor veneer implib not found at:
+        #{implib}
+      Build the Secure monitor first:
+        cd #{R2P2_GEM_DIR}/tz/monitor && \\
+          PICO_SDK_PATH=#{ENV['PICO_SDK_PATH']} cmake -B build -S . && \\
+          cmake --build build
+      or set R2P2_TZ_IMPLIB to its r2p2_sg_implib.o.
+    MSG
+  end
+  "-D R2P2_TRUSTZONE=1 -D R2P2_TZ_IMPLIB=#{implib}"
+end
+
 def r2p2_build_dir(vm, board, mode)
-  "#{MRUBY_ROOT}/build/r2p2/#{vm}/#{board}/#{mode}"
+  suffix = ENV["R2P2_TRUSTZONE"] ? "-tz" : ""
+  "#{MRUBY_ROOT}/build/r2p2/#{vm}/#{board}/#{mode}#{suffix}"
 end
 
 namespace :r2p2 do
@@ -141,7 +163,8 @@ namespace :r2p2 do
                 #{r2p2_def_board(board)} \
                 #{r2p2_def_build_type(mode)} \
                 #{r2p2_def_psg_mcp4922_dma} \
-                #{r2p2_def_psg_pwm_dma}
+                #{r2p2_def_psg_pwm_dma} \
+                #{r2p2_def_trustzone(vm, board)}
               DEFS
               sh "cmake -S #{R2P2_GEM_DIR}/cmake -B #{dir} #{defs}"
               sh "cmake --build #{dir}"

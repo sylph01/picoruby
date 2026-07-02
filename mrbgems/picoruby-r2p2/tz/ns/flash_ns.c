@@ -1,9 +1,11 @@
 /*
  * flash_ns.c — link-level replacement for hardware_flash's
  * flash_range_erase/flash_range_program in the Non-secure R2P2 image.
- * SKETCH. Same mechanism as rand_ns.c: this file is a direct source of
- * the firmware target, so the linker never pulls flash.o from the
- * hardware_flash archive.
+ * SKETCH. Same --wrap mechanism as rand_ns.c (hardware_flash is an SDK
+ * INTERFACE library, so flash.c is a peer object and a plain redefinition
+ * would collide): ns_build.cmake passes -Wl,--wrap=flash_range_erase and
+ * --wrap=flash_range_program, redirecting callers (the littlefs/FAT HALs)
+ * to the __wrap_* functions here.
  *
  * Why: the stock implementations drive the QSPI/QMI directly via
  * Arm-S-only ROM helpers (connect_internal_flash, flash_exit_xip) and
@@ -49,14 +51,14 @@
         (CFLASH_SECLEVEL_VALUE_NONSECURE << CFLASH_SECLEVEL_LSB) | \
         (CFLASH_ASPACE_VALUE_STORAGE << CFLASH_ASPACE_LSB) })
 
-void flash_range_erase(uint32_t flash_offs, size_t count) {
+void __wrap_flash_range_erase(uint32_t flash_offs, size_t count) {
     int rc = rom_flash_op(TZ_CFLASH(CFLASH_OP_VALUE_ERASE),
                           XIP_BASE + flash_offs, (uint32_t)count, NULL);
     hard_assert(rc == BOOTROM_OK);
     sg_flash_flush_cache();
 }
 
-void flash_range_program(uint32_t flash_offs, const uint8_t *data, size_t count) {
+void __wrap_flash_range_program(uint32_t flash_offs, const uint8_t *data, size_t count) {
     /* rom_flash_op takes a non-const buf; program ops never write to it. */
     int rc = rom_flash_op(TZ_CFLASH(CFLASH_OP_VALUE_PROGRAM),
                           XIP_BASE + flash_offs, (uint32_t)count,
