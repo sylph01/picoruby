@@ -125,6 +125,31 @@ gpio_init_safe(void)
   }
 }
 
+#if defined(R2P2_TRUSTZONE)
+/* Report the boot-exception class over the LED (GPIO25), since USB CDC is
+ * unreliable during NS bring-up. Blinks a 32-bit word as 8 hex nibbles,
+ * MSB first; value 0 = one long pulse. Slow and countable. */
+static void tz_busy(uint32_t loops) {
+  for (volatile uint32_t i = 0; i < loops; i++) __asm volatile ("nop");
+}
+#define TZ_MS(n) ((n) * 25000u)  /* ~n ms at 150 MHz */
+static void tz_nibble(unsigned v) {
+  if (v == 0) { gpio_put(25, 1); tz_busy(TZ_MS(1400)); gpio_put(25, 0); }
+  else for (unsigned i = 0; i < v; i++) {
+    gpio_put(25, 1); tz_busy(TZ_MS(350));
+    gpio_put(25, 0); tz_busy(TZ_MS(350));
+  }
+  tz_busy(TZ_MS(2200));
+}
+static void __attribute__((noreturn)) tz_blink_word(uint32_t w) {
+  gpio_init(25); gpio_set_dir(25, GPIO_OUT);
+  for (;;) {
+    for (int s = 28; s >= 0; s -= 4) tz_nibble((w >> s) & 0xfu);
+    tz_busy(TZ_MS(5000));
+  }
+}
+#endif
+
 int
 main(void)
 {
@@ -169,32 +194,22 @@ main(void)
    * enumerates, and print the boot error once the host attaches (DTR). This
    * turns the dead-end into a readable console. Remove once boot is clean. */
   {
-    extern void tud_task(void);
-    /* Own USB servicing exclusively here (disable USB IRQ; tud_task is not
-     * reentrant). Write the diagnosis to the CDC FIFO UNCONDITIONALLY — it
-     * buffers until a reader drains it, so we don't depend on DTR/connected
-     * detection (which wasn't working). The exception class name goes to
-     * stdout (ttyACM0); full detail to stderr (ttyACM1) via mrb_print_error. */
+    /* USB CDC has been unreadable in NS bring-up, so report the boot
+     * outcome over the LED instead: blink the first 4 chars of the
+     * exception class name as hex (e.g. "Runt"=0x52756E74 -> RuntimeError,
+     * "Load"=0x4C6F6164 -> LoadError, "Argu"->ArgumentError, "NoMe"/"Name",
+     * "Type", ...), or "NONE"=0x4E4F4E45 if the VM exited with no exception
+     * (clean scheduler end). */
     irq_set_enabled(USBCTRL_IRQ, false);
-    gpio_init(25); gpio_set_dir(25, GPIO_OUT);
-    const char *hdr = "\r\n[TZ] boot task exited; VM halted. exc=";
-    picorb_hal_write(1, hdr, strlen(hdr));
+    uint32_t code;
     if (mrb->exc) {
       const char *cls = mrb_obj_classname(mrb, mrb_obj_value(mrb->exc));
-      picorb_hal_write(1, cls, strlen(cls));
-      picorb_hal_write(1, "\r\n", 2);
-      mrb_print_error(mrb);
+      code = 0;
+      for (int i = 0; i < 4 && cls[i]; i++) code = (code << 8) | (uint8_t)cls[i];
     } else {
-      const char *m = "(none, scheduler ended)\r\n";
-      picorb_hal_write(1, m, strlen(m));
+      code = 0x4E4F4E45u; /* "NONE" */
     }
-    uint32_t hb = 0;
-    for (;;) {
-      tud_task();
-      picorb_hal_flush(1);  /* push buffered stdout to the host */
-      picorb_hal_flush(2);  /* and stderr */
-      if (((++hb) & 0x7fffu) == 0) { gpio_xor_mask(1u << 25); } /* FAST = main keepalive */
-    }
+    tz_blink_word(code); /* never returns */
   }
 #endif
   if (mrb->exc) {
