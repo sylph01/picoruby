@@ -8,9 +8,9 @@
  *
  * Pattern (repeats):
  *   - MARKER: 2 long pulses = abort(), 3 long pulses = exit()
- *   - then the low 20 bits of the return address, MSB first, as binary:
- *       long pulse = 1, short pulse = 0, in 5 nibble-groups (gap between).
- *   Reconstruct the address as 0x10000000 | <20 bits>, then addr2line.
+ *   - then bits [19:8] of the return address, MSB first, as binary:
+ *       long pulse = 1, short pulse = 0, in 3 nibble-groups (gap between).
+ *   These 3 nibbles uniquely identify the caller among the abort() sites.
  *
  * Wired via --wrap=abort,--wrap=exit in ns_build.cmake. TEMPORARY.
  */
@@ -31,8 +31,8 @@ static void __attribute__((noreturn)) report(uint32_t ra, int is_exit) {
       gpio_put(25, 0); t_busy(T_MS(450));
     }
     t_busy(T_MS(1800));
-    /* low 20 bits, MSB first: long=1, short=0 */
-    for (int b = 19; b >= 0; b--) {
+    /* bits [19:8], MSB first: long=1, short=0 (3 nibble groups) */
+    for (int b = 19; b >= 8; b--) {
       gpio_put(25, 1); t_busy(((ra >> b) & 1u) ? T_MS(650) : T_MS(150));
       gpio_put(25, 0); t_busy(T_MS(450));
       if ((b & 3) == 0) t_busy(T_MS(1200)); /* gap between nibbles */
