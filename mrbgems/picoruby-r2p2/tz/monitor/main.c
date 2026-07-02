@@ -60,8 +60,11 @@
 static void busy_delay(uint32_t loops) {
     for (volatile uint32_t i = 0; i < loops; i++) __asm volatile ("nop");
 }
-#define LED_ON_MS  3000000u   /* ~120 ms at 150 MHz */
-#define LED_GAP_MS 9000000u   /* ~360 ms gap between blink groups */
+/* ~1 ms of busy-wait at 150 MHz (rough; the volatile loop is a handful of
+ * cycles). Timings below are deliberately slow so blinks are countable. */
+#define BUSY_MS(n) ((n) * 25000u)
+#define LED_ON_MS  BUSY_MS(250)   /* breadcrumb blink on/off */
+#define LED_GAP_MS BUSY_MS(1200)  /* gap between breadcrumb blink groups */
 static void led_init(void) { gpio_init(TZ_LED_PIN); gpio_set_dir(TZ_LED_PIN, GPIO_OUT); }
 static void led_set(bool on) { gpio_put(TZ_LED_PIN, on); }
 static void led_blink(uint n) {
@@ -71,6 +74,55 @@ static void led_blink(uint n) {
     }
     busy_delay(LED_GAP_MS);
 }
+
+/* Fault self-report. BFHFNMINS=0 means NS bus/hard faults escalate to these
+ * SECURE handlers, so an NS fault shows up here rather than as a dead hang.
+ * Distinct rhythms tell escalated-NS-fault apart from a pure lockup:
+ *   hardfault  = fast double-blink groups
+ *   busfault   = fast triple-blink groups (a denied peripheral access)
+ * These override crt0's weak bkpt stubs (no debugger attached here). */
+static void __attribute__((noreturn)) fault_blink(uint n) {
+    for (;;) {
+        for (uint k = 0; k < n; k++) {
+            led_set(true);  busy_delay(BUSY_MS(250));
+            led_set(false); busy_delay(BUSY_MS(250));
+        }
+        busy_delay(BUSY_MS(2000));
+    }
+}
+/* Blink one hex nibble MSB-first: value 1..15 = that many short blinks,
+ * value 0 = one long pulse (so 0 is distinguishable from "no blinks"). */
+static void led_nibble(uint v) {
+    if (v == 0) {
+        led_set(true); busy_delay(BUSY_MS(1400)); led_set(false);  /* long = 0 */
+    } else {
+        for (uint i = 0; i < v; i++) {
+            led_set(true);  busy_delay(BUSY_MS(350));
+            led_set(false); busy_delay(BUSY_MS(350));
+        }
+    }
+    busy_delay(BUSY_MS(2200)); /* inter-nibble gap */
+}
+/* Blink a 32-bit word as 8 nibbles, MSB first, forever (long gap between
+ * repeats). Used to report the BusFault address (BFAR) = the peripheral
+ * NS was denied. */
+static void __attribute__((noreturn)) blink_word(uint32_t w) {
+    for (;;) {
+        for (int s = 28; s >= 0; s -= 4) led_nibble((w >> s) & 0xfu);
+        busy_delay(BUSY_MS(5000)); /* long gap before repeating the address */
+    }
+}
+
+void isr_busfault(void) {
+    /* BFAR holds the faulting address when BFARVALID; else all-ones marker. */
+    uint32_t addr = (m33_hw->cfsr & M33_CFSR_BFSR_BFARVALID_BITS)
+                    ? m33_hw->bfar : 0xffffffffu;
+    blink_word(addr);
+}
+void isr_hardfault(void)   { fault_blink(2); }
+void isr_securefault(void) { fault_blink(4); }
+void isr_usagefault(void)  { fault_blink(5); }
+void isr_memmanage(void)   { fault_blink(6); }
 
 /* All ACCESSCTRL registers except GPIO_NSMASK* require this password in the
  * upper half of the write data; writes without it bus-fault (§10.6). */
@@ -288,6 +340,9 @@ static void __attribute__((noreturn)) ns_launch(void) {
      * TODO(phase 2, PSG/pitchdetector): sg_launch_core1_ns veneer with
      * ACCESSCTRL FORCE_CORE_NS.CORE1 so core 1 runs NS-only. */
 
+    led_blink(4);             /* (F) SCS setup survived — about to blxns */
+    led_set(true);
+
     /* cmse_nonsecure_call: the compiler clears non-argument registers and
      * emits BLXNS; the target address needs its LSB clear for the NS
      * transition, which GCC handles via the function-pointer bit-clear. */
@@ -303,6 +358,12 @@ int main(void) {
      * BEFORE anything Non-secure exists or runs. */
     led_init();
     led_set(true);            /* (A) monitor entered — solid on */
+    /* Route configurable faults to their specific handlers instead of
+     * escalating everything to HardFault, so the LED tells us the exact
+     * fault class. NS bus/secure faults target these Secure handlers
+     * because BFHFNMINS=0. (Bring-up only.) */
+    m33_hw->shcsr |= M33_SHCSR_SECUREFAULTENA_BITS | M33_SHCSR_BUSFAULTENA_BITS
+                   | M33_SHCSR_USGFAULTENA_BITS | M33_SHCSR_MEMFAULTENA_BITS;
     verify_ns_image();        /* strobes forever on hash mismatch */
     led_blink(1);             /* (B) NS verified */
     monitor_derive_keys();
