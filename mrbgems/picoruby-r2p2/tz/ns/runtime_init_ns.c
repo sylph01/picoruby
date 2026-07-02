@@ -34,7 +34,6 @@
  */
 
 #include "pico.h"
-#include "hardware/resets.h"
 #include "hardware/clocks.h"
 
 #include "../include/r2p2_tz_config.h"
@@ -43,46 +42,17 @@
 #error runtime_init_ns.c is specific to the RP2350 TrustZone build
 #endif
 
-/* RESETS bits the NS image is allowed to touch — exactly the ACCESSCTRL
- * NS-granted peripherals (RESETS access rides on the per-peripheral bits,
- * §10.6.2). Touching Secure-only bits from NS is at best ignored; waiting
- * on their RESET_DONE would hang forever, which is why the stock
- * mask-everything stages must not run. */
-#define TZ_NS_RESETS_MASK ( \
-        (1u << RESET_ADC)        | \
-        (1u << RESET_DMA)        | \
-        (1u << RESET_HSTX)       | \
-        (1u << RESET_I2C0)       | \
-        (1u << RESET_I2C1)       | \
-        (1u << RESET_IO_BANK0)   | \
-        (1u << RESET_PADS_BANK0) | \
-        (1u << RESET_PIO0)       | \
-        (1u << RESET_PIO1)       | \
-        (1u << RESET_PIO2)       | \
-        (1u << RESET_PWM)        | \
-        (1u << RESET_SPI0)       | \
-        (1u << RESET_SPI1)       | \
-        (1u << RESET_SYSINFO)    | \
-        (1u << RESET_TBMAN)      | \
-        (1u << RESET_TIMER0)     | \
-        (1u << RESET_UART0)      | \
-        (1u << RESET_UART1)      | \
-        (1u << RESET_USBCTRL))
-
-/* Stock stage resets ~everything then unresets clk_sys/clk_ref-only
- * peripherals. In NS: reset-cycle only our own peripherals for a clean
- * start (the monitor left them unreset after its full init); all their
- * clocks are already running, so unreset everything in one go.
- *
- * TODO(verify on target): confirm NS reads of RESET_DONE reflect
- * NS-granted bits (RAZ semantics for the rest) rather than bus-faulting. */
+/* Both reset stages are NO-OPS in NS. The RESETS block is Secure-only
+ * (ACCESSCTRL_RESETS resets to 0xfc — NSP/NSU clear) and MUST stay that way:
+ * it can reset OTP/TRNG/SHA256/XIP, so NS holding it would breach the
+ * partition. Any NS write to resets_hw bus-faults. The monitor's own
+ * runtime_init already brought every peripheral out of reset before the
+ * handoff, and NS inherits them at reset-default config, so NS has nothing
+ * to do here. (Confirmed on target 2026-07-02: the stock reset-cycle here
+ * faulted in runtime_init — LED breadcrumb stopped at "3 blinks, solid".) */
 void runtime_init_early_resets(void) {
-    reset_block_mask(TZ_NS_RESETS_MASK);
-    unreset_block_mask_wait_blocking(TZ_NS_RESETS_MASK);
 }
 
-/* Stock stage is a no-op wait: by NS entry every NS peripheral is already
- * out of reset (see above), and Secure-only bits must not be waited on. */
 void runtime_init_post_clock_resets(void) {
 }
 

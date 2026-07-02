@@ -46,9 +46,31 @@
 #include "hardware/regs/accessctrl.h"
 #include "hardware/regs/dma.h"
 #include "hardware/regs/intctrl.h"
+#include "hardware/gpio.h"
 
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_tz_config.h"  /* memory map, clock contract, TZ_NS_DMA_CHANNELS */
+
+/* ---- bring-up breadcrumbs (TEMPORARY) -----------------------------------
+ * The monitor has no console, so first-silicon debugging uses the onboard
+ * LED. Each boot stage blinks a distinct count; verify_failed strobes.
+ * GPIO 25 = Pico 2 (non-W) LED — a Pico 2 W has no GPIO LED, so no light
+ * there means "can't tell", not "dead". Remove once the handoff is proven. */
+#define TZ_LED_PIN 25
+static void busy_delay(uint32_t loops) {
+    for (volatile uint32_t i = 0; i < loops; i++) __asm volatile ("nop");
+}
+#define LED_ON_MS  3000000u   /* ~120 ms at 150 MHz */
+#define LED_GAP_MS 9000000u   /* ~360 ms gap between blink groups */
+static void led_init(void) { gpio_init(TZ_LED_PIN); gpio_set_dir(TZ_LED_PIN, GPIO_OUT); }
+static void led_set(bool on) { gpio_put(TZ_LED_PIN, on); }
+static void led_blink(uint n) {
+    for (uint k = 0; k < n; k++) {
+        led_set(true);  busy_delay(LED_ON_MS);
+        led_set(false); busy_delay(LED_ON_MS);
+    }
+    busy_delay(LED_GAP_MS);
+}
 
 /* All ACCESSCTRL registers except GPIO_NSMASK* require this password in the
  * upper half of the write data; writes without it bus-fault (§10.6). */
@@ -85,11 +107,11 @@ static const tz_ns_manifest_t tz_ns_manifest
     __attribute__((section(".ns_manifest"), used)) = { .magic = 0 };
 
 static void __attribute__((noreturn)) verify_failed(void) {
-    /* No stdio in the monitor; park. Recovery path is BOOTSEL, which sits
-     * upstream in the bootrom and is unaffected. TODO: blink a status LED
-     * pattern once the monitor owns one. */
+    /* NS hash mismatch. Rapid strobe = self-identifying (distinct from any
+     * blink-count breadcrumb). Recovery is BOOTSEL, upstream in the bootrom. */
     for (;;) {
-        __asm volatile ("wfi");
+        led_set(true);  busy_delay(1000000u);   /* ~40 ms */
+        led_set(false); busy_delay(1000000u);
     }
 }
 
@@ -279,8 +301,14 @@ int main(void) {
      * covers .ns_manifest). Order matters: the NS image is authenticated
      * and keys come out of OTP (SW_LOCK ratchet closing behind them)
      * BEFORE anything Non-secure exists or runs. */
-    verify_ns_image();
+    led_init();
+    led_set(true);            /* (A) monitor entered — solid on */
+    verify_ns_image();        /* strobes forever on hash mismatch */
+    led_blink(1);             /* (B) NS verified */
     monitor_derive_keys();
+    led_blink(2);             /* (C) keys derived */
     partition_configure();
+    led_blink(3);             /* (D) partition configured */
+    led_set(true);            /* (E) solid on — about to blxns into NS */
     ns_launch();
 }
