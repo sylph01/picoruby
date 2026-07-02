@@ -38,10 +38,13 @@ function(r2p2_apply_tz_ns TARGET)
     # flash_range_program with bootrom checked_flash_op calls (+ cache
     # flush via veneer), transitively fixing picoruby-filesystem-fat and
     # picoruby-littlefs.
+    # aon_ns.c: software wall clock (TIMER0) replacing pico_aon_timer, whose
+    # POWMAN backend is Secure-only (Machine.set_hwclock faults from NS).
     target_sources(${TARGET} PRIVATE
         ${R2P2_TZ_NS_DIR}/runtime_init_ns.c
         ${R2P2_TZ_NS_DIR}/rand_ns.c
         ${R2P2_TZ_NS_DIR}/flash_ns.c
+        ${R2P2_TZ_NS_DIR}/aon_ns.c
     )
 
     # NB: intentionally NOT linking pico_flash. flash_ns.c calls the bootrom
@@ -61,6 +64,10 @@ function(r2p2_apply_tz_ns TARGET)
         LINKER:--wrap=get_rand_128
         LINKER:--wrap=flash_range_erase
         LINKER:--wrap=flash_range_program
+        LINKER:--wrap=aon_timer_start
+        LINKER:--wrap=aon_timer_set_time
+        LINKER:--wrap=aon_timer_get_time
+        LINKER:--wrap=aon_timer_is_running
     )
 
     target_include_directories(${TARGET} PRIVATE
