@@ -39,6 +39,7 @@
 #include "pico/bootrom.h"
 #include "boot/bootrom_constants.h"
 #include "hardware/regs/addressmap.h"
+#include "hardware/gpio.h"
 
 #include "../include/r2p2_sg_api.h"
 
@@ -64,7 +65,12 @@
 static int ns_flash_op(cflash_flags_t flags, uint32_t flash_offs,
                        uint32_t count, uint8_t *buf) {
     rom_flash_op_fn fn = (rom_flash_op_fn) rom_func_lookup(ROM_FUNC_FLASH_OP);
-    return fn(flags, XIP_BASE + flash_offs, count, buf);
+    /* TEMP diagnostic: LED solid ON during the ROM flash op. If it sticks
+     * ON, we hung inside the op; if it flickers, ops are completing. */
+    gpio_init(25); gpio_set_dir(25, GPIO_OUT); gpio_put(25, 1);
+    int rc = fn(flags, XIP_BASE + flash_offs, count, buf);
+    gpio_put(25, 0);
+    return rc;
 }
 
 /* TEMP bring-up: on error blink the bootrom rc instead of asserting, so we
