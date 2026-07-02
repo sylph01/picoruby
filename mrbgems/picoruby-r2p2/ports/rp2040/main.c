@@ -171,6 +171,9 @@ main(void)
   {
     extern void tud_task(void);
     extern bool tud_cdc_connected(void);
+    /* Own USB servicing exclusively here: disable the USB IRQ so its
+     * tud_task() can't reenter ours (tud_task is not reentrant). */
+    irq_set_enabled(USBCTRL_IRQ, false);
     bool dumped = false;
     for (;;) {
       tud_task();
