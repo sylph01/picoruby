@@ -1,13 +1,18 @@
 # TrustZone-partitioned R2P2 (RP2350) — design sketch
 
-Status: **sketch; both images build and link** (SDK 2.2.0, arm-none-eabi-gcc
-14.2). The Secure monitor builds standalone (`monitor/CMakeLists.txt`); the
-Non-secure R2P2 builds via `rake r2p2:picoruby:pico2:prod` with
-`R2P2_TRUSTZONE=1` (see `ns/ns_build.cmake`), linking the monitor's veneer
-implib. Neither image is bootable yet — the combined-image signing,
-`EXE_SECURITY=NS` marking, and partition table are still TODO. This
-directory holds the shared contract between the two firmware images of a
-Secure/Non-secure split R2P2:
+Status: **phase 1 working on hardware** (Pico 2, SDK 2.2.0, arm-none-eabi-gcc
+14.2; verified 2026-07-03). The combined image boots: monitor verifies the
+NS image (SHA-256 vs `.ns_manifest`), configures SAU/ACCESSCTRL/ITNS/DMA,
+and `blxns`es into a Non-secure mruby VM running the full R2P2 shell over
+USB CDC. Field-verified veneer round-trips: `sg_random_bytes` (RNG gem),
+`sg_flash_erase`/`sg_flash_program`/cache flush (FAT filesystem format at
+boot + runtime `File` write/read), `sg_sha256` (monitor-side NS verify).
+Build: monitor standalone (`monitor/CMakeLists.txt`), NS via
+`R2P2_TRUSTZONE=1 rake r2p2:picoruby:pico2:prod` (see `ns/ns_build.cmake`),
+then `rake r2p2:tz:package` → `package/R2P2-TZ-combined.uf2`. Still open:
+combined-image signing/secure boot, real crypto veneers (keystore, AEAD,
+HKDF), `sg_verify_mrb`. This directory holds the shared contract between
+the two firmware images of a Secure/Non-secure split R2P2:
 
 - `include/r2p2_sg_api.h` — the Secure Gateway (veneer) API, compiled into
   both images
