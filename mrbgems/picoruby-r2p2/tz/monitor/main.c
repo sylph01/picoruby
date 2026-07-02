@@ -63,8 +63,8 @@ static void busy_delay(uint32_t loops) {
 /* ~1 ms of busy-wait at 150 MHz (rough; the volatile loop is a handful of
  * cycles). Timings below are deliberately slow so blinks are countable. */
 #define BUSY_MS(n) ((n) * 25000u)
-#define LED_ON_MS  BUSY_MS(250)   /* breadcrumb blink on/off */
-#define LED_GAP_MS BUSY_MS(1200)  /* gap between breadcrumb blink groups */
+#define LED_ON_MS  BUSY_MS(120)   /* breadcrumb blink on/off */
+#define LED_GAP_MS BUSY_MS(550)   /* gap between breadcrumb blink groups */
 static void led_init(void) { gpio_init(TZ_LED_PIN); gpio_set_dir(TZ_LED_PIN, GPIO_OUT); }
 static void led_set(bool on) { gpio_put(TZ_LED_PIN, on); }
 static void led_blink(uint n) {

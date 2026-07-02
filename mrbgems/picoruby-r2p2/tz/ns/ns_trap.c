@@ -41,6 +41,25 @@ static void __attribute__((noreturn)) report(uint32_t ra, int marker, int hibit)
   }
 }
 
+/* Blink a small value: `marker` long pulses, then |value| short blinks.
+ * Used to report a bootrom return code (see flash_ns.c). */
+void __attribute__((noreturn)) ns_trap_code(int marker, int value) {
+  int v = value < 0 ? -value : value;
+  gpio_init(25); gpio_set_dir(25, GPIO_OUT);
+  for (;;) {
+    for (int i = 0; i < marker; i++) {
+      gpio_put(25, 1); t_busy(T_MS(900));
+      gpio_put(25, 0); t_busy(T_MS(450));
+    }
+    t_busy(T_MS(1800));
+    for (int i = 0; i < v; i++) {
+      gpio_put(25, 1); t_busy(T_MS(250));
+      gpio_put(25, 0); t_busy(T_MS(550));
+    }
+    t_busy(T_MS(4000));
+  }
+}
+
 void __attribute__((noreturn)) __wrap_abort(void) {
   report((uint32_t)__builtin_return_address(0), 2, 19);
 }

@@ -63,16 +63,21 @@ static int ns_flash_op(cflash_flags_t flags, uint32_t flash_offs,
     return fn(flags, XIP_BASE + flash_offs, count, buf);
 }
 
+/* TEMP bring-up: on error blink the bootrom rc instead of asserting, so we
+ * can read WHY checked_flash_op rejected the op (7=erase, 8=program;
+ * then |rc| short blinks -> e.g. 4=NOT_PERMITTED, 10=INVALID_ADDRESS). */
+extern void ns_trap_code(int marker, int value) __attribute__((noreturn));
+
 void __wrap_flash_range_erase(uint32_t flash_offs, size_t count) {
     int rc = ns_flash_op(TZ_CFLASH(CFLASH_OP_VALUE_ERASE),
                          flash_offs, (uint32_t)count, NULL);
-    hard_assert(rc == BOOTROM_OK);
+    if (rc != BOOTROM_OK) ns_trap_code(7, rc);
     sg_flash_flush_cache();
 }
 
 void __wrap_flash_range_program(uint32_t flash_offs, const uint8_t *data, size_t count) {
     int rc = ns_flash_op(TZ_CFLASH(CFLASH_OP_VALUE_PROGRAM),
                          flash_offs, (uint32_t)count, (uint8_t *)(uintptr_t)data);
-    hard_assert(rc == BOOTROM_OK);
+    if (rc != BOOTROM_OK) ns_trap_code(8, rc);
     sg_flash_flush_cache();
 }
