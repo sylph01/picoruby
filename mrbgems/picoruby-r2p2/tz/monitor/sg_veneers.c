@@ -29,6 +29,8 @@
 #include "pico/rand.h"
 #include "pico/sha256.h"
 #include "hardware/rcp.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_tz_config.h"
@@ -146,6 +148,40 @@ SG_API int sg_flash_flush_cache(void) {
     rom_flash_flush_cache_fn func =
         (rom_flash_flush_cache_fn) rom_func_lookup_inline(ROM_FUNC_FLASH_FLUSH_CACHE);
     func();
+    return SG_OK;
+}
+
+/* Is [offset, offset+count) entirely inside the NS filesystem partition? */
+static bool fs_range_ok(uint32_t offset, uint32_t count) {
+    uint64_t end = (uint64_t)offset + count;
+    return count != 0
+        && offset >= TZ_FS_OFFSET
+        && end <= (uint64_t)TZ_FS_OFFSET + TZ_FS_SIZE;
+}
+
+/* Erase/program run Secure-side: flash_range_erase/program are RAM-resident
+ * (__no_inline_not_in_flash_func) and manage XIP exit/re-enter and the cache
+ * flush themselves. We only add interrupt masking so no IRQ handler is
+ * fetched from the (temporarily unreadable) flash mid-op. Range is clamped
+ * to the NS fs partition; NS can't reach the monitor or NS-code regions. */
+SG_API int sg_flash_erase(uint32_t offset, uint32_t count) {
+    if (!fs_range_ok(offset, count)) return SG_ERR_BAD_PARAM;
+    if ((offset & (FLASH_SECTOR_SIZE - 1)) || (count & (FLASH_SECTOR_SIZE - 1)))
+        return SG_ERR_BAD_PARAM;
+    uint32_t save = save_and_disable_interrupts();
+    flash_range_erase(offset, count);
+    restore_interrupts(save);
+    return SG_OK;
+}
+
+SG_API int sg_flash_program(uint32_t offset, const uint8_t *data, uint32_t count) {
+    if (!fs_range_ok(offset, count)) return SG_ERR_BAD_PARAM;
+    if ((offset & (FLASH_PAGE_SIZE - 1)) || (count & (FLASH_PAGE_SIZE - 1)))
+        return SG_ERR_BAD_PARAM;
+    if (!ns_buffer_ok(data, count, false)) return SG_ERR_BAD_BUFFER;
+    uint32_t save = save_and_disable_interrupts();
+    flash_range_program(offset, data, count);
+    restore_interrupts(save);
     return SG_OK;
 }
 

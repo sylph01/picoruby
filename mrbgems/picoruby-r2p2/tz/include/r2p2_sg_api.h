@@ -190,6 +190,21 @@ SG_API int sg_hmac_sha256(sg_key_t key, const uint8_t *msg, size_t msg_len,
  * impact, and flash writes are rare (filesystem writes). */
 SG_API int sg_flash_flush_cache(void);
 
+/* Erase / program flash. offset and count are 0-based flash offsets (from
+ * the start of flash), matching the SDK's flash_range_* convention. The
+ * monitor performs the op Secure-side (flash_range_erase/program run from
+ * RAM with XIP handled and interrupts masked) — NS cannot do this safely
+ * because the ROM flash op leaves flash unreadable across the call and
+ * flash_safe_execute needs the Secure-only BOOTRAM lock.
+ *
+ * Both are clamped to the NS filesystem partition [TZ_FS_OFFSET,
+ * TZ_FS_OFFSET+TZ_FS_SIZE); anything outside returns SG_ERR_BAD_PARAM, so
+ * NS can never erase/program the monitor or the NS code image. erase needs
+ * 4 KiB alignment, program 256 B alignment. program validates the source
+ * buffer is NS memory. Each does its own cache flush. */
+SG_API int sg_flash_erase(uint32_t offset, uint32_t count);
+SG_API int sg_flash_program(uint32_t offset, const uint8_t *data, uint32_t count);
+
 /* ---- signed bytecode ----------------------------------------------------- */
 
 /* PHASE 2 — returns SG_ERR_NOT_PERMITTED in phase 1. Reserved in the ABI
