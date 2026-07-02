@@ -298,6 +298,21 @@ picorb_hal_idle_cpu(mrb_state *mrb)
   /* NB: do NOT poll tud_task() here — USB is serviced from usb_irq_handler
    * (USBCTRL_IRQ). tud_task() is not reentrant, so calling it from both the
    * idle loop and the IRQ corrupts USB. */
+#if defined(R2P2_TRUSTZONE)
+  /* TEMP diagnostic: reaching here means the scheduler is idling (VM got to
+   * the shell and is waiting for input). LED heartbeat proves that; the
+   * periodic '.' to stdout proves the CDC output path. If you see the LED
+   * blink but no dots -> output broken; dots -> output OK, input is the
+   * problem; neither -> VM never reaches idle (hung before the shell). */
+  {
+    static uint32_t c = 0;
+    if (((++c) & 0x3ffffu) == 0) {
+      gpio_xor_mask(1u << 25);
+      const char dot = '.';
+      picorb_hal_write(FD_STDOUT, &dot, 1);
+    }
+  }
+#endif
 #if defined(PICO_RP2040)
   __wfi();
 #elif defined(PICO_RP2350)
