@@ -106,19 +106,18 @@ SECTIONS
     __binary_info_end = .;
     . = ALIGN(4);
 
-    /* Secure Gateway veneers — the ONLY Non-secure-callable addresses in the
-     * monitor. SAU region: 0x1000f000..0x1000ffff, Secure + NSC. 32-byte
-     * alignment matches SAU region granularity. */
-    .gnu.sgstubs : ALIGN(32) {
-        __sg_start = .;
-        *(.gnu.sgstubs*)
-        . = ALIGN(32);
-        __sg_end = .;
-    } > FLASH_NSC
+    .ram_vector_table (NOLOAD): {
+        *(.ram_vector_table)
+    } > RAM_S
 
-    /* Unlike the default script, .data does NOT swallow .text*/.rodata*
-     * (no RAM-resident time-critical copies): RAM_S is 8 KiB total, and the
-     * monitor runs from Secure XIP. */
+    .uninitialized_data (NOLOAD): {
+        . = ALIGN(4);
+        *(.uninitialized_data*)
+    } > RAM_S
+
+    /* Unlike the default script, .data does NOT swallow leftover text and
+     * rodata input sections (no RAM-resident time-critical copies): RAM_S
+     * is 8 KiB total, and the monitor runs from Secure XIP. */
     .data : {
         __data_start__ = .;
         *(vtable)
@@ -164,6 +163,29 @@ SECTIONS
         KEEP(*(.embedded_end_block*))
         PROVIDE(__flash_binary_end = .);
     } > FLASH_S =0xaa
+
+    /* Secure Gateway veneers — the ONLY Non-secure-callable addresses in
+     * the monitor. SAU region: 0x1000f000..0x1000ffff, Secure + NSC;
+     * 32-byte alignment matches SAU region granularity. Placed LAST so
+     * load addresses stay monotonic (FLASH_NSC sits above everything
+     * FLASH_S loads, including .data's load image) — an out-of-order LMA
+     * makes ld unable to form program segments. */
+    .gnu.sgstubs : ALIGN(32) {
+        __sg_start = .;
+        *(.gnu.sgstubs*)
+        . = ALIGN(32);
+        __sg_end = .;
+    } > FLASH_NSC
+
+    /* crt0's data-copy table unconditionally references the scratch-bank
+     * symbols; the monitor has no scratch sections (SRAM8/9 ARE its main
+     * RAM), so satisfy them with empty ranges (start == end -> 0 bytes). */
+    __scratch_x_source__ = 0;
+    __scratch_x_start__ = 0;
+    __scratch_x_end__ = 0;
+    __scratch_y_source__ = 0;
+    __scratch_y_start__ = 0;
+    __scratch_y_end__ = 0;
 
     /* Monitor stack at the top of SRAM9. Single core, Secure only. */
     __StackTop = ORIGIN(RAM_S) + LENGTH(RAM_S);

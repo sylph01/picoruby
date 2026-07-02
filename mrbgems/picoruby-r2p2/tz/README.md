@@ -1,6 +1,6 @@
 # TrustZone-partitioned R2P2 (RP2350) — design sketch
 
-Status: **sketch / not built yet**. This directory holds the shared contract
+Status: **sketch; the monitor builds and links** (SDK 2.2.0, arm-none-eabi-gcc 14.2 — see monitor/CMakeLists.txt). The NS R2P2 build is not wired up yet. This directory holds the shared contract
 between the two firmware images of a Secure/Non-secure split R2P2:
 
 - `include/r2p2_sg_api.h` — the Secure Gateway (veneer) API, compiled into
