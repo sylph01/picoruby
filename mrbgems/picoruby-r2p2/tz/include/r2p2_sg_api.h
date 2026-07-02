@@ -155,6 +155,20 @@ SG_API int sg_aead_decrypt(sg_key_t key,
 SG_API int sg_hmac_sha256(sg_key_t key, const uint8_t *msg, size_t msg_len,
                           uint8_t mac[SG_SHA256_DIGEST_LEN]);
 
+/* ---- flash --------------------------------------------------------------- */
+
+/* Invalidate the entire XIP cache after NS flash writes. NS flash
+ * program/erase goes through the bootrom's checked_flash_op NS API (not a
+ * veneer), but the bootrom does NOT do cache maintenance, the ROM's
+ * flash_flush_cache is Arm-S-only, and NS maintenance-window writes are
+ * disabled by design (XIP_CTRL.MAINT_NONSEC stays clear — enabling it is
+ * unsafe while Secure code performs cached XIP accesses, which the XIP
+ * monitor does). So NS calls this after program/erase to make writes
+ * visible to subsequent cached reads. Whole-cache invalidate: costs the
+ * monitor its warm cache lines too — performance only, no security
+ * impact, and flash writes are rare (filesystem writes). */
+SG_API int sg_flash_flush_cache(void);
+
 /* ---- signed bytecode ----------------------------------------------------- */
 
 /* PHASE 2 — returns SG_ERR_NOT_PERMITTED in phase 1. Reserved in the ABI
