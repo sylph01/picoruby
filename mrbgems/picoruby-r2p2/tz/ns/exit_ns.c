@@ -22,6 +22,7 @@
 #include <string.h>
 #include <tusb.h>
 #include "hardware/irq.h"
+#include "hardware/gpio.h"
 #include "mruby.h"
 #include "hal.h"   /* picorb_hal_write -> mrb_hal_write (needs PICORB_VM_MRUBY) */
 
@@ -35,9 +36,14 @@ void __attribute__((noreturn)) _exit(int status) {
     /* Own USB servicing exclusively: disable the USB IRQ so its tud_task()
      * can't reenter ours (tud_task is not reentrant). */
     irq_set_enabled(USBCTRL_IRQ, false);
+    gpio_init(25); gpio_set_dir(25, GPIO_OUT);
     bool dumped = false;
+    uint32_t hb = 0;
     for (;;) {
         tud_task();
+        /* SLOW steady blink = "in _exit keepalive" (VM aborted). Distinct
+         * from the usb_irq flicker and from a static LED at the shell. */
+        if (((++hb) & 0x1ffffu) == 0) { gpio_xor_mask(1u << 25); }
         if (!dumped && tud_cdc_connected()) {
             emit("\r\n[TZ] _exit reached (VM aborted mid-boot).\r\n");
             if (global_mrb && global_mrb->exc) {
