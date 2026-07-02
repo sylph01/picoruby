@@ -49,6 +49,7 @@ function(r2p2_apply_tz_ns TARGET)
         ${R2P2_TZ_NS_DIR}/flash_ns.c
         ${R2P2_TZ_NS_DIR}/aon_ns.c
         ${R2P2_TZ_NS_DIR}/exit_ns.c   # TEMP: _exit -> USB console for bring-up
+        ${R2P2_TZ_NS_DIR}/ns_trap.c   # TEMP: wrap abort()/exit() -> blink caller addr
     )
 
     # NB: intentionally NOT linking pico_flash. flash_ns.c calls the bootrom
@@ -75,6 +76,9 @@ function(r2p2_apply_tz_ns TARGET)
         # TEMP bring-up: capture the class of an unhandled exception at the
         # exc_throw -> mrb_print_error -> abort() point (see exit_ns.c).
         LINKER:--wrap=mrb_print_error
+        # TEMP bring-up: capture WHO calls abort()/exit() (see ns_trap.c).
+        LINKER:--wrap=abort
+        LINKER:--wrap=exit
     )
 
     target_include_directories(${TARGET} PRIVATE
