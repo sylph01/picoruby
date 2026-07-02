@@ -114,10 +114,18 @@ static void __attribute__((noreturn)) blink_word(uint32_t w) {
 }
 
 void isr_busfault(void) {
-    /* BFAR holds the faulting address when BFARVALID; else all-ones marker. */
-    uint32_t addr = (m33_hw->cfsr & M33_CFSR_BFSR_BFARVALID_BITS)
-                    ? m33_hw->bfar : 0xffffffffu;
-    blink_word(addr);
+    /* Report the faulting NS instruction address (stacked PC), which maps
+     * to a function via nm/addr2line — more actionable than BFAR once we
+     * know it's a peripheral-access fault. NS was in thread mode using
+     * MSP_NS, so the exception frame is there; PC is word 6. Guard the SP
+     * so a bogus value can't nest-fault. Falls back to 0xbadadd50. */
+    uint32_t msp_ns;
+    __asm volatile ("mrs %0, msp_ns" : "=r" (msp_ns));
+    uint32_t pc = 0xbadadd50u;
+    if (msp_ns >= 0x20000000u && msp_ns < (0x20080000u - 32u)) {
+        pc = ((const uint32_t *)msp_ns)[6];
+    }
+    blink_word(pc);
 }
 void isr_hardfault(void)   { fault_blink(2); }
 void isr_securefault(void) { fault_blink(4); }
