@@ -20,39 +20,50 @@
  */
 
 #include <string.h>
-#include <tusb.h>
 #include "hardware/irq.h"
 #include "hardware/gpio.h"
 #include "mruby.h"
-#include "hal.h"   /* picorb_hal_write -> mrb_hal_write (needs PICORB_VM_MRUBY) */
 
 extern mrb_state *global_mrb;
-extern void mrb_print_error(mrb_state *mrb);
+extern const char *mrb_obj_classname(mrb_state *mrb, mrb_value obj);
 
-static void emit(const char *s) { picorb_hal_write(1, s, (int)strlen(s)); }
+/* Report the abort cause over the LED (GPIO25) as a small countable number
+ * of slow blinks — USB CDC has proven unreadable in NS bring-up, and this
+ * _exit path (C-level exit inside mrb_task_run) is the one actually taken.
+ * The number matches main.c's tz_blink_count table, with distinct markers
+ * for the _exit path: 14 = raw abort (no pending exception). */
+static void ns_busy(uint32_t loops) {
+    for (volatile uint32_t i = 0; i < loops; i++) __asm volatile ("nop");
+}
+#define NS_MS(n) ((n) * 25000u)  /* ~n ms at 150 MHz */
+static int ns_exc_index(const char *cls) {
+    static const char *names[] = {
+        "RuntimeError", "LoadError", "ArgumentError", "NoMethodError",   /* 2-5  */
+        "NameError", "TypeError", "StandardError", "NotImplementedError",/* 6-9  */
+        "IndexError", "KeyError", "RangeError", "ScriptError",           /* 10-13*/
+    };
+    for (int i = 0; i < 12; i++) if (strcmp(cls, names[i]) == 0) return i + 2;
+    return 15; /* an exception, but not one in the table */
+}
+static void __attribute__((noreturn)) ns_blink_count(int n) {
+    gpio_init(25); gpio_set_dir(25, GPIO_OUT);
+    for (;;) {
+        for (int i = 0; i < n; i++) {
+            gpio_put(25, 1); ns_busy(NS_MS(300));
+            gpio_put(25, 0); ns_busy(NS_MS(300));
+        }
+        ns_busy(NS_MS(4000));
+    }
+}
 
 void __attribute__((noreturn)) _exit(int status) {
     (void)status;
-    /* Own USB servicing exclusively: disable the USB IRQ so its tud_task()
-     * can't reenter ours (tud_task is not reentrant). */
     irq_set_enabled(USBCTRL_IRQ, false);
-    gpio_init(25); gpio_set_dir(25, GPIO_OUT);
-    bool dumped = false;
-    uint32_t hb = 0;
-    for (;;) {
-        tud_task();
-        /* SLOW steady blink = "in _exit keepalive" (VM aborted). Distinct
-         * from the usb_irq flicker and from a static LED at the shell. */
-        if (((++hb) & 0x1ffffu) == 0) { gpio_xor_mask(1u << 25); }
-        if (!dumped && tud_cdc_connected()) {
-            emit("\r\n[TZ] _exit reached (VM aborted mid-boot).\r\n");
-            if (global_mrb && global_mrb->exc) {
-                mrb_print_error(global_mrb);
-            } else {
-                emit("[TZ] no pending mruby exception (raw abort).\r\n");
-            }
-            emit("[TZ] halted; USB kept alive.\r\n");
-            dumped = true;
-        }
+    int n;
+    if (global_mrb && global_mrb->exc) {
+        n = ns_exc_index(mrb_obj_classname(global_mrb, mrb_obj_value(global_mrb->exc)));
+    } else {
+        n = 14; /* raw C-level abort, no pending mruby exception */
     }
+    ns_blink_count(n); /* never returns */
 }
