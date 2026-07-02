@@ -21,6 +21,7 @@
 
 #include <string.h>
 #include <tusb.h>
+#include "hardware/irq.h"
 #include "mruby.h"
 #include "hal.h"   /* picorb_hal_write -> mrb_hal_write (needs PICORB_VM_MRUBY) */
 
@@ -31,6 +32,9 @@ static void emit(const char *s) { picorb_hal_write(1, s, (int)strlen(s)); }
 
 void __attribute__((noreturn)) _exit(int status) {
     (void)status;
+    /* Own USB servicing exclusively: disable the USB IRQ so its tud_task()
+     * can't reenter ours (tud_task is not reentrant). */
+    irq_set_enabled(USBCTRL_IRQ, false);
     bool dumped = false;
     for (;;) {
         tud_task();
