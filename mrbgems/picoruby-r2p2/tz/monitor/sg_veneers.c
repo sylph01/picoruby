@@ -151,11 +151,11 @@ SG_API int sg_flash_flush_cache(void) {
     return SG_OK;
 }
 
-/* Is [offset, offset+count) entirely inside the NS filesystem partition? */
+/* Is [offset, offset+count) entirely inside the NS filesystem partition?
+ * count == 0 is accepted (callers treat it as a no-op, like the SDK). */
 static bool fs_range_ok(uint32_t offset, uint32_t count) {
     uint64_t end = (uint64_t)offset + count;
-    return count != 0
-        && offset >= TZ_FS_OFFSET
+    return offset >= TZ_FS_OFFSET
         && end <= (uint64_t)TZ_FS_OFFSET + TZ_FS_SIZE;
 }
 
@@ -168,6 +168,7 @@ SG_API int sg_flash_erase(uint32_t offset, uint32_t count) {
     if (!fs_range_ok(offset, count)) return SG_ERR_BAD_PARAM;
     if ((offset & (FLASH_SECTOR_SIZE - 1)) || (count & (FLASH_SECTOR_SIZE - 1)))
         return SG_ERR_BAD_PARAM;
+    if (count == 0) return SG_OK;
     uint32_t save = save_and_disable_interrupts();
     flash_range_erase(offset, count);
     restore_interrupts(save);
@@ -178,7 +179,10 @@ SG_API int sg_flash_program(uint32_t offset, const uint8_t *data, uint32_t count
     if (!fs_range_ok(offset, count)) return SG_ERR_BAD_PARAM;
     if ((offset & (FLASH_PAGE_SIZE - 1)) || (count & (FLASH_PAGE_SIZE - 1)))
         return SG_ERR_BAD_PARAM;
+    if (count == 0) return SG_OK;
     if (!ns_buffer_ok(data, count, false)) return SG_ERR_BAD_BUFFER;
+    /* NB: data must not point into XIP flash — flash is unreadable during
+     * the op (same constraint as the stock SDK; FatFS passes RAM buffers). */
     uint32_t save = save_and_disable_interrupts();
     flash_range_program(offset, data, count);
     restore_interrupts(save);
