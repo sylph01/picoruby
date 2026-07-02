@@ -22,11 +22,11 @@ static void t_busy(uint32_t loops) {
 }
 #define T_MS(n) ((n) * 25000u)  /* ~n ms at 150 MHz */
 
-static void __attribute__((noreturn)) report(uint32_t ra, int is_exit) {
+/* marker = 2:abort 3:exit 4:panic 5:__assert_func */
+static void __attribute__((noreturn)) report(uint32_t ra, int marker) {
   gpio_init(25); gpio_set_dir(25, GPIO_OUT);
   for (;;) {
-    /* marker */
-    for (int i = 0; i < (is_exit ? 3 : 2); i++) {
+    for (int i = 0; i < marker; i++) {
       gpio_put(25, 1); t_busy(T_MS(900));
       gpio_put(25, 0); t_busy(T_MS(450));
     }
@@ -42,10 +42,21 @@ static void __attribute__((noreturn)) report(uint32_t ra, int is_exit) {
 }
 
 void __attribute__((noreturn)) __wrap_abort(void) {
-  report((uint32_t)__builtin_return_address(0), 0);
+  report((uint32_t)__builtin_return_address(0), 2);
 }
 
 void __attribute__((noreturn)) __wrap_exit(int status) {
   (void)status;
-  report((uint32_t)__builtin_return_address(0), 1);
+  report((uint32_t)__builtin_return_address(0), 3);
+}
+
+void __attribute__((noreturn)) __wrap_panic(const char *fmt, ...) {
+  (void)fmt;
+  report((uint32_t)__builtin_return_address(0), 4);
+}
+
+void __attribute__((noreturn))
+__wrap___assert_func(const char *file, int line, const char *func, const char *expr) {
+  (void)file; (void)line; (void)func; (void)expr;
+  report((uint32_t)__builtin_return_address(0), 5);
 }
