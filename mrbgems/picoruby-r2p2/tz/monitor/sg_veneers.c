@@ -113,29 +113,21 @@ SG_API int sg_key_derive(sg_key_t parent, const uint8_t *info,
     return SG_ERR_NOT_PERMITTED;
 }
 
-SG_API int sg_key_derive_export(sg_key_t parent, const uint8_t *info,
-                                size_t info_len, uint8_t *out, size_t out_len) {
-    (void)parent; (void)info; (void)info_len; (void)out; (void)out_len;
+/* TODO(real impl): memcpy *req into Secure stack FIRST, then validate the
+ * copied pointers with ns_buffer_ok() — never re-read NS struct fields
+ * after validation (TOCTOU, ABI rule 5 in the header). */
+SG_API int sg_key_derive_export(sg_key_t parent, const sg_derive_export_t *req) {
+    (void)parent; (void)req;
     return SG_ERR_NOT_PERMITTED;
 }
 
-SG_API int sg_aead_encrypt(sg_key_t key,
-                           const uint8_t nonce[SG_AEAD_NONCE_LEN],
-                           const uint8_t *aad, size_t aad_len,
-                           const uint8_t *plaintext, size_t pt_len,
-                           uint8_t *out, size_t out_cap, size_t *out_len) {
-    (void)key; (void)nonce; (void)aad; (void)aad_len;
-    (void)plaintext; (void)pt_len; (void)out; (void)out_cap; (void)out_len;
+SG_API int sg_aead_encrypt(sg_aead_op_t *op) {
+    (void)op;
     return SG_ERR_NOT_PERMITTED;
 }
 
-SG_API int sg_aead_decrypt(sg_key_t key,
-                           const uint8_t nonce[SG_AEAD_NONCE_LEN],
-                           const uint8_t *aad, size_t aad_len,
-                           const uint8_t *in, size_t in_len,
-                           uint8_t *out, size_t out_cap, size_t *out_len) {
-    (void)key; (void)nonce; (void)aad; (void)aad_len;
-    (void)in; (void)in_len; (void)out; (void)out_cap; (void)out_len;
+SG_API int sg_aead_decrypt(sg_aead_op_t *op) {
+    (void)op;
     return SG_ERR_NOT_PERMITTED;
 }
 

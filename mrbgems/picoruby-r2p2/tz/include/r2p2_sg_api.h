@@ -33,6 +33,11 @@
  *     reachable only as handles.
  *  4. Return value: SG_OK (0) or a negative sg_status_t. Out-params are
  *     unspecified on error.
+ *  5. ABI: cmse_nonsecure_entry functions cannot take stack-passed
+ *     arguments (the NS stack is untrusted; GCC rejects >4 register
+ *     args). Wide operations therefore take a request struct. The monitor
+ *     must copy the struct into Secure memory BEFORE validating and using
+ *     the embedded pointers — NS could rewrite fields mid-call (TOCTOU).
  */
 
 #ifndef R2P2_SG_API_H
@@ -49,8 +54,13 @@ extern "C" {
  * against a mismatched monitor. */
 #define SG_API_VERSION 0x0001
 
+/* noipa: GCC's IPA passes otherwise clone entry functions into local
+ * `*.constprop.N` symbols (e.g. when a stub ignores its arguments), and
+ * CMSE veneer generation requires global function symbols — the clone is
+ * a hard link error. used: veneers must exist even with no Secure-side
+ * caller. */
 #if defined(R2P2_TZ_MONITOR)
-#define SG_API __attribute__((cmse_nonsecure_entry))
+#define SG_API __attribute__((cmse_nonsecure_entry, noipa, used))
 #else
 #define SG_API
 #endif
@@ -125,32 +135,43 @@ SG_API int sg_key_derive(sg_key_t parent, const uint8_t *info,
 /* Same derivation, but the derived key material is written to NS memory.
  * Requires SG_KEY_POLICY_EXPORT_DERIVED on parent. This is the deliberate
  * tier-2 knob: compromise of NS reveals the session key, never the parent.
- * Feeds e.g. MbedTLS::Cipher#key= for NS-side TLS/AEAD sessions. */
-SG_API int sg_key_derive_export(sg_key_t parent, const uint8_t *info,
-                                size_t info_len, uint8_t *out,
-                                size_t out_len);
+ * Feeds e.g. MbedTLS::Cipher#key= for NS-side TLS/AEAD sessions.
+ * Request struct per ABI rule 5 (5 args would spill to the NS stack). */
+typedef struct {
+    const uint8_t *info;
+    size_t info_len;
+    uint8_t *out;
+    size_t out_len;
+} sg_derive_export_t;
+
+SG_API int sg_key_derive_export(sg_key_t parent, const sg_derive_export_t *req);
 
 /* ---- AEAD / MAC ---------------------------------------------------------- */
 
 /* ChaCha20-Poly1305 (RFC 8439). Chosen over AES-GCM: RP2350 has no AES
  * hardware, and ChaCha20 is naturally constant-time in software — no
  * table-lookup side channels — and small enough that the monitor needs no
- * mbedTLS at all. out must have room for pt_len + SG_AEAD_TAG_LEN (tag is
- * appended). Nonce discipline is the caller's job; the monitor does not
- * track uniqueness in the sketch. */
-SG_API int sg_aead_encrypt(sg_key_t key,
-                           const uint8_t nonce[SG_AEAD_NONCE_LEN],
-                           const uint8_t *aad, size_t aad_len,
-                           const uint8_t *plaintext, size_t pt_len,
-                           uint8_t *out, size_t out_cap, size_t *out_len);
+ * mbedTLS at all. Request struct per ABI rule 5. Nonce discipline is the
+ * caller's job; the monitor does not track uniqueness in the sketch.
+ *
+ * encrypt: in/in_len = plaintext; out must have room for
+ *          in_len + SG_AEAD_TAG_LEN (tag appended); out_len written.
+ * decrypt: in/in_len = ciphertext||tag; returns SG_ERR_AUTH_FAILED (and
+ *          writes nothing) on tag mismatch. */
+typedef struct {
+    sg_key_t key;
+    const uint8_t *nonce;   /* SG_AEAD_NONCE_LEN bytes */
+    const uint8_t *aad;
+    size_t aad_len;
+    const uint8_t *in;
+    size_t in_len;
+    uint8_t *out;
+    size_t out_cap;
+    size_t out_len;         /* written by the monitor */
+} sg_aead_op_t;
 
-/* Counterpart: `in` is ciphertext||tag as produced above; returns
- * SG_ERR_AUTH_FAILED (and writes nothing) on tag mismatch. */
-SG_API int sg_aead_decrypt(sg_key_t key,
-                           const uint8_t nonce[SG_AEAD_NONCE_LEN],
-                           const uint8_t *aad, size_t aad_len,
-                           const uint8_t *in, size_t in_len,
-                           uint8_t *out, size_t out_cap, size_t *out_len);
+SG_API int sg_aead_encrypt(sg_aead_op_t *op);
+SG_API int sg_aead_decrypt(sg_aead_op_t *op);
 
 SG_API int sg_hmac_sha256(sg_key_t key, const uint8_t *msg, size_t msg_len,
                           uint8_t mac[SG_SHA256_DIGEST_LEN]);
