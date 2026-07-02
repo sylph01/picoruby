@@ -161,8 +161,14 @@ peripherals reset with NSP/NSU clear (Secure-only).
   `USBCTRL`, `PIO0`–`PIO2`, `IO_BANK0`, `PADS_BANK0`, `ADC0`, `HSTX`,
   `I2C0`, `I2C1`, `PWM`, `SPI0`, `SPI1`, `TIMER0`, `UART0`, `UART1`,
   `WATCHDOG` (an NS watchdog reboot just re-enters secure boot —
-  acceptable), `SYSINFO`, `TBMAN`. RESETS access rides on the
-  per-peripheral bits, so NS can reset-cycle its own peripherals.
+  acceptable), `SYSINFO`, `TBMAN`, and **`RESETS`** (the block itself).
+- **RESETS needs BOTH grants** (datasheet §10.6.2.2): peripheral drivers
+  (`uart_init`, `i2c_init`, ...) reset their block on init via the RESETS
+  register, which faults from NS unless the RESETS block is NS-granted.
+  This is safe — each reset bit is independently gated by that
+  peripheral's own ACCESSCTRL, so NS still cannot reset the Secure-only
+  peripherals (OTP/XIP/CLOCKS/etc.). Confirmed on target: without the
+  RESETS grant, `uart_init` BusFaulted at boot.
 - **GPIO**: `GPIO_NSMASK0` for all user pins; QSPI pads stay Secure; USB
   DP/DM are NSMASK1 bits 30/31 and must be NS for TinyUSB.
 - **IRQs**: NVIC ITNS for every NS peripheral's IRQ; NS interrupts then

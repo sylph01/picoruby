@@ -245,10 +245,8 @@ static void partition_configure(void) {
 
     /* ACCESSCTRL, peripheral side: grant NS to everything R2P2 drives.
      * Peripherals not listed keep their Secure-only reset value: OTP, TRNG,
-     * SHA256, CLOCKS, XOSC, ROSC, PLLs, POWMAN, TICKS, RESETS(*), XIP_QMI,
-     * XIP_CTRL, XIP_AUX, BUSCTRL, SYSCFG, PADS_QSPI, TIMER1, CORESIGHT_*.
-     * (*) RESETS access rides on the per-peripheral bits (§10.6.2), so NS
-     * can still reset-cycle its own peripherals. */
+     * SHA256, CLOCKS, XOSC, ROSC, PLLs, POWMAN, TICKS, XIP_QMI, XIP_CTRL,
+     * XIP_AUX, BUSCTRL, SYSCFG, PADS_QSPI, TIMER1, CORESIGHT_*. */
     accessctrl_hw->dma        = AC_ALLOW_ALL;
     accessctrl_hw->usbctrl    = AC_ALLOW_ALL;
     accessctrl_hw->pio[0]     = AC_ALLOW_ALL;
@@ -269,6 +267,16 @@ static void partition_configure(void) {
     accessctrl_hw->watchdog   = AC_ALLOW_ALL;  /* NS reboot re-enters secure boot */
     accessctrl_hw->sysinfo    = AC_ALLOW_ALL;
     accessctrl_hw->tbman      = AC_ALLOW_ALL;
+
+    /* Grant NS access to the RESETS block itself. Peripheral drivers
+     * (uart_init, i2c_init, spi_init, ...) reset their block on init via
+     * RESETS, which faults from NS unless the block is NS-accessible
+     * (datasheet §10.6.2.2: NS reset of a peripheral needs BOTH the
+     * peripheral NS-granted AND the RESETS block NS-granted). This is safe:
+     * each reset bit is independently gated by that peripheral's own
+     * ACCESSCTRL, so NS still cannot reset OTP/XIP/CLOCKS/etc. (they remain
+     * Secure-only per-peripheral above). */
+    accessctrl_hw->resets     = AC_ALLOW_ALL;
 
     /* GPIO: user pins to NS (both domains), QSPI pads stay Secure-only.
      * GPIO_NSMASK is the one ACCESSCTRL register with no password. Pico 2
