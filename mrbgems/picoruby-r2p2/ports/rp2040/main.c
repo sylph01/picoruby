@@ -126,26 +126,30 @@ gpio_init_safe(void)
 }
 
 #if defined(R2P2_TRUSTZONE)
-/* Report the boot-exception class over the LED (GPIO25), since USB CDC is
- * unreliable during NS bring-up. Blinks a 32-bit word as 8 hex nibbles,
- * MSB first; value 0 = one long pulse. Slow and countable. */
+/* Report the boot outcome over the LED (GPIO25) as a small, countable
+ * number of slow blinks (USB CDC is unreliable during NS bring-up).
+ * The number is an index into a table of likely boot-exception classes. */
 static void tz_busy(uint32_t loops) {
   for (volatile uint32_t i = 0; i < loops; i++) __asm volatile ("nop");
 }
 #define TZ_MS(n) ((n) * 25000u)  /* ~n ms at 150 MHz */
-static void tz_nibble(unsigned v) {
-  if (v == 0) { gpio_put(25, 1); tz_busy(TZ_MS(1400)); gpio_put(25, 0); }
-  else for (unsigned i = 0; i < v; i++) {
-    gpio_put(25, 1); tz_busy(TZ_MS(350));
-    gpio_put(25, 0); tz_busy(TZ_MS(350));
-  }
-  tz_busy(TZ_MS(2200));
+static int tz_exc_index(const char *cls) {
+  static const char *names[] = {
+    "RuntimeError", "LoadError", "ArgumentError", "NoMethodError",   /* 2-5  */
+    "NameError", "TypeError", "StandardError", "NotImplementedError",/* 6-9  */
+    "IndexError", "KeyError", "RangeError", "ScriptError",           /* 10-13*/
+  };
+  for (int i = 0; i < 12; i++) if (strcmp(cls, names[i]) == 0) return i + 2;
+  return 15; /* an exception, but not one in the table */
 }
-static void __attribute__((noreturn)) tz_blink_word(uint32_t w) {
+static void __attribute__((noreturn)) tz_blink_count(int n) {
   gpio_init(25); gpio_set_dir(25, GPIO_OUT);
   for (;;) {
-    for (int s = 28; s >= 0; s -= 4) tz_nibble((w >> s) & 0xfu);
-    tz_busy(TZ_MS(5000));
+    for (int i = 0; i < n; i++) {
+      gpio_put(25, 1); tz_busy(TZ_MS(300));
+      gpio_put(25, 0); tz_busy(TZ_MS(300));
+    }
+    tz_busy(TZ_MS(4000)); /* long gap before repeating the count */
   }
 }
 #endif
@@ -201,15 +205,13 @@ main(void)
      * "Type", ...), or "NONE"=0x4E4F4E45 if the VM exited with no exception
      * (clean scheduler end). */
     irq_set_enabled(USBCTRL_IRQ, false);
-    uint32_t code;
+    int n;
     if (mrb->exc) {
-      const char *cls = mrb_obj_classname(mrb, mrb_obj_value(mrb->exc));
-      code = 0;
-      for (int i = 0; i < 4 && cls[i]; i++) code = (code << 8) | (uint8_t)cls[i];
+      n = tz_exc_index(mrb_obj_classname(mrb, mrb_obj_value(mrb->exc)));
     } else {
-      code = 0x4E4F4E45u; /* "NONE" */
+      n = 1; /* clean exit, no exception (boot completed / shell returned) */
     }
-    tz_blink_word(code); /* never returns */
+    tz_blink_count(n); /* never returns */
   }
 #endif
   if (mrb->exc) {
