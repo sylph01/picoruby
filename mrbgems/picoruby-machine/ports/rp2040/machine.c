@@ -297,6 +297,18 @@ picorb_hal_idle_cpu()
 picorb_hal_idle_cpu(mrb_state *mrb)
 #endif
 {
+#if defined(R2P2_TRUSTZONE)
+  /* TZ: USB enumeration is otherwise driven by USBCTRL_IRQ, which may not be
+   * delivered to NS. Poll tud_task() here so the CDC port enumerates from the
+   * scheduler idle. Heartbeat on GPIO25 confirms the VM is looping. TEMP. */
+  {
+    extern void tud_task(void);
+    tud_task();
+    static uint32_t hb = 0;
+    static bool on = false;
+    if (((++hb) & 0x3ffffu) == 0) { on = !on; gpio_put(25, on); }
+  }
+#endif
 #if defined(PICO_RP2040)
   __wfi();
 #elif defined(PICO_RP2350)
