@@ -14,6 +14,9 @@ function(r2p2_apply_tz_ns TARGET)
     # Stages that cannot run Non-secure (see runtime_init_ns.c header):
     # bootrom_state_reset is an Arm-S-only ROM API.
     target_compile_definitions(${TARGET} PRIVATE
+        # Let shared gem source (machine.c etc.) guard NS-incompatible code
+        # (e.g. Secure-only CLOCKS/POWMAN accesses) with #ifdef R2P2_TRUSTZONE.
+        R2P2_TRUSTZONE=1
         PICO_RUNTIME_SKIP_INIT_BOOTROM_RESET=1
         PICO_RUNTIME_SKIP_INIT_PER_CORE_BOOTROM_RESET=1
         # bootrom_locking_enable acquires BOOTROM_LOCK_ENABLE, a lock word in
