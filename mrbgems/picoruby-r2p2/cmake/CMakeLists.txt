@@ -183,7 +183,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   pico_stdlib
   pico_stdio
   pico_stdio_uart
-  pico_bootsel_via_double_reset
   pico_rand
   tinyusb_device
   tinyusb_board
@@ -202,6 +201,14 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   hardware_dma
   mruby
 )
+
+# double-tap-reset-to-BOOTSEL: its constructor runs before main and reads
+# powman_hw->chip_reset (POWMAN, Secure-only under the TZ split) -> BusFault
+# from NS. Non-essential (BOOTSEL still works via the button, and the ROM
+# can do double-tap via OTP BOOT_FLAGS), so drop it in the TZ build.
+if(NOT R2P2_TRUSTZONE)
+  target_link_libraries(${PROJECT_NAME} PRIVATE pico_bootsel_via_double_reset)
+endif()
 
 # Sleep functionality for both RP2040 and RP2350
 target_link_libraries(${PROJECT_NAME} PRIVATE
