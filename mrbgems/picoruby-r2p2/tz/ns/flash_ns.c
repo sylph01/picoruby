@@ -38,31 +38,41 @@
 #include "pico.h"
 #include "pico/bootrom.h"
 #include "boot/bootrom_constants.h"
-#include "hardware/flash.h"
 #include "hardware/regs/addressmap.h"
 
 #include "../include/r2p2_sg_api.h"
 
-/* No QMI address translation is configured in R2P2, and the partition
- * table is expressed in storage addresses: use the storage address space
- * (ASPACE_STORAGE), addressed as XIP_BASE + offset per §5.4.8.9. */
+/* Do NOT use the SDK's rom_flash_op() wrapper here: it calls
+ * bootrom_try_acquire_lock(), which reads/writes a lock word in BOOTRAM
+ * (0x400e0000). BOOTRAM is Secure-only, and that access runs in NS state,
+ * so it bus-faults (confirmed on target 2026-07-02: BusFault, BFAR =
+ * 0x400e0000). Instead call the bootrom flash_op ROM function directly:
+ * from NS, rom_func_lookup returns the Non-secure 'FO' entry, which is a
+ * secure gateway — the Secure bootrom does the BOOTRAM/QMI work on the
+ * Secure side. It also enforces the partition table's NS permissions
+ * (only the fs partition is NS-writable), so no seclevel games are needed
+ * or allowed from NS. Requires the monitor to have enabled the
+ * checked_flash_op NS API (it does). */
 #define TZ_CFLASH(op) ((cflash_flags_t){ .flags = \
         ((op) << CFLASH_OP_LSB) | \
-        (CFLASH_SECLEVEL_VALUE_NONSECURE << CFLASH_SECLEVEL_LSB) | \
         (CFLASH_ASPACE_VALUE_STORAGE << CFLASH_ASPACE_LSB) })
 
+static int ns_flash_op(cflash_flags_t flags, uint32_t flash_offs,
+                       uint32_t count, uint8_t *buf) {
+    rom_flash_op_fn fn = (rom_flash_op_fn) rom_func_lookup(ROM_FUNC_FLASH_OP);
+    return fn(flags, XIP_BASE + flash_offs, count, buf);
+}
+
 void __wrap_flash_range_erase(uint32_t flash_offs, size_t count) {
-    int rc = rom_flash_op(TZ_CFLASH(CFLASH_OP_VALUE_ERASE),
-                          XIP_BASE + flash_offs, (uint32_t)count, NULL);
+    int rc = ns_flash_op(TZ_CFLASH(CFLASH_OP_VALUE_ERASE),
+                         flash_offs, (uint32_t)count, NULL);
     hard_assert(rc == BOOTROM_OK);
     sg_flash_flush_cache();
 }
 
 void __wrap_flash_range_program(uint32_t flash_offs, const uint8_t *data, size_t count) {
-    /* rom_flash_op takes a non-const buf; program ops never write to it. */
-    int rc = rom_flash_op(TZ_CFLASH(CFLASH_OP_VALUE_PROGRAM),
-                          XIP_BASE + flash_offs, (uint32_t)count,
-                          (uint8_t *)(uintptr_t)data);
+    int rc = ns_flash_op(TZ_CFLASH(CFLASH_OP_VALUE_PROGRAM),
+                         flash_offs, (uint32_t)count, (uint8_t *)(uintptr_t)data);
     hard_assert(rc == BOOTROM_OK);
     sg_flash_flush_cache();
 }

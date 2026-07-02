@@ -16,6 +16,12 @@ function(r2p2_apply_tz_ns TARGET)
     target_compile_definitions(${TARGET} PRIVATE
         PICO_RUNTIME_SKIP_INIT_BOOTROM_RESET=1
         PICO_RUNTIME_SKIP_INIT_PER_CORE_BOOTROM_RESET=1
+        # bootrom_locking_enable acquires BOOTROM_LOCK_ENABLE, a lock word in
+        # BOOTRAM (0x400e0000) — Secure-only, bus-faults from NS (confirmed
+        # on target 2026-07-02). The monitor already enabled bootrom locking
+        # system-wide; NS bootrom calls go through secure gateways that lock
+        # Secure-side, so NS neither can nor needs to hold the lock itself.
+        PICO_RUNTIME_SKIP_INIT_BOOTROM_LOCKING_ENABLE=1
     )
 
     # Strong overrides for the __weak stages that must behave differently
@@ -33,9 +39,10 @@ function(r2p2_apply_tz_ns TARGET)
         ${R2P2_TZ_NS_DIR}/flash_ns.c
     )
 
-    # rom_flash_op() serializes through flash_safe_execute().
-    # Keyword (PRIVATE) form to match the R2P2 CMakeLists' usage.
-    target_link_libraries(${TARGET} PRIVATE pico_flash)
+    # NB: intentionally NOT linking pico_flash. flash_ns.c calls the bootrom
+    # NS flash_op secure-gateway directly (not the rom_flash_op wrapper), so
+    # we avoid flash_safe_execute and its BOOTRAM lock — which is Secure-only
+    # and bus-faults from NS.
 
     # pico_rand / hardware_flash are SDK INTERFACE libs whose .c files are
     # injected as peer objects, so rand_ns.c / flash_ns.c cannot simply
