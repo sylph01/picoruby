@@ -24,13 +24,22 @@ Secure/Non-secure split R2P2:
    paper's "never execute secure code from flash" tip targets the latter).
    Revisit with encrypted boot / SRAM packaging if physical attacks enter
    the threat model.
-2. **The bootrom verifies everything at boot.** Monitor + NS image are
-   packaged and signed as ONE unit: the monitor's IMAGE_DEF signature covers
-   both flash regions. Note the bootrom cannot launch an `EXE_SECURITY=NS`
-   image (the `rp2350_arm_ns` family is "not directly bootable", datasheet
-   §5.9), so `chain_image()` is not used; the monitor performs the NS entry
-   itself. Consequence: no signature-verification code in the monitor at
-   all — no mbedTLS.
+2. **Ship-together with a hash manifest** (revised 2026-07-02; originally
+   "one signed unit via LOAD_MAP"). The bootrom verifies only the monitor's
+   signature; the monitor authenticates the NS image by comparing its
+   SHA-256 against a digest in the signed `.ns_manifest` section
+   (`monitor/main.c` `verify_ns_image()`, ~30 lines on the already-linked
+   `pico_sha256`). The digest is patched in at packaging time
+   (`rake r2p2:tz:package`) and the monitor is sealed AFTER patching, so
+   the boot signature transitively covers the NS bytes. Trade-off accepted:
+   every NS change re-patches + re-signs the monitor — fine while both
+   images ship together. If NS ever updates independently in the field,
+   graduate to a signed manifest verified against a stable public key
+   (ECDSA in the monitor); the manifest carries a `version` field from day
+   one so that extends rather than replaces this format. (The bootrom
+   cannot launch an `EXE_SECURITY=NS` image — `rp2350_arm_ns` is "not
+   directly bootable", §5.9 — so the monitor performs the NS entry itself
+   in every variant.) Still no mbedTLS in the monitor.
 3. **`sg_verify_mrb` is deferred to phase 2** and returns
    `SG_ERR_NOT_PERMITTED` until the verification story (ECDSA vs HMAC seal)
    is settled.
@@ -191,18 +200,22 @@ All bootrom NS APIs default to *disabled*. The monitor enables exactly:
    `r2p2_sg_implib.o`. IMAGE_DEF `EXE_SECURITY=NS`, UF2 family
    `RP2350_ARM_NS`. There is no `rp2350-arm-ns` SDK platform — expect to
    build under `rp2350-arm-s` and patch, or write a platform file.
-3. **Packaging**: the two binaries are combined and signed as one unit —
-   the monitor's IMAGE_DEF (`EXE_SECURITY=S`) signature covers
-   0x10000000..NS image end, so the bootrom verifies both at boot. The
-   bootrom cannot launch NS images (`rp2350_arm_ns` is "not directly
-   bootable"), so `chain_image()` is not used.
+3. **Packaging** (`rake r2p2:tz:package`): SHA-256 the built NS `.bin` →
+   `objcopy --update-section .ns_manifest` into the monitor ELF →
+   `picotool seal --sig` (if `R2P2_TZ_SIGKEY` set; unsigned dev package
+   otherwise) → regenerate the monitor UF2 → concatenate monitor+NS UF2s
+   into `R2P2-TZ-combined.uf2` (UF2 blocks are self-addressing, one
+   BOOTSEL drop flashes both).
 4. **Partition table** with the FS partition marked NS_R/NS_W; embedded via
-   `pico_embed_pt_in_binary` / picotool.
-5. Boot: bootrom verifies the combined image + enters the monitor (S) →
-   monitor derives keys from OTP + ratchets SW_LOCK, configures SAU +
-   ACCESSCTRL(+LOCK) + ITNS + DMA SECCFG + GPIO NS masks, enables the
-   bootrom NS APIs above → sets VTOR_NS/MSP_NS + NSACR (NS FPU) → `blxns`
-   into the NS reset handler. See `monitor/main.c`.
+   `pico_embed_pt_in_binary` / picotool ("partition-table-in-image boot",
+   §5.1.14 — the table rides in the monitor image, loaded as the resident
+   table that `checked_flash_op` validates against). Still TODO.
+5. Boot: bootrom verifies the monitor image + enters it (S) → monitor
+   SHA-256-verifies the NS region against `.ns_manifest` (dev builds with
+   an unpatched manifest skip this) → derives keys from OTP + ratchets
+   SW_LOCK → configures SAU + ACCESSCTRL(+LOCK) + ITNS + DMA SECCFG + GPIO
+   NS masks, enables the bootrom NS APIs above → sets VTOR_NS/MSP_NS +
+   NSACR → `blxns` into the NS reset handler. See `monitor/main.c`.
 
 ## Building (both images)
 
@@ -218,11 +231,18 @@ R2P2_TRUSTZONE=1 \
   PICO_EXTRAS_PATH=/path/to/pico-extras \
   rake r2p2:picoruby:pico2:prod
 # artifacts in build/r2p2/picoruby/pico2/prod-tz/
+
+# 3. Package: patch NS digest into the monitor, seal, combined UF2
+rake r2p2:tz:package                      # unsigned dev package
+R2P2_TZ_SIGKEY=key.pem rake r2p2:tz:package  # sealed for secure boot
+# -> build/r2p2/picoruby/pico2/prod-tz/package/R2P2-TZ-combined.uf2
 ```
 
 `R2P2_TRUSTZONE=1` defaults `R2P2_TZ_IMPLIB` to the monitor's standalone
 build output; set it explicitly to point elsewhere. The rake task appends a
 `-tz` suffix to the build dir so TZ and stock artifacts coexist. pico2 only.
+An unpackaged monitor (placeholder manifest) skips the NS hash check at
+boot, so plain dev iteration doesn't require repackaging on every change.
 
 ## Secure boot enable (OTP, irreversible — datasheet §10.5)
 

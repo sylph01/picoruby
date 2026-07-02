@@ -80,6 +80,64 @@ def r2p2_build_dir(vm, board, mode)
 end
 
 namespace :r2p2 do
+  namespace :tz do
+    # Ship-together packaging (see mrbgems/picoruby-r2p2/tz/README.md):
+    # hash the built NS image, patch the digest into the monitor's
+    # .ns_manifest section, regenerate the monitor UF2, optionally seal
+    # with a signing key (R2P2_TZ_SIGKEY), and emit a combined UF2.
+    # Layout must match tz_ns_manifest_t in tz/include/r2p2_tz_config.h.
+    desc "Patch NS digest into the TZ monitor and package (env: R2P2_TZ_MODE=prod|debug, R2P2_TZ_SIGKEY, R2P2_TZ_NS_VERSION)"
+    task :package do
+      require "digest"
+
+      mode = ENV["R2P2_TZ_MODE"] || "prod"
+      monitor_build = "#{R2P2_GEM_DIR}/tz/monitor/build"
+      monitor_elf = "#{monitor_build}/r2p2_tz_monitor.elf"
+      ns_dir = "#{MRUBY_ROOT}/build/r2p2/picoruby/pico2/#{mode}-tz"
+      ns_bin = Dir["#{ns_dir}/R2P2-*.bin"].max_by { |f| File.mtime(f) }
+      ns_uf2 = ns_bin&.sub(/\.bin\z/, ".uf2")
+
+      raise "Monitor not built: #{monitor_elf}" unless File.exist?(monitor_elf)
+      raise "NS image not built in #{ns_dir} (run the r2p2:picoruby:pico2:#{mode} task with R2P2_TRUSTZONE=1)" unless ns_bin
+
+      picotool = Dir["#{monitor_build}/_deps/picotool*/picotool",
+                     "#{ns_dir}/_deps/picotool*/picotool"].find { |f| File.executable?(f) } || "picotool"
+
+      ns_bytes = File.binread(ns_bin)
+      digest = Digest::SHA256.digest(ns_bytes)
+      magic = 0x52324e53 # TZ_NS_MANIFEST_MAGIC "R2NS"
+      version = (ENV["R2P2_TZ_NS_VERSION"] || 0).to_i
+      manifest = [magic, version, ns_bytes.bytesize].pack("V3") + digest
+
+      out_dir = "#{ns_dir}/package"
+      FileUtils.mkdir_p out_dir
+      manifest_bin = "#{out_dir}/ns_manifest.bin"
+      patched_elf = "#{out_dir}/r2p2_tz_monitor_packaged.elf"
+      File.binwrite(manifest_bin, manifest)
+
+      sh "arm-none-eabi-objcopy --update-section .ns_manifest=#{manifest_bin} #{monitor_elf} #{patched_elf}"
+
+      if ENV["R2P2_TZ_SIGKEY"]
+        # Seal AFTER patching so the signature covers the digest.
+        sh "#{picotool} seal --quiet --sig #{ENV['R2P2_TZ_SIGKEY']} #{patched_elf} #{patched_elf}"
+      end
+
+      monitor_uf2 = "#{out_dir}/r2p2_tz_monitor_packaged.uf2"
+      sh "#{picotool} uf2 convert --quiet #{patched_elf} #{monitor_uf2}"
+
+      # UF2 blocks are self-addressing; concatenation flashes both images
+      # in one BOOTSEL drop (both are rp2350-arm-s family for now — the NS
+      # image is entered by the monitor, never by the bootrom).
+      combined = "#{out_dir}/R2P2-TZ-combined.uf2"
+      File.binwrite(combined, File.binread(monitor_uf2) + File.binread(ns_uf2))
+
+      puts "NS image:  #{ns_bin} (#{ns_bytes.bytesize} bytes)"
+      puts "SHA-256:   #{digest.unpack1('H*')}"
+      puts "Packaged:  #{patched_elf}#{ENV['R2P2_TZ_SIGKEY'] ? ' (sealed)' : ' (UNSIGNED dev package)'}"
+      puts "Combined:  #{combined}"
+    end
+  end
+
   desc "Initialize git submodules for R2P2"
   task :setup do
     FileUtils.cd MRUBY_ROOT do
