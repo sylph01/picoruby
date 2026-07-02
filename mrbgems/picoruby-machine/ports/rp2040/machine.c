@@ -218,6 +218,10 @@ picorb_hal_init(void)
   irq_set_priority(ALARM_IRQ, PICO_HIGHEST_IRQ_PRIORITY);
   timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + US_PER_MS;
 
+#if !defined(R2P2_TRUSTZONE)
+  /* CLOCKS is Secure-only under the TrustZone split; NS writes bus-fault.
+   * This only tunes idle clock-gating (sleep_en), so NS simply leaves the
+   * defaults (all clocks on during idle). The monitor owns CLOCKS. */
   clocks_hw->sleep_en0 = 0;
 #if defined(PICO_RP2040)
   clocks_hw->sleep_en1 =
@@ -241,8 +245,17 @@ picorb_hal_init(void)
 #else
   #error "Unsupported Board"
 #endif
+#endif /* !R2P2_TRUSTZONE */
 
   tud_init(TUD_OPT_RHPORT);
+#if defined(R2P2_TRUSTZONE)
+  /* TEMP bring-up breadcrumb: 2 blinks after USB init reached. */
+  gpio_init(25); gpio_set_dir(25, GPIO_OUT);
+  for (int k = 0; k < 2; k++) {
+    gpio_put(25, 1); for (volatile int j = 0; j < 8000000; j++) {}
+    gpio_put(25, 0); for (volatile int j = 0; j < 8000000; j++) {}
+  }
+#endif
   irq_add_shared_handler(USBCTRL_IRQ, usb_irq_handler,
       PICO_SHARED_IRQ_HANDLER_LOWEST_ORDER_PRIORITY);
 }
