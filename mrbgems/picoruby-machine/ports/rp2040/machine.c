@@ -198,9 +198,6 @@ alarm_handler(void)
 static void
 usb_irq_handler(void)
 {
-#if defined(R2P2_TRUSTZONE)
-  gpio_xor_mask(1u << 25); /* TEMP: toggle LED each USB IRQ (flicker = IRQ alive) */
-#endif
   tud_task();
 }
 
@@ -373,7 +370,13 @@ picorb_hal_read_available(void)
 int
 picorb_hal_getchar(void)
 {
+#if !defined(R2P2_TRUSTZONE)
+  /* TZ: USB is serviced exclusively by usb_irq_handler (USBCTRL_IRQ).
+   * tud_task() is not reentrant, so calling it here too — while the IRQ
+   * also calls it — corrupts CDC data flow. The IRQ's tud_cdc_rx_cb()
+   * fills stdin_rb, which we read below. */
   tud_task();
+#endif
 
   /* Drain any bytes left in the CDC FIFO that tud_cdc_rx_cb() could
    * not push because the ring buffer was full at the time.  Now that
