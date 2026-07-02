@@ -75,21 +75,6 @@ static void led_blink(uint n) {
     busy_delay(LED_GAP_MS);
 }
 
-/* Fault self-report. BFHFNMINS=0 means NS bus/hard faults escalate to these
- * SECURE handlers, so an NS fault shows up here rather than as a dead hang.
- * Distinct rhythms tell escalated-NS-fault apart from a pure lockup:
- *   hardfault  = fast double-blink groups
- *   busfault   = fast triple-blink groups (a denied peripheral access)
- * These override crt0's weak bkpt stubs (no debugger attached here). */
-static void __attribute__((noreturn)) fault_blink(uint n) {
-    for (;;) {
-        for (uint k = 0; k < n; k++) {
-            led_set(true);  busy_delay(BUSY_MS(250));
-            led_set(false); busy_delay(BUSY_MS(250));
-        }
-        busy_delay(BUSY_MS(2000));
-    }
-}
 /* Blink one hex nibble MSB-first: value 1..15 = that many short blinks,
  * value 0 = one long pulse (so 0 is distinguishable from "no blinks"). */
 static void led_nibble(uint v) {
@@ -113,24 +98,27 @@ static void __attribute__((noreturn)) blink_word(uint32_t w) {
     }
 }
 
-void isr_busfault(void) {
-    /* Report the faulting NS instruction address (stacked PC), which maps
-     * to a function via nm/addr2line — more actionable than BFAR once we
-     * know it's a peripheral-access fault. NS was in thread mode using
-     * MSP_NS, so the exception frame is there; PC is word 6. Guard the SP
-     * so a bogus value can't nest-fault. Falls back to 0xbadadd50. */
+/* Faulting NS instruction address from the stacked exception frame. NS runs
+ * thread mode on MSP_NS, so the 8-word frame is there and PC is word 6.
+ * Guard the SP so a bogus value can't nest-fault. */
+static uint32_t ns_stacked_pc(void) {
     uint32_t msp_ns;
     __asm volatile ("mrs %0, msp_ns" : "=r" (msp_ns));
-    uint32_t pc = 0xbadadd50u;
     if (msp_ns >= 0x20000000u && msp_ns < (0x20080000u - 32u)) {
-        pc = ((const uint32_t *)msp_ns)[6];
+        return ((const uint32_t *)msp_ns)[6];
     }
-    blink_word(pc);
+    return 0xbadadd50u;
 }
-void isr_hardfault(void)   { fault_blink(2); }
-void isr_securefault(void) { fault_blink(4); }
-void isr_usagefault(void)  { fault_blink(5); }
-void isr_memmanage(void)   { fault_blink(6); }
+/* All fault handlers report the faulting PC (map via addr2line). NS-origin
+ * bus/usage/mem/secure faults escalate here (BFHFNMINS=0, NS handlers off).
+ * A HardFault is usually an escalated NS UsageFault (undefined instr / NOCP
+ * coprocessor / unaligned). PC first, then the type count, so the address
+ * and the class are both visible. */
+void isr_busfault(void)    { blink_word(ns_stacked_pc()); }
+void isr_hardfault(void)   { blink_word(ns_stacked_pc()); }
+void isr_securefault(void) { blink_word(ns_stacked_pc()); }
+void isr_usagefault(void)  { blink_word(ns_stacked_pc()); }
+void isr_memmanage(void)   { blink_word(ns_stacked_pc()); }
 
 /* All ACCESSCTRL registers except GPIO_NSMASK* require this password in the
  * upper half of the write data; writes without it bus-fault (§10.6). */
