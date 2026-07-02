@@ -48,11 +48,16 @@ static int ns_exc_index(const char *cls) {
 static void __attribute__((noreturn)) ns_blink_count(int n) {
     gpio_init(25); gpio_set_dir(25, GPIO_OUT);
     for (;;) {
+        /* Unmistakable long ON start marker (~1.2s) — nothing else in the
+         * boot does this, so it separates the count from the shimmer. */
+        gpio_put(25, 1); ns_busy(NS_MS(1200));
+        gpio_put(25, 0); ns_busy(NS_MS(700));
+        /* Then N clearly-spaced blinks to count. */
         for (int i = 0; i < n; i++) {
-            gpio_put(25, 1); ns_busy(NS_MS(300));
-            gpio_put(25, 0); ns_busy(NS_MS(300));
+            gpio_put(25, 1); ns_busy(NS_MS(250));
+            gpio_put(25, 0); ns_busy(NS_MS(550));
         }
-        ns_busy(NS_MS(4000));
+        ns_busy(NS_MS(3000)); /* long gap before repeating */
     }
 }
 
