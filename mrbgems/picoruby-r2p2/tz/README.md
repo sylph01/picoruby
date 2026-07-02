@@ -208,6 +208,43 @@ disable unused boot paths in `BOOT_FLAGS0`, then `CRIT1.SECURE_BOOT_ENABLE`.
 Development boards skip this: the partition still works unsigned; secure
 boot is what makes the monitor's presence non-bypassable.
 
+## NS runtime-init trimming (`ns/runtime_init_ns.c`, `ns/ns_build.cmake`)
+
+The stock SDK runtime init assumes it owns the whole chip. Stage-by-stage
+disposition for the NS image (SDK stage order):
+
+| Stage                              | NS disposition | Why |
+|------------------------------------|----------------|-----|
+| `BOOTROM_RESET` (global)           | **skip** (define) | `bootrom_state_reset` is Arm-S-only (§5.4.8) — NS ROM-table lookup fails at boot; it would also revoke the monitor's NS API grants. Monitor does it. |
+| `PER_CORE_BOOTROM_RESET`           | **skip** (define) | same API |
+| `EARLY_RESETS`                     | **override** | stock masks ~all RESETS bits; Secure-only bits are unwritable from NS and waiting on their RESET_DONE hangs. Override reset-cycles only `TZ_NS_RESETS_MASK`. |
+| `USB_POWER_DOWN`                   | unchanged | USBCTRL is NS-granted |
+| `PER_CORE_ENABLE_COPROCESSORS`     | unchanged | CPACR is banked (hits CPACR_NS); works because monitor NSACR grants CP0/CP4/CP10/CP11 |
+| `CLOCKS`                           | **override** | CLOCKS is Secure-only, not even readable. Override reports the contract frequencies (`r2p2_tz_config.h`) via `clock_set_reported_hz()` so `clock_get_hz()` stays correct; no tick start (TICKS is Secure, monitor started them). |
+| `POST_CLOCK_RESETS`                | **override** (empty) | stock waits on RESET_DONE for all bits incl. Secure-only ones |
+| `RP2040_GPIO_IE_DISABLE`           | unchanged | compiles empty on RP2350 |
+| `SPIN_LOCKS_RESET`                 | unchanged | RP2350 defaults to software spin locks (erratum); NS SIO also has its own spinlock bank |
+| `INSTALL_RAM_VECTOR_TABLE`         | unchanged | SCB->VTOR banked → VTOR_NS |
+| stack guard (MPU)                  | unchanged | MPU banked → MPU_NS |
+
+## NS build: gem impact
+
+Gems that must change (or go) to fit the security model:
+
+| Gem | Impact | What changes |
+|-----|--------|--------------|
+| `picoruby-machine` | **modify** | `Machine.deep_sleep`/`sleep` touch XOSC/ROSC dormancy, CLOCKS, VREG/POWMAN — all Secure-only → `sg_deep_sleep()` veneer (phase 2) or disabled. `Machine.using_usb?`-style paths, unique-id via bootrom `get_sys_info` (NS API enabled) keep working. `Machine.read_memory` of Secure addresses now SecureFaults (hardware-enforced; consider removing anyway for UX). Time-of-day via `pico_aon_timer` sits on POWMAN (Secure-only) → needs an `sg_time_*` veneer or NS timekeeping on TIMER0 — open decision. |
+| `picoruby-rng` | **modify** | `get_rand_32()` → RP2350 TRNG, which is Secure-only and faults from NS. TZ build calls `sg_random_bytes()` instead (the fresh non-TZ fix stays for stock builds). |
+| `picoruby-filesystem-fat` | **modify** | `flash_disk.c` `flash_range_program/erase` → bootrom `checked_flash_op` NS API (validated against the NS_W partition). |
+| `picoruby-littlefs` | **modify** | same change in `flash_hal.c` |
+| `picoruby-mbedtls` | **modify** | `mbedtls_hardware_poll` → `get_rand_64` → TRNG faults from NS; re-point at `sg_random_bytes()`. Raw-key `Cipher` API unchanged by design. |
+| `picoruby-psg` | **cut (phase 1)** | runs its driver on core 1; NS cannot launch core 1 until `sg_launch_core1_ns()` exists (phase 2) |
+| `picoruby-pitchdetector` | **audit/cut** | ADC+DMA fine per se; cut with psg if it shares the core-1 pattern |
+| `picoruby-cyw43` / `-net` / `-socket` / `-ble` (pico2_w) | **defer/audit** | driver itself uses PIO/DMA/GPIO (all NS-granted incl. NSMASK bits), but lwIP/mbedTLS pull `pico_rand` → TRNG fault. Needs an NS `get_rand_*` replacement backed by `sg_random_bytes()` (link-level override), then re-audit. Phase 1 targets plain pico2. |
+| `picoruby-watchdog` | unchanged | WATCHDOG NS-granted; tick already running (monitor) |
+| `picoruby-gpio/-uart/-i2c/-spi/-adc/-pwm/-pio/-irq/-usb-hid/-io-console` | unchanged | peripherals NS-granted, IRQs in ITNS |
+| shell / require / sandbox / VM gems | unchanged | pure software |
+
 ## Known open items
 
 - Core 1: bootrom launch protocol is Secure-side; NS needs an
