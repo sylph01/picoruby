@@ -18,10 +18,18 @@ function(r2p2_apply_tz_ns TARGET)
     # link-level pico_rand replacement (TRNG is Secure-only; rand_ns.c
     # backs get_rand_* with the sg_random_bytes veneer, which transitively
     # fixes picoruby-rng, pico_mbedtls entropy, and lwIP's RNG).
+    # flash_ns.c likewise replaces hardware_flash's flash_range_erase/
+    # flash_range_program with bootrom checked_flash_op calls (+ cache
+    # flush via veneer), transitively fixing picoruby-filesystem-fat and
+    # picoruby-littlefs.
     target_sources(${TARGET} PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/runtime_init_ns.c
         ${CMAKE_CURRENT_LIST_DIR}/rand_ns.c
+        ${CMAKE_CURRENT_LIST_DIR}/flash_ns.c
     )
+
+    # rom_flash_op() serializes through flash_safe_execute().
+    target_link_libraries(${TARGET} pico_flash)
 
     target_include_directories(${TARGET} PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/../include
@@ -42,7 +50,7 @@ function(r2p2_apply_tz_ns TARGET)
     #    signing with the monitor, partition table with the FS partition
     #    marked NS_R/NS_W.
     #  - gem source substitutions for the TZ build (see tz/README.md
-    #    "NS build: gem impact"): flash HALs (checked_flash_op), machine
-    #    sleep paths; exclude psg/pitchdetector. (rng/mbedtls/lwIP rand
-    #    needs are already covered by rand_ns.c above.)
+    #    "NS build: gem impact"): machine sleep/time paths; exclude
+    #    psg/pitchdetector. (rng/mbedtls/lwIP rand and both flash HALs
+    #    are already covered by rand_ns.c / flash_ns.c above.)
 endfunction()

@@ -235,8 +235,8 @@ Gems that must change (or go) to fit the security model:
 |-----|--------|--------------|
 | `picoruby-machine` | **modify** | `Machine.deep_sleep`/`sleep` touch XOSC/ROSC dormancy, CLOCKS, VREG/POWMAN — all Secure-only → `sg_deep_sleep()` veneer (phase 2) or disabled. `Machine.using_usb?`-style paths, unique-id via bootrom `get_sys_info` (NS API enabled) keep working. `Machine.read_memory` of Secure addresses now SecureFaults (hardware-enforced; consider removing anyway for UX). Time-of-day via `pico_aon_timer` sits on POWMAN (Secure-only) → needs an `sg_time_*` veneer or NS timekeeping on TIMER0 — open decision. |
 | `picoruby-rng` | unchanged | keeps calling `get_rand_32()`; the NS image replaces `pico_rand` itself at link level (`ns/rand_ns.c` backs `get_rand_*` with `sg_random_bytes()` — the TRNG is Secure-only and would fault from NS) |
-| `picoruby-filesystem-fat` | **modify** | `flash_disk.c` `flash_range_program/erase` → bootrom `checked_flash_op` NS API (validated against the NS_W partition). |
-| `picoruby-littlefs` | **modify** | same change in `flash_hal.c` |
+| `picoruby-filesystem-fat` | unchanged | keeps calling `flash_range_program/erase`; the NS image replaces them at link level (`ns/flash_ns.c` → bootrom `checked_flash_op`, partition-checked against NS_W, + `sg_flash_flush_cache()` since the ROM op does no cache maintenance and the ROM flush is Arm-S-only) |
+| `picoruby-littlefs` | unchanged | same coverage via `ns/flash_ns.c` |
 | `picoruby-mbedtls` | unchanged | `mbedtls_hardware_poll` → `get_rand_64` is covered by the `ns/rand_ns.c` override; raw-key `Cipher` API unchanged by design |
 | `picoruby-psg` | **cut (phase 1)** | runs its driver on core 1; NS cannot launch core 1 until `sg_launch_core1_ns()` exists (phase 2) |
 | `picoruby-pitchdetector` | **audit/cut** | ADC+DMA fine per se; cut with psg if it shares the core-1 pattern |

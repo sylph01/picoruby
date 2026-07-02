@@ -145,6 +145,18 @@ SG_API int sg_hmac_sha256(sg_key_t key, const uint8_t *msg, size_t msg_len,
     return SG_ERR_NOT_PERMITTED;
 }
 
+/* ---- flash --------------------------------------------------------------- */
+
+/* Mirrors flash.c's flash_flush_cache(): the ROM function ('F','C') is
+ * Arm-S-only, hence this veneer. See the header for why NS can't do its
+ * own cache maintenance. No parameters, no NS memory touched. */
+SG_API int sg_flash_flush_cache(void) {
+    rom_flash_flush_cache_fn func =
+        (rom_flash_flush_cache_fn) rom_func_lookup_inline(ROM_FUNC_FLASH_FLUSH_CACHE);
+    func();
+    return SG_OK;
+}
+
 /* ---- signed bytecode — phase 2 by decision ------------------------------ */
 
 SG_API int sg_verify_mrb(const uint8_t *pkg, size_t pkg_len) {
