@@ -47,16 +47,7 @@
 #include "hardware/regs/intctrl.h"
 
 #include "../include/r2p2_sg_api.h"
-
-/* ---- memory map (single source of truth: tz/README.md; must match the
- *      linker scripts) ---------------------------------------------------- */
-
-#define TZ_SG_NSC_BASE    0x1000f000u  /* .gnu.sgstubs in memmap_monitor_s.ld */
-#define TZ_SG_NSC_LAST    0x1000ffffu
-#define TZ_NS_FLASH_BASE  0x10010000u  /* NS image + filesystem, to end of 4 MiB flash */
-#define TZ_NS_FLASH_LAST  0x103fffffu
-#define TZ_NS_RAM_BASE    0x20000000u  /* all 512 KiB striped SRAM */
-#define TZ_NS_RAM_LAST    0x2007ffffu
+#include "../include/r2p2_tz_config.h"  /* memory map, clock contract, TZ_NS_DMA_CHANNELS */
 
 /* All ACCESSCTRL registers except GPIO_NSMASK* require this password in the
  * upper half of the write data; writes without it bus-fault (§10.6). */
@@ -66,10 +57,6 @@
  * registers reset with NSP/NSU clear, memory devices reset to 0xff. */
 #define AC_ALLOW_ALL     (AC_PASSWORD | 0xffu)
 #define AC_SECURE_ONLY   (AC_PASSWORD | (0xffu & ~(ACCESSCTRL_UART0_NSP_BITS | ACCESSCTRL_UART0_NSU_BITS)))
-
-/* DMA channels handed to NS. Channel security locks at first use until DMA
- * block reset, so this is a boot-time-only assignment. */
-#define TZ_NS_DMA_CHANNELS 12u
 
 /* IRQs retargeted to the NS vector table via NVIC ITNS. Everything an NS
  * peripheral can raise; SecureFault/faults stay Secure (AIRCR.BFHFNMINS=0,
@@ -219,10 +206,16 @@ static void __attribute__((noreturn)) ns_launch(void) {
     m33_ns_hw->vtor = (uintptr_t)ns_vtor;
     __asm volatile ("msr msp_ns, %0" :: "r" (ns_vtor[0]));
 
-    /* Let NS use the FPU: NSACR grants CP10/CP11 to NS, CPACR_NS enables
-     * them within NS (R2P2 builds with hard float). */
-    m33_hw->nsacr |= M33_NSACR_CP10_BITS | M33_NSACR_CP11_BITS;
-    m33_ns_hw->cpacr |= M33_CPACR_CP10_BITS | M33_CPACR_CP11_BITS;
+    /* Coprocessor grants to NS (NSACR), matching what the SDK's
+     * runtime_init_per_core_enable_coprocessors will then enable in
+     * CPACR_NS: CP10/CP11 FPU (R2P2 builds hard-float), CP4 DCP (the SDK's
+     * double-precision routines — the mruby VM is double-heavy), CP0 GPIO
+     * coprocessor. Without a grant the NS CPACR write is ineffective and
+     * the first use traps. CP7 (RCP) deliberately stays Secure. */
+    m33_hw->nsacr |= M33_NSACR_CP0_BITS | M33_NSACR_CP4_BITS
+                   | M33_NSACR_CP10_BITS | M33_NSACR_CP11_BITS;
+    m33_ns_hw->cpacr |= M33_CPACR_CP0_BITS | M33_CPACR_CP4_BITS
+                      | M33_CPACR_CP10_BITS | M33_CPACR_CP11_BITS;
 
     /* AIRCR defaults kept: BFHFNMINS=0 (bus/hard faults target Secure),
      * SYSRESETREQS=0 (NS may request system reset — the watchdog is NS
