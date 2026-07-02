@@ -8,6 +8,35 @@
 #ifndef R2P2_TZ_CONFIG_H
 #define R2P2_TZ_CONFIG_H
 
+#include <stdint.h>
+
+/* ---- NS image manifest ---------------------------------------------------
+ * Monitor+NS ship-together model: the monitor authenticates the NS image
+ * by SHA-256 digest. The monitor is built with a placeholder (magic = 0);
+ * the packaging step (rake r2p2:tz:package) hashes the built NS binary,
+ * patches this struct into the monitor's .ns_manifest section via
+ * objcopy --update-section, and THEN the monitor is sealed/signed — so the
+ * boot signature transitively covers the digest, and the digest covers the
+ * NS bytes. Every NS change ⇒ re-patch + re-sign the monitor (accepted:
+ * both images ship together).
+ *
+ * The byte layout below is mirrored by the packing code in
+ * tasks/picoruby/r2p2.rake (little-endian u32 ×3 + 32 digest bytes = 44
+ * bytes) — keep them in sync.
+ *
+ * `version` is carried from day one so a later field-update model (signed
+ * manifest verified against a stable public key) extends this format
+ * instead of replacing it. */
+
+#define TZ_NS_MANIFEST_MAGIC 0x52324e53u  /* "R2NS" */
+
+typedef struct {
+    uint32_t magic;        /* TZ_NS_MANIFEST_MAGIC once patched; 0 = dev build */
+    uint32_t version;      /* monotonic NS image version (rollback, phase 2) */
+    uint32_t ns_size;      /* bytes of NS image hashed from TZ_NS_FLASH_BASE */
+    uint8_t  ns_digest[32];/* SHA-256 over those bytes */
+} tz_ns_manifest_t;
+
 /* ---- flash/RAM map (see tz/README.md) ----------------------------------- */
 
 #define TZ_SG_NSC_BASE    0x1000f000u  /* .gnu.sgstubs in memmap_monitor_s.ld */

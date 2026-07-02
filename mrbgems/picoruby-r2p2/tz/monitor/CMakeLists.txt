@@ -59,19 +59,18 @@ target_link_options(r2p2_tz_monitor PRIVATE
 pico_add_extra_outputs(r2p2_tz_monitor)
 
 # ---- signing (production) ---------------------------------------------------
-# Dev boards boot the partition unsigned; secure boot (OTP CRIT1.
-# SECURE_BOOT_ENABLE, irreversible — README) is what makes the monitor
-# non-bypassable. The signature must cover the COMBINED monitor+NS image
-# (single signed unit, see README "Phase-1 decisions"), so plain
-# pico_sign_binary() on this target alone is only correct for
-# monitor-without-NS testing. TODO: packaging step that concatenates
-# monitor + NS R2P2 at their linked offsets and signs the whole range
-# (picotool seal --sig <key.pem> combined.bin, or extend the IMAGE_DEF
-# load map to cover the NS region).
-option(R2P2_TZ_SIGN "Sign the monitor image (requires R2P2_TZ_SIGKEY)" OFF)
-if (R2P2_TZ_SIGN)
-    pico_sign_binary(r2p2_tz_monitor ${R2P2_TZ_SIGKEY})
-endif()
+# Signing does NOT happen here. Ship-together model (README "Phase-1
+# decisions"): the NS image's SHA-256 must be patched into .ns_manifest
+# BEFORE sealing, and the NS image doesn't exist yet when this target
+# builds (it links our implib). The pipeline is:
+#   1. build this monitor (placeholder manifest, magic=0 -> dev boot
+#      skips the NS hash check)
+#   2. build the NS R2P2 (R2P2_TRUSTZONE=1 rake r2p2:picoruby:pico2:prod)
+#   3. rake r2p2:tz:package   # hash NS -> objcopy .ns_manifest ->
+#                             # picotool seal (R2P2_TZ_SIGKEY) -> UF2s
+# Secure boot (OTP CRIT1.SECURE_BOOT_ENABLE, irreversible — README) is what
+# makes the monitor non-bypassable; the monitor's signature then covers the
+# manifest, which covers the NS bytes.
 
 # ---- crypto slice (TODO: keystore/HKDF/AEAD veneers) -------------------------
 # The symmetric slice of the SDK-vendored mbedTLS — no bignum/ECP, a few

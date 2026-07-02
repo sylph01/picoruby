@@ -35,6 +35,7 @@
 #include <string.h>
 
 #include "pico/bootrom.h"
+#include "pico/sha256.h"
 #include "boot/bootrom_constants.h"
 #include "hardware/structs/sau.h"
 #include "hardware/structs/accessctrl.h"
@@ -73,6 +74,46 @@ static const uint8_t tz_ns_irqs[] = {
     ADC_IRQ_FIFO,
     I2C0_IRQ, I2C1_IRQ,
 };
+
+/* ---- NS image verification ----------------------------------------------
+ * Ship-together model: the packaging step patches the built NS image's
+ * SHA-256 into .ns_manifest and the monitor is signed afterwards, so the
+ * boot signature covers this struct. A dev build (unpackaged, magic still
+ * 0) skips the check so the plain cmake build remains bootable. */
+
+static const tz_ns_manifest_t tz_ns_manifest
+    __attribute__((section(".ns_manifest"), used)) = { .magic = 0 };
+
+static void __attribute__((noreturn)) verify_failed(void) {
+    /* No stdio in the monitor; park. Recovery path is BOOTSEL, which sits
+     * upstream in the bootrom and is unaffected. TODO: blink a status LED
+     * pattern once the monitor owns one. */
+    for (;;) {
+        __asm volatile ("wfi");
+    }
+}
+
+static void verify_ns_image(void) {
+    if (tz_ns_manifest.magic != TZ_NS_MANIFEST_MAGIC) {
+        return; /* dev build: no digest was packaged in */
+    }
+    if (tz_ns_manifest.ns_size == 0 ||
+        tz_ns_manifest.ns_size > (TZ_NS_FLASH_LAST + 1u - TZ_NS_FLASH_BASE)) {
+        verify_failed();
+    }
+    pico_sha256_state_t state;
+    if (pico_sha256_try_start(&state, SHA256_BIG_ENDIAN, false) != PICO_OK) {
+        verify_failed(); /* nothing else owns the engine this early */
+    }
+    pico_sha256_update_blocking(&state, (const uint8_t *)TZ_NS_FLASH_BASE,
+                                tz_ns_manifest.ns_size);
+    sha256_result_t result;
+    pico_sha256_finish(&state, &result);
+    /* Plain memcmp is fine: both values are public (a digest, not a key). */
+    if (memcmp(result.bytes, tz_ns_manifest.ns_digest, sizeof result.bytes) != 0) {
+        verify_failed();
+    }
+}
 
 /* ---- key material ------------------------------------------------------- */
 
@@ -234,10 +275,11 @@ static void __attribute__((noreturn)) ns_launch(void) {
 }
 
 int main(void) {
-    /* Entered by the bootrom after signature verification of the combined
-     * monitor+NS image; interrupts still masked by crt0 until runtime init.
-     * Order matters: keys come out of OTP and the SW_LOCK ratchet closes
-     * BEFORE anything Non-secure exists. */
+    /* Entered by the bootrom after verifying the monitor's signature (which
+     * covers .ns_manifest). Order matters: the NS image is authenticated
+     * and keys come out of OTP (SW_LOCK ratchet closing behind them)
+     * BEFORE anything Non-secure exists or runs. */
+    verify_ns_image();
     monitor_derive_keys();
     partition_configure();
     ns_launch();

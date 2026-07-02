@@ -106,6 +106,14 @@ SECTIONS
     __binary_info_end = .;
     . = ALIGN(4);
 
+    /* NS image manifest (tz_ns_manifest_t): patched post-build by
+     * `rake r2p2:tz:package` via objcopy --update-section, then the image
+     * is sealed/signed so the signature covers the patched digest. Own
+     * output section so objcopy can address it by name. */
+    .ns_manifest : ALIGN(4) {
+        KEEP(*(.ns_manifest))
+    } > FLASH_S
+
     .ram_vector_table (NOLOAD): {
         *(.ram_vector_table)
     } > RAM_S
