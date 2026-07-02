@@ -76,9 +76,11 @@ function(r2p2_apply_tz_ns TARGET)
         # TEMP bring-up: capture the class of an unhandled exception at the
         # exc_throw -> mrb_print_error -> abort() point (see exit_ns.c).
         LINKER:--wrap=mrb_print_error
-        # TEMP bring-up: capture WHO calls abort()/exit() (see ns_trap.c).
+        # TEMP bring-up: capture WHO calls abort()/exit()/panic()/assert (ns_trap.c).
         LINKER:--wrap=abort
         LINKER:--wrap=exit
+        LINKER:--wrap=panic
+        LINKER:--wrap=__assert_func
     )
 
     target_include_directories(${TARGET} PRIVATE
