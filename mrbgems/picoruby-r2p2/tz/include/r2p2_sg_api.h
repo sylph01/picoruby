@@ -130,9 +130,12 @@ SG_API int sg_key_derive_export(sg_key_t parent, const uint8_t *info,
                                 size_t info_len, uint8_t *out,
                                 size_t out_len);
 
-/* ---- AEAD / MAC (monitor-side mbedTLS; RP2350 has no AES hardware) ------ */
+/* ---- AEAD / MAC ---------------------------------------------------------- */
 
-/* AES-256-GCM. out must have room for pt_len + SG_AEAD_TAG_LEN (tag is
+/* ChaCha20-Poly1305 (RFC 8439). Chosen over AES-GCM: RP2350 has no AES
+ * hardware, and ChaCha20 is naturally constant-time in software — no
+ * table-lookup side channels — and small enough that the monitor needs no
+ * mbedTLS at all. out must have room for pt_len + SG_AEAD_TAG_LEN (tag is
  * appended). Nonce discipline is the caller's job; the monitor does not
  * track uniqueness in the sketch. */
 SG_API int sg_aead_encrypt(sg_key_t key,
@@ -154,9 +157,12 @@ SG_API int sg_hmac_sha256(sg_key_t key, const uint8_t *msg, size_t msg_len,
 
 /* ---- signed bytecode ----------------------------------------------------- */
 
-/* Verify a signed .mrb package (payload || ECDSA-P256 signature; envelope
- * format TBD) against SG_SLOT_MRB_VERIFY, including a monotonic rollback
- * counter check (OTP thermometer rows, monitor-side).
+/* PHASE 2 — returns SG_ERR_NOT_PERMITTED in phase 1. Reserved in the ABI
+ * now so the veneer table stays stable.
+ *
+ * Will verify an authenticated .mrb package (envelope format TBD; ECDSA
+ * signature vs HMAC seal undecided) against SG_SLOT_MRB_VERIFY, including
+ * a monotonic rollback counter check (OTP thermometer rows, monitor-side).
  *
  * Honest scope note: this attests the buffer contents at call time. NS owns
  * the buffer and the VM that will execute it, so this is a policy gate
