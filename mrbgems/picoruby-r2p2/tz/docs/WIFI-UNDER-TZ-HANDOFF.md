@@ -301,6 +301,58 @@ workaround; when a gem needs runtime pull/drive changes from NS, add an
 - Then: PHASE2-BACKLOG items and folding in secure boot (OTP still
   pristine on this board).
 
+### Open bug 3 (found by soak session 2026-07-07 evening): NS heap
+### corruption → HardFault, tied to CYW43::ConnectTimeout raise path
+
+During join/leave cycling (soak item 2), the board hard-faulted and
+parked in the monitor's diag_halt. Forensics over SWD (probe attached;
+serial was dead — USB stays enumerated but the VM is gone, don't trust
+lsusb as liveness):
+
+- `tz_diag`: boot_stage 5, fault_kind 3 (HardFault), NS pc/lr in
+  `est_free` (the picoruby-mruby allocator), SFSR 0x48 =
+  SFARVALID|AUVIOL, SFAR 0x753130c4 — a wild address made of
+  ASCII-looking bytes. A heap chunk header was overwritten (string
+  data over the size field); est_free computed next-chunk from the
+  poisoned size and dereferenced garbage; the SAU attribution check
+  caught what plain RP2040 would have silently misread.
+- NS stack walk (mdw @msp_ns + addr2line): alloc pressure →
+  `mrb_full_gc` → `incremental_gc_finish` → `obj_free` →
+  `mrb_sandbox_state_free` → `mrc_ccontext_free` → `est_free` ⇒ the
+  GC was freeing a dead shell **sandbox + compiler context** when it
+  tripped. Not obviously a WiFi-data-path bug.
+- Sequence that led there: `CYW43.connect_timeout` failing (AP churn)
+  raises `CYW43::ConnectTimeout` from C (mrb_raise after ~10 s of
+  blocking driver code); the live irb session died to the `$>` shell
+  prompt; the shell then compiled a stream of long not-found commands;
+  a later GC freeing the dead irb sandbox hit the corrupted chunk.
+
+Exception-path anomalies confirmed on a fresh boot (same build):
+- Ruby-level `raise "boom"` in irb: handled fine, session lives.
+- C-level TypeError (mrb_get_args): rescuable, fine.
+- `CYW43.connect_timeout` failure inside `begin/rescue`: rescue does
+  NOT catch, no message prints, block evaluates to **nil** — a value
+  the C code cannot return. The raise happens after blocking driver
+  work (idle-poll/scheduler ran meanwhile), so the prime suspect is
+  mrb_raise against a stale/wrong task context in the
+  sandbox/scheduler model — which would also explain the irb death
+  (same raise, different timing) and plausibly the heap corruption
+  (exception object/ci stack manipulated on a context the GC later
+  frees). Unrescued repeat on fresh boot did NOT kill irb — timing-
+  dependent, consistent with the stale-context theory.
+- Also on the suspect list: `mrb_define_class_under_id` at raise time
+  inside mrb_s_connect_timeout (class allocation mid-failure path).
+
+Repro candidates for next session: loop
+`begin CYW43.connect_timeout("no-such-ap",…,5) rescue nil end` +
+`GC.start` on stock (non-TZ) pico2_w build — if it corrupts there too,
+it's a picoruby sandbox/VM bug, not TZ. The soak driver
+(scratchpad soak_run.py) reproduced the original within ~2 minutes of
+cycling. NOTE for the soak driver: gem disconnect intentionally
+disables STA mode (connect_timeout then returns false immediately) —
+re-enable per cycle; and connect failures RAISE, they don't return
+false.
+
 Ruby-side driving recipe (irb over CDC): `CYW43.init("JP")` →
 `CYW43.enable_sta_mode` → `CYW43.connect_timeout(ssid, psk,
 CYW43::Auth::WPA2_MIXED_PSK, 10)` → `CYW43.link_connected?(true)`;
