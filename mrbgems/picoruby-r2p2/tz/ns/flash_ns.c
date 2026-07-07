@@ -28,16 +28,30 @@
 
 #include "../include/r2p2_sg_api.h"
 
-/* TEMP bring-up: on error blink the veneer rc instead of failing silently
- * (7=erase, 8=program; then |rc| short blinks — see ns_trap.c / sg_status_t). */
-extern void ns_trap_code(int marker, int value) __attribute__((noreturn));
+/* A failed Secure flash veneer is an invariant break (the monitor's range
+ * clamp or buffer validation rejected a FatFS request) — never continue
+ * silently. The failing op and rc are parked in globals for the probe,
+ * then bkpt: with a debugger attached the core halts right here;
+ * unattended it escalates to the monitor's HardFault handler and lands in
+ * the tz_diag record (pc = this loop). See tz/tools/PROBE.md. */
+volatile int ns_flash_trap_op;  /* 'E'rase / 'P'rogram */
+volatile int ns_flash_trap_rc;  /* sg_status_t */
+
+static void __attribute__((noreturn)) ns_flash_trap(int op, int rc) {
+    ns_flash_trap_op = op;
+    ns_flash_trap_rc = rc;
+    for (;;) {
+        __asm volatile ("bkpt 0");
+        __asm volatile ("wfi");
+    }
+}
 
 void __wrap_flash_range_erase(uint32_t flash_offs, size_t count) {
     int rc = sg_flash_erase(flash_offs, (uint32_t)count);
-    if (rc != SG_OK) ns_trap_code(7, rc);
+    if (rc != SG_OK) ns_flash_trap('E', rc);
 }
 
 void __wrap_flash_range_program(uint32_t flash_offs, const uint8_t *data, size_t count) {
     int rc = sg_flash_program(flash_offs, data, (uint32_t)count);
-    if (rc != SG_OK) ns_trap_code(8, rc);
+    if (rc != SG_OK) ns_flash_trap('P', rc);
 }
