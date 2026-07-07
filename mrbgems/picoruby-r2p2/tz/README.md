@@ -43,16 +43,18 @@ full fault dump, read over SWD (`tools/PROBE.md`, `tools/tz_diag.gdb`).
 openocd (RPi fork) also replaces BOOTSEL for the dev loop: `program
 <ns.elf>` + `program <monitor_packaged.elf> verify reset exit`.
 
-Secure-boot rehearsal done 2026-07-07 on board 1 (chip ID confirmed
-pristine): a fresh off-repo secp256k1 key (`~/.r2p2-tz-keys/`, never
-committed) seals the monitor, and the real-signed combined image boots
-repeatedly on board 1 with secure boot STILL OFF — the reversible gate.
-The irreversible writes are documented but NOT run: `tools/OTP-BURN.md`
-is the gated recipe (A provision keys 48/49, B burn BOOTKEY, C
-SECURE_BOOT_ENABLE), and `~/.r2p2-tz-keys/` holds the key + provisioning
-material. Still open (deliberately, awaiting an explicit go): the OTP
-burn itself. This directory holds the shared contract between the two
-firmware images of a Secure/Non-secure split R2P2:
+Secure boot ENABLED on board 1 (2026-07-07): a fresh off-repo secp256k1
+key (`~/.r2p2-tz-keys/`, never committed) seals the monitor; OTP groups
+A (keys → pages 48/49), B (BOOTKEY0 + KEY_VALID) and C
+(SECURE_BOOT_ENABLE) are burned, debug left enabled, and the board boots
+ONLY the signed image under mask-ROM enforcement (selftest PASSED under
+enforcement). Recipe + burn log: `tools/OTP-BURN.md` (note: the seal JSON
+bundles the enable bit, so `otp load bootkey_otp.json` is the point of no
+return). To reflash board 1 you must package with
+`R2P2_TZ_SIGKEY=~/.r2p2-tz-keys/boot_signing.pem`. Phase 2 is complete;
+remaining work is backlog (`sg_launch_core1_ns`, `sg_deep_sleep`,
+secure-stack sealing). This directory holds the shared contract between
+the two firmware images of a Secure/Non-secure split R2P2:
 
 - `include/r2p2_sg_api.h` — the Secure Gateway (veneer) API, compiled into
   both images
