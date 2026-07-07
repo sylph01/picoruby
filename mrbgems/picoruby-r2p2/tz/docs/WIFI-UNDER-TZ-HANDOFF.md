@@ -285,6 +285,19 @@ workaround; when a gem needs runtime pull/drive changes from NS, add an
 - `sg_pad_write` veneer when a gem needs NS runtime pad changes (E3).
 - Soak: long-idle RX (minutes-hours), repeated join/leave, reboot
   persistence of the FS.
+- Soak: **busy-VM starvation.** Poll mode services the stack only from
+  `picorb_hal_idle_cpu` and the net-call wait helpers, so a Ruby program
+  that never idles (`while true; compute; end`) with a socket open may
+  starve ACKs/retransmits/keepalives/DHCP-renewal — check whether the
+  peer sees stalls. If it does, the fix is cheap: pump `cyw43_arch_poll`
+  from the VM's timeslice/task-switch hook too, not just true idle.
+- **BLE: explicitly deferred** (decision 2026-07-07). The WiFi-only
+  scoping is load-bearing: btstack rides the threadsafe_background async
+  context, so BLE under TZ needs either background mode's pinned spare
+  user IRQ + ITNS routing (now a well-understood recipe — same shape as
+  IO_IRQ_BANK0_NS) or btstack-under-poll integration work. Revisit only
+  on a concrete need; the gateway use-case (WiFi + Secure-side keys) is
+  served without it.
 - Then: PHASE2-BACKLOG items and folding in secure boot (OTP still
   pristine on this board).
 
