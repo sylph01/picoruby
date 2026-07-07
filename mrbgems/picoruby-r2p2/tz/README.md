@@ -323,6 +323,46 @@ disable unused boot paths in `BOOT_FLAGS0`, then `CRIT1.SECURE_BOOT_ENABLE`.
 Development boards skip this: the partition still works unsigned; secure
 boot is what makes the monitor's presence non-bypassable.
 
+## Application code integrity — where code can live, what protects each
+
+Secure boot is a **boot-time, ROM-level check of the flash image**, not a
+runtime check. The chain is: ROM verifies the monitor signature → the
+monitor's `.ns_manifest` covers `SHA-256(NS image)` → everything inside
+the signed flash image is covered, once, at boot. That scoping decides
+what protection each kind of application code can have:
+
+| Where the code lives | Protected by | Guarantee |
+|---|---|---|
+| **Baked into the NS image** (compiled to bytecode at build time, like `main_task`/`mrblib`; `#include "main_task.c"`) | Secure boot, via `.ns_manifest` | Real integrity — the ROM won't run a tampered image. |
+| **Separate signed image/partition**, verified by the monitor before launch (analogous to how it verifies the NS image) — *design option, not built* | Secure boot chain, extended by the monitor | Same boot-time integrity, but you re-sign just the app image, not the whole firmware. |
+| **Filesystem `.mrb`/`.rb`** loaded at runtime (shell executables via `Shell::Job#exec`→`load_file`, `Shell.load`, irb) | Nothing at boot; **opt-in** `sg_verify_mrb` if the app calls it | Weaker: a *key-access gate*, not execution enforcement (see below). |
+
+Consequences:
+
+- **To put application firmware under secure boot, it must be part of a
+  signed image at build time** — baked into the NS binary (today's
+  ship-together model: every change ⇒ rebuild ⇒ re-hash ⇒ re-seal ⇒
+  reflash the signed package), or, with additional work, a separate signed
+  image the monitor verifies at launch. There is no way to extend the
+  *boot-time* chain to a file that appears on the NS-writable FAT
+  partition after boot — the ROM never sees it.
+- **Runtime-loaded code can only ever get the `sg_verify_mrb` gate**, and
+  that gate is deliberately scoped: a successful verify latches access to
+  `SG_SLOT_GATEWAY_PSK` (uses the *separate* P-256 mrb signing key, not
+  the boot key). It attests buffer contents *at call time*; it does **not**
+  enforce that only signed bytecode runs, because the VM is entirely
+  Non-secure and a compromised NS can bypass any NS-side load hook. Nothing
+  in the shell/loader calls it automatically — it is an explicit
+  `TZ.verify_mrb(pkg)` a program makes *before trusting* a package. The
+  boundary protects **keys, not NS control flow** (same honest-scope note
+  as on `sg_verify_mrb` in `r2p2_sg_api.h`).
+- The shell's own "system executable" seeding (`setup_system_executables`)
+  materializes commands onto the FAT partition guarded by a **CRC32**,
+  which is corruption-detection, not a signature — not a security boundary.
+
+Net: baked-in code has cryptographic boot integrity; filesystem code is
+NS-trust whose only lever is "may or may not reach secrets."
+
 ## NS runtime-init trimming (`ns/runtime_init_ns.c`, `ns/ns_build.cmake`)
 
 The stock SDK runtime init assumes it owns the whole chip. Stage-by-stage
