@@ -285,12 +285,28 @@ workaround; when a gem needs runtime pull/drive changes from NS, add an
 - `sg_pad_write` veneer when a gem needs NS runtime pad changes (E3).
 - Soak: long-idle RX (minutes-hours), repeated join/leave, reboot
   persistence of the FS.
+  - **Long-idle RX: PASS (2026-07-07 evening, ~40 min run).** Pushes to
+    an open TCP socket after 1/2/5/10/15-minute idle gaps all ACKed:
+    1.8 / 3.0 / 3.1 / 2.9 / **0.26** s. Latency is flat in idle
+    duration (no PM deepening); it's bimodal ~0.3 s vs ~3 s — worth
+    understanding (poll cadence at the shell prompt vs. mid-sleep?)
+    but operationally fine for the gateway. Link up and zero data loss
+    across the whole run.
+  - Join/leave cycling: PARKED behind open bug 3 (below) — the failing-
+    join raise path is the trigger. Hours-scale idle and FS-reboot
+    persistence remain to do.
 - Soak: **busy-VM starvation.** Poll mode services the stack only from
   `picorb_hal_idle_cpu` and the net-call wait helpers, so a Ruby program
   that never idles (`while true; compute; end`) with a socket open may
   starve ACKs/retransmits/keepalives/DHCP-renewal — check whether the
   peer sees stalls. If it does, the fix is cheap: pump `cyw43_arch_poll`
   from the VM's timeslice/task-switch hook too, not just true idle.
+  - **CONFIRMED (2026-07-07 evening): 5/5 ACK probes stalled >25 s
+    during a 300 s compute loop; recovery 1.3 s after the loop ended;
+    TCP connection survived and delivered every payload in order (host
+    kernel retransmits + lwIP buffering).** A liveness gap, not a
+    crash. Do the timeslice-hook pump before gateway workloads that
+    mix compute with open connections.
 - **BLE: explicitly deferred** (decision 2026-07-07). The WiFi-only
   scoping is load-bearing: btstack rides the threadsafe_background async
   context, so BLE under TZ needs either background mode's pinned spare
