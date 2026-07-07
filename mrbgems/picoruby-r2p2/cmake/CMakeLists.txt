@@ -16,11 +16,11 @@ set (R2P2_REVISION  ${CMAKE_REVISION})
 
 project("${R2P2_NAME}-${R2P2_VERSION}-${R2P2_BOARD_NAME}-${R2P2_BUILDDATE}-${R2P2_REVISION}")
 
-# Non-secure half of a TrustZone-split R2P2 (RP2350 / pico2 only). See
-# ${R2P2_GEM_DIR}/tz/README.md. When ON, the runtime-init/rand/flash
+# Non-secure half of a TrustZone-split R2P2 (RP2350 Arm: pico2/pico2_w).
+# See ${R2P2_GEM_DIR}/tz/README.md. When ON, the runtime-init/rand/flash
 # overrides, the NS linker script, and the monitor's veneer implib are
 # applied via tz/ns/ns_build.cmake (near the end of this file).
-option(R2P2_TRUSTZONE "Build the Non-secure half of a TrustZone-split R2P2 (pico2)" OFF)
+option(R2P2_TRUSTZONE "Build the Non-secure half of a TrustZone-split R2P2 (pico2/pico2_w)" OFF)
 
 add_compile_options(-Wall
   # int != int32_t as far as the compiler is concerned because gcc has int32_t as long int
@@ -66,6 +66,16 @@ if(USE_WIFI)
       ${PICORUBY_ROOT}/mrbgems/picoruby-filesystem-fat/ports/rp2040/*.c
       ${PICORUBY_ROOT}/mrbgems/picoruby-net/ports/rp2040/*.c
     )
+  endif()
+  if(R2P2_TRUSTZONE)
+    # TZ is WiFi-only (no Bluetooth, see tz/docs/WIFI-UNDER-TZ-HANDOFF.md
+    # watch-out #5): the r2p2-picoruby-pico2_w-tz build config drops the
+    # BLE gems from libmruby, so the BLE port .c (which needs btstack
+    # headers we no longer pull in) must not be compiled either.
+    file(GLOB REMOVE_BLE_SRCS CONFIGURE_DEPENDS
+      ${PICORUBY_ROOT}/mrbgems/picoruby-ble/ports/rp2040/*.c
+    )
+    list(APPEND REMOVE_WIFI_SRCS ${REMOVE_BLE_SRCS})
   endif()
 else()
   # picoruby-mbedtls stays IN for non-WiFi builds: the pico2 build config
@@ -237,15 +247,29 @@ if(PICO_BOARD STREQUAL "pico" OR PICO_BOARD STREQUAL "pico_w")
 endif()
 
 if(USE_WIFI)
-  # these are used only in WiFi build
-  target_link_libraries(${PROJECT_NAME} PRIVATE
-    pico_cyw43_arch_lwip_threadsafe_background
-    pico_btstack_ble
-    pico_btstack_cyw43
-  )
-  target_include_directories(${PROJECT_NAME} PRIVATE
-    ${PICORUBY_ROOT}/mrbgems/picoruby-ble/include
-  )
+  if(R2P2_TRUSTZONE)
+    # Poll mode under TrustZone (tz/docs/WIFI-UNDER-TZ-HANDOFF.md §2):
+    # threadsafe_background drives cyw43 from a dynamically claimed spare
+    # NVIC user IRQ, which would silently never fire NS unless pinned and
+    # ITNS-routed. Poll mode needs no user IRQ and fits the cooperative
+    # single-caller model; the net/socket gems already compile with
+    # PICO_CYW43_ARCH_POLL=1 and call cyw43_arch_poll() in their wait
+    # loops, and picorb_hal_idle_cpu polls from the VM idle hook. No
+    # Bluetooth: btstack is not linked (BLE gems are out of the TZ config).
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+      pico_cyw43_arch_lwip_poll
+    )
+  else()
+    # these are used only in WiFi build
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+      pico_cyw43_arch_lwip_threadsafe_background
+      pico_btstack_ble
+      pico_btstack_cyw43
+    )
+    target_include_directories(${PROJECT_NAME} PRIVATE
+      ${PICORUBY_ROOT}/mrbgems/picoruby-ble/include
+    )
+  endif()
 endif()
 
 add_compile_definitions(PICORB_ALLOC_ESTALLOC=1)
@@ -289,8 +313,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 if(R2P2_TRUSTZONE)
-  if(NOT (PICO_BOARD STREQUAL "pico2"))
-    message(FATAL_ERROR "R2P2_TRUSTZONE is pico2-only in phase 1 (RP2350 Arm, non-WiFi)")
+  if(NOT (PICO_BOARD STREQUAL "pico2" OR PICO_BOARD STREQUAL "pico2_w"))
+    message(FATAL_ERROR "R2P2_TRUSTZONE requires an RP2350 Arm board (pico2 or pico2_w)")
   endif()
   # NS runtime-init/rand/flash overrides, NS linker script, veneer implib.
   include(${R2P2_GEM_DIR}/tz/ns/ns_build.cmake)

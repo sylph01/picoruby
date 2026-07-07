@@ -6,8 +6,21 @@ load "#{R2P2_GEM_DIR}/r2p2_config.rb"
 ENV["PICO_SDK_PATH"] ||= "#{R2P2_GEM_DIR}/lib/pico-sdk"
 ENV["PICO_EXTRAS_PATH"] ||= "#{R2P2_GEM_DIR}/lib/pico-extras"
 
+# TZ builds use a dedicated `-tz` build config when one exists (e.g.
+# r2p2-picoruby-pico2_w-tz.rb trims the gem set for the NS image); boards
+# whose TZ gem set matches stock (pico2) just share the stock config.
+def r2p2_mruby_config_name(vm, board)
+  name = "r2p2-#{vm}-#{board}"
+  tz_name = "#{name}-tz"
+  if ENV["R2P2_TRUSTZONE"] && File.exist?("#{MRUBY_ROOT}/build_config/#{tz_name}.rb")
+    tz_name
+  else
+    name
+  end
+end
+
 def r2p2_mruby_config(vm, board)
-  "#{MRUBY_ROOT}/build_config/r2p2-#{vm}-#{board}.rb"
+  "#{MRUBY_ROOT}/build_config/#{r2p2_mruby_config_name(vm, board)}.rb"
 end
 
 def r2p2_def_board(board)
@@ -53,22 +66,32 @@ def r2p2_def_psg_pwm_dma
   "-D PICORUBY_PSG_PWM_DMA=#{enabled ? 'ON' : 'OFF'}"
 end
 
+# The monitor is built once per board (the W build must set
+# R2P2_TZ_LED_DIAG=0 — GP25 is the CYW43 chip select there). Keep the
+# per-board builds in separate dirs so board-1 (pico2) artifacts survive.
+def r2p2_tz_monitor_build_dir(board)
+  suffix = board == "pico2" ? "" : "-#{board}"
+  "#{R2P2_GEM_DIR}/tz/monitor/build#{suffix}"
+end
+
 def r2p2_def_trustzone(vm, board)
   return "" unless ENV["R2P2_TRUSTZONE"]
-  unless vm == "picoruby" && board == "pico2"
-    raise "R2P2_TRUSTZONE is only supported for picoruby on pico2 (phase 1)"
+  unless vm == "picoruby" && %w[pico2 pico2_w].include?(board)
+    raise "R2P2_TRUSTZONE is only supported for picoruby on pico2/pico2_w (RP2350 Arm)"
   end
-  implib = ENV["R2P2_TZ_IMPLIB"] ||
-           "#{R2P2_GEM_DIR}/tz/monitor/build/r2p2_sg_implib.o"
+  monitor_build = r2p2_tz_monitor_build_dir(board)
+  implib = ENV["R2P2_TZ_IMPLIB"] || "#{monitor_build}/r2p2_sg_implib.o"
   unless File.exist?(implib)
     raise <<~MSG
       Monitor veneer implib not found at:
         #{implib}
       Build the Secure monitor first:
         cd #{R2P2_GEM_DIR}/tz/monitor && \\
-          PICO_SDK_PATH=#{ENV['PICO_SDK_PATH']} cmake -B build -S . && \\
-          cmake --build build
-      or set R2P2_TZ_IMPLIB to its r2p2_sg_implib.o.
+          PICO_SDK_PATH=#{ENV['PICO_SDK_PATH']} cmake -B #{File.basename(monitor_build)} -S . -DPICO_BOARD=#{board} && \\
+          cmake --build #{File.basename(monitor_build)}
+      (the monitor CMakeLists forces the diag LED off on pico2_w — GP25 is
+      the CYW43 chip select there) or set R2P2_TZ_IMPLIB to its
+      r2p2_sg_implib.o.
     MSG
   end
   "-D R2P2_TRUSTZONE=1 -D R2P2_TZ_IMPLIB=#{implib}"
@@ -86,19 +109,23 @@ namespace :r2p2 do
     # .ns_manifest section, regenerate the monitor UF2, optionally seal
     # with a signing key (R2P2_TZ_SIGKEY), and emit a combined UF2.
     # Layout must match tz_ns_manifest_t in tz/include/r2p2_tz_config.h.
-    desc "Patch NS digest into the TZ monitor and package (env: R2P2_TZ_MODE=prod|debug, R2P2_TZ_SIGKEY, R2P2_TZ_NS_VERSION)"
+    desc "Patch NS digest into the TZ monitor and package (env: R2P2_TZ_BOARD=pico2|pico2_w, R2P2_TZ_MODE=prod|debug, R2P2_TZ_SIGKEY, R2P2_TZ_NS_VERSION)"
     task :package do
       require "digest"
 
       mode = ENV["R2P2_TZ_MODE"] || "prod"
-      monitor_build = "#{R2P2_GEM_DIR}/tz/monitor/build"
+      board = ENV["R2P2_TZ_BOARD"] || "pico2"
+      unless %w[pico2 pico2_w].include?(board)
+        raise "R2P2_TZ_BOARD must be pico2 or pico2_w"
+      end
+      monitor_build = r2p2_tz_monitor_build_dir(board)
       monitor_elf = "#{monitor_build}/r2p2_tz_monitor.elf"
-      ns_dir = "#{MRUBY_ROOT}/build/r2p2/picoruby/pico2/#{mode}-tz"
+      ns_dir = "#{MRUBY_ROOT}/build/r2p2/picoruby/#{board}/#{mode}-tz"
       ns_bin = Dir["#{ns_dir}/R2P2-*.bin"].max_by { |f| File.mtime(f) }
       ns_uf2 = ns_bin&.sub(/\.bin\z/, ".uf2")
 
       raise "Monitor not built: #{monitor_elf}" unless File.exist?(monitor_elf)
-      raise "NS image not built in #{ns_dir} (run the r2p2:picoruby:pico2:#{mode} task with R2P2_TRUSTZONE=1)" unless ns_bin
+      raise "NS image not built in #{ns_dir} (run the r2p2:picoruby:#{board}:#{mode} task with R2P2_TRUSTZONE=1)" unless ns_bin
 
       picotool = Dir["#{monitor_build}/_deps/picotool*/picotool",
                      "#{ns_dir}/_deps/picotool*/picotool"].find { |f| File.executable?(f) } || "picotool"
@@ -212,7 +239,8 @@ namespace :r2p2 do
               dir = r2p2_build_dir(vm, board, mode)
               FileUtils.mkdir_p dir
               config = r2p2_mruby_config(vm, board)
-              mruby_build_path = "#{MRUBY_ROOT}/build/r2p2-#{vm}-#{board}"
+              config_name = r2p2_mruby_config_name(vm, board)
+              mruby_build_path = "#{MRUBY_ROOT}/build/#{config_name}"
               FileUtils.cd MRUBY_ROOT do
                 sh "MRUBY_CONFIG=#{config} PICORB_BOARD=#{board} #{mode=='debug' ? 'PICORB_DEBUG=1' : ''} rake"
               end
@@ -222,7 +250,7 @@ namespace :r2p2 do
                 -D EXTRA_LIBRARY_PATH=#{mruby_build_path}/lib \
                 -D EXTRA_INCLUDE_DIR=#{mruby_build_path}/include \
                 -D PICO_CYW43_SUPPORTED=1 \
-                -D MRUBY_CONFIG=r2p2-#{vm}-#{board} \
+                -D MRUBY_CONFIG=#{config_name} \
                 #{r2p2_def_picorb_vm(vm)} \
                 #{r2p2_def_r2p2_name(vm, board)} \
                 #{r2p2_def_board(board)} \

@@ -24,6 +24,18 @@ pico_sdk_init()
 # sg_crypto.c over the hardware SHA-256. No md layer, no bignum/ECP.
 set(MBEDTLS_LIB $ENV{PICO_SDK_PATH}/lib/mbedtls/library)
 
+# On the pico2_w GP25 is the CYW43 chip select, not an LED — driving it
+# from the monitor would fight the WiFi driver (see docs/WIFI-UNDER-TZ-
+# HANDOFF.md watch-out #1). Default the diag LED OFF there and hard-error
+# if someone forces it on; probe/tz_diag is the diagnostic channel on the W.
+if(PICO_BOARD STREQUAL "pico2_w")
+  set(R2P2_TZ_LED_DIAG OFF CACHE BOOL "LED diag — GP25 is the CYW43 chip select on pico2_w")
+  if(R2P2_TZ_LED_DIAG)
+    message(FATAL_ERROR
+      "R2P2_TZ_LED_DIAG=1 on pico2_w would drive GP25, the CYW43 chip "
+      "select. Build the W monitor with R2P2_TZ_LED_DIAG=0 (the default).")
+  endif()
+endif()
 option(R2P2_TZ_LED_DIAG "LED breadcrumb diagnostics on GPIO25 (non-W Pico 2 only)" ON)
 
 add_executable(r2p2_tz_monitor

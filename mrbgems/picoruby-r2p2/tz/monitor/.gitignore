@@ -1,1 +1,2 @@
-build/
+# per-board monitor build dirs: build/ (pico2), build-pico2_w/, ...
+build*/
