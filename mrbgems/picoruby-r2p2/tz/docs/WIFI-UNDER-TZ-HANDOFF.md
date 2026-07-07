@@ -145,3 +145,77 @@ guards first.
 - Whether the gateway use-case needs the server-shared `GATEWAY_PSK`
   provisioned for real (a fresh board + the `OTP-BURN.md` production path),
   or dev-fallback keys suffice during bring-up (they do).
+
+---
+
+## Status update (2026-07-07, end of bring-up session 1)
+
+Everything above §"The work" is DONE and hardware-verified on the
+pristine-OTP Pico 2 W (commits 199d1848..6d7859a0):
+
+- Build plumbing (§1), **poll mode** chosen (§2 — the net/socket gems
+  were already coded for it; stock+poll verified working on hardware, so
+  poll is exonerated of everything below), constructor audit (§3) clean.
+- **Ladder: rungs 1–3 PASS under TZ** — `CYW43.init` → STA → WPA2 join →
+  full DHCP handshake (lease acquired from a host-side `nmcli` hotspot),
+  cold boot, no debugger. Rung 4 (TCP) blocked by the RX-pump bug below.
+
+### The big find: NS pad writes never land (fixed in monitor)
+
+NS writes to PADS_BANK0 are silently dropped (SDK pad writes all go via
+the atomic aliases; IO_BANK0 FUNCSEL plain writes DO work) → every pad
+stays reset: ISO latched, IE clear → no NS-configured pin ever drives.
+The monitor now de-isolates + input-enables all NSMASK'd bank-0 pads
+(`partition_configure`, commit 5cdf1961). Without this, ALL pad-touching
+NS peripherals (UART/I2C/SPI/PWM/WiFi) are dead while looking configured.
+Diagnosis tools that earned their keep: `CYW43._probe_up` (forces
+ensure_up, returns its real error; -6 EIO = SPI garbage), `CYW43._state`,
+SWD dumps of ACCESSCTRL (all grants were correct!) and of PADS (0x116 =
+reset+ISO = the smoking gun). TODO: datasheet check — aliases-only vs all
+pad writes; decides whether NS runtime pull/drive changes need a veneer.
+
+### Open bug 1: async F2 RX delivery stalls at idle (blocks rungs 4–5)
+
+TX works; the AP's DHCP replies arrive OTA but sit undelivered — every
+synchronous ioctl drains them (a `CYW43::GPIO#read` pump loop completes
+DHCP instantly; that's how rung 3 was proven). So `cyw43_arch_poll()` at
+idle isn't processing packets: suspect `cyw43_ll_has_work` →
+`gpio_get(24)` (host-wake pin) reading 0 from NS, or the LEVEL_HIGH GPIO
+IRQ on pin 24 not firing NS. Next session: read SIO_NS GPIO_IN bit 24
+while packets are pending; if dead, either fix the input path or make the
+50 ms sleep-check worker call process_packets unconditionally.
+Also observed: board TX frames appear DUPLICATED in AP-side tcpdump
+(firmware ACK-timeout retries? benign so far, worth understanding).
+
+### Open bug 2: littlefs corruption on the seeded FS (TZ only)
+
+Fresh-format + same-boot small write/readback both PASS; but a boot
+sequence seeding the system executables can corrupt the FS such that
+later boots fail `Corrupted @ lfs_file_read` — and a corrupted volume
+can HANG littlefs (boot task freezes pre-shell). Fresh-erase clears it
+(`picotool erase -r 0x10340000 0x10400000`; note littlefs actually lives
+at 0x380000+, `LFS_FLASH_TARGET_OFFSET` ≠ cmake's `FLASH_TARGET_OFFSET`).
+Suspect multi-KB / multi-sector write paths under checked_flash_op.
+Unrelated to pads (QSPI is Secure-side).
+
+### Operational gotchas (hard-won today)
+
+- After `picotool load`, `picotool reboot` often leaves the board dark —
+  ask for a **physical replug** instead. BOOTSEL + `picotool load -v` is
+  the reliable flash path; openocd `program ... verify reset exit` works
+  but ALWAYS pass verify (an unverified program once left a corrupt,
+  dark-booting image). Avoid openocd RESCUE unless truly bricked.
+- The boot-error loop-print (main_task rescue) + `tio`-style capture
+  beats racing USB enumeration; never hold a CDC fd across a board reset
+  (it can wedge the host kernel's USB stack — hard reboot territory).
+- 802.11-level join state is visible host-side: `iw dev <ap-if> station
+  dump` (associated/authorized), NM-dnsmasq leases need sudo, tcpdump on
+  the hotspot interface is the ground truth for DHCP.
+
+### Ladder remainder for next session
+
+4. TCP to a host — echo server script exists (scratchpad
+   tcp_echo_server.py, port 4444; host is 10.42.0.1 on the hotspot).
+5. TLS via mbedTLS — self-signed P-256 cert generated; measure RAM
+   during handshake (watch-out #4).
+Fix RX pump first; both rungs then likely just work.
