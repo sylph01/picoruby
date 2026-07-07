@@ -68,13 +68,22 @@ if(USE_WIFI)
     )
   endif()
 else()
+  # picoruby-mbedtls ports/ stay IN for non-WiFi builds: the pico2 build
+  # config now includes the gem (NS session crypto under TrustZone, see
+  # tz/README.md), whose src/*.c inside libmruby.a reference the MbedTLS_*
+  # port symbols. Only the SDK's lwIP TLS glue (pico_mbedtls.c) is
+  # WiFi-specific. The port objects must see the SAME mbedtls config the
+  # gem's rake-side library objects were built with — context structs are
+  # sized by the config.
+  add_compile_definitions(
+    MBEDTLS_CONFIG_FILE="${PICORUBY_ROOT}/mrbgems/picoruby-mbedtls/include/mbedtls_config.h"
+  )
   file(GLOB REMOVE_WIFI_SRCS CONFIGURE_DEPENDS
       ${PICORUBY_ROOT}/mrbgems/picoruby-filesystem-fat/ports/rp2040/*.c
     ${PICORUBY_ROOT}/mrbgems/picoruby-cyw43/ports/rp2040/*.c
     ${PICORUBY_ROOT}/mrbgems/picoruby-net/ports/rp2040/*.c
     ${PICORUBY_ROOT}/mrbgems/picoruby-socket/ports/rp2040/*.c
     ${PICORUBY_ROOT}/mrbgems/picoruby-ble/ports/rp2040/*.c
-    ${PICORUBY_ROOT}/mrbgems/picoruby-mbedtls/ports/**/*.c
     ${PICO_SDK_PATH}/src/rp2_common/pico_mbedtls/pico_mbedtls.c
   )
 endif()
