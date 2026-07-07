@@ -20,12 +20,15 @@
 #include "../include/r2p2_mrb_envelope.h"
 #include "tz_selftest_pkgs.h"
 
-int picorb_hal_write(int fd, const void *buf, int nbytes); /* machine hal */
+/* The machine hal's console write. hal.h #defines picorb_hal_write to this
+ * for the mruby VM (the only VM the TZ build uses), so name the real
+ * symbol directly rather than dragging that header's include paths here. */
+int mrb_hal_write(int fd, const void *buf, int nbytes);
 
 static int t_failures;
 
 static void t_out(const char *s) {
-    picorb_hal_write(1, s, (int)strlen(s));
+    mrb_hal_write(1, s, (int)strlen(s));
 }
 
 static void t_check(const char *name, bool ok) {
