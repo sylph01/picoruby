@@ -1,6 +1,12 @@
 if Machine.wifi_available?
   if Shell.get_device(:gpio, 'TRIGGER_NMBLE')&.low?
-    load "/bin/nmble"
+    begin
+      load "/bin/nmble"
+    rescue LoadError => e
+      # WiFi-only builds (e.g. the TrustZone pico2_w config) have no ble
+      # gem; a floating TRIGGER_NMBLE pin must not abort the whole boot.
+      puts "nmble unavailable: #{e.message}"
+    end
   end
   wifi_config_path = ENV['WIFI_CONFIG_PATH'] || ENV_DEFAULT_WIFI_CONFIG_PATH
   if File.file?(wifi_config_path)

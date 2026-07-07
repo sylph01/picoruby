@@ -30,6 +30,12 @@ begin
   shell.show_logo
   shell.start
 rescue => e
-  puts "#{e.message} (#{e.class})"
+  # Keep re-printing a fatal boot error instead of letting the task die:
+  # a one-shot print races USB CDC enumeration (the host usually isn't
+  # listening yet), and on the TZ build a dead scheduler parks the core.
+  loop do
+    puts "#{e.message} (#{e.class})"
+    sleep 2
+  end
 end
 
