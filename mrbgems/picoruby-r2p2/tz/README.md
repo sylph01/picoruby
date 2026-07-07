@@ -35,7 +35,15 @@ one-shot by decision), `TZ.derive_key(info, len=32, slot=0)` feeding
 `MbedTLS::Cipher#key=` (tier-2 session crypto — AES-256-GCM round-trip
 verified in irb on target), and `TZ.verify_mrb`. The picoruby-mbedtls gem
 is now in the pico2 build config; its entropy comes from `sg_random_bytes`
-via the rand_ns wrap. Still open: the secure-boot OTP burn itself, real
+via the rand_ns wrap. Item 0 (probe-first diagnostics) landed 2026-07-07 and was verified on a
+Pico 2 W + Debug Probe: the bring-up LED scaffolding is gone (LED path
+survives behind `cmake -DR2P2_TZ_LED_DIAG=1`, the non-W board 1 default),
+replaced by the `tz_diag` record at 0x20080000 — boot-stage stamps +
+full fault dump, read over SWD (`tools/PROBE.md`, `tools/tz_diag.gdb`).
+openocd (RPi fork) also replaces BOOTSEL for the dev loop: `program
+<ns.elf>` + `program <monitor_packaged.elf> verify reset exit`.
+
+Still open: the secure-boot OTP burn itself, real
 key provisioning to OTP pages 48/49. This directory holds the shared
 contract between the two firmware images of a Secure/Non-secure split
 R2P2:
