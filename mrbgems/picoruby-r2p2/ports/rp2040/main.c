@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <unistd.h>  /* _exit (overridden by tz/ns/exit_ns.c under TZ) */
 
 /* PicoRuby */
 #include "picoruby.h"
@@ -126,34 +127,6 @@ gpio_init_safe(void)
 }
 
 #if defined(R2P2_TRUSTZONE)
-/* Report the boot outcome over the LED (GPIO25) as a small, countable
- * number of slow blinks (USB CDC is unreliable during NS bring-up).
- * The number is an index into a table of likely boot-exception classes. */
-static void tz_busy(uint32_t loops) {
-  for (volatile uint32_t i = 0; i < loops; i++) __asm volatile ("nop");
-}
-#define TZ_MS(n) ((n) * 25000u)  /* ~n ms at 150 MHz */
-static int tz_exc_index(const char *cls) {
-  static const char *names[] = {
-    "RuntimeError", "LoadError", "ArgumentError", "NoMethodError",   /* 2-5  */
-    "NameError", "TypeError", "StandardError", "NotImplementedError",/* 6-9  */
-    "IndexError", "KeyError", "RangeError", "ScriptError",           /* 10-13*/
-  };
-  for (int i = 0; i < 12; i++) if (strcmp(cls, names[i]) == 0) return i + 2;
-  return 15; /* an exception, but not one in the table */
-}
-static void __attribute__((noreturn)) tz_blink_count(int n) {
-  gpio_init(25); gpio_set_dir(25, GPIO_OUT);
-  for (;;) {
-    gpio_put(25, 1); tz_busy(TZ_MS(1200)); /* long start marker */
-    gpio_put(25, 0); tz_busy(TZ_MS(700));
-    for (int i = 0; i < n; i++) {
-      gpio_put(25, 1); tz_busy(TZ_MS(250));
-      gpio_put(25, 0); tz_busy(TZ_MS(550));
-    }
-    tz_busy(TZ_MS(3000)); /* long gap before repeating the count */
-  }
-}
 /* Run the scheduler under C-level protection so a task's unhandled exception
  * is caught here (as mrb_protect_error's result) instead of re-raising at the
  * top level -> abort() -> _exit. Lets us read the exception class reliably. */
@@ -210,20 +183,27 @@ main(void)
 #if defined(R2P2_TRUSTZONE)
     /* Protect the scheduler so a task's unhandled exception is caught here
      * instead of re-raising at the C top level (mrb->jmp==NULL) ->
-     * exc_throw -> abort() -> _exit. Then report the class over the LED
-     * (USB CDC is unreadable in NS bring-up). */
+     * exc_throw -> abort() -> _exit. Report the class over the still-live
+     * CDC console, then fall into the _exit halt (exit_ns.c: bkpt — probe
+     * stops there, or the monitor's fault handler records it). */
     mrb_bool tz_err = FALSE;
     mrb_value tz_res = mrb_protect_error(mrb, tz_task_run_thunk, NULL, &tz_err);
-    irq_set_enabled(USBCTRL_IRQ, false);
-    int n;
+    const char *cls = NULL;
     if (tz_err && !mrb_nil_p(tz_res)) {
-      n = tz_exc_index(mrb_obj_classname(mrb, tz_res));
+      cls = mrb_obj_classname(mrb, tz_res);
     } else if (mrb->exc) {
-      n = tz_exc_index(mrb_obj_classname(mrb, mrb_obj_value(mrb->exc)));
-    } else {
-      n = 1; /* scheduler ended with no exception */
+      cls = mrb_obj_classname(mrb, mrb_obj_value(mrb->exc));
     }
-    tz_blink_count(n); /* never returns */
+    {
+      const char *msg = "\r\nR2P2-TZ: scheduler exited";
+      picorb_hal_write(2, msg, strlen(msg));
+      if (cls) {
+        picorb_hal_write(2, ": ", 2);
+        picorb_hal_write(2, cls, strlen(cls));
+      }
+      picorb_hal_write(2, "\r\n", 2);
+    }
+    _exit(1); /* never returns (exit_ns.c) */
 #else
     mrb_task_run(mrb);
 #endif

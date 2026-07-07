@@ -114,6 +114,14 @@ SECTIONS
         KEEP(*(.ns_manifest))
     } > FLASH_S
 
+    /* Probe-readable diagnostic record (tz_diag.h) pinned to the very
+     * start of RAM_S = 0x20080000, so SWD tooling needs no symbol lookup.
+     * NOLOAD + placed first: the address is part of the debug contract. */
+    .tz_diag (NOLOAD): {
+        KEEP(*(.tz_diag))
+    } > RAM_S
+    ASSERT(ADDR(.tz_diag) == 0x20080000, ".tz_diag must sit at 0x20080000")
+
     .ram_vector_table (NOLOAD): {
         *(.ram_vector_table)
     } > RAM_S

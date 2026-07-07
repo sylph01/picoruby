@@ -24,6 +24,8 @@ pico_sdk_init()
 # sg_crypto.c over the hardware SHA-256. No md layer, no bignum/ECP.
 set(MBEDTLS_LIB $ENV{PICO_SDK_PATH}/lib/mbedtls/library)
 
+option(R2P2_TZ_LED_DIAG "LED breadcrumb diagnostics on GPIO25 (non-W Pico 2 only)" ON)
+
 add_executable(r2p2_tz_monitor
     main.c
     sg_veneers.c
@@ -61,6 +63,12 @@ target_compile_definitions(r2p2_tz_monitor PRIVATE
     # Anti-rollback counter OTP writes stay compiled OUT for dev boards; a
     # RAM shadow keeps the semantics. Production monitors set this to 1.
     R2P2_TZ_OTP_WRITE=0
+    # Diagnostics channel (tz_diag.h): the probe-readable record at
+    # 0x20080000 always exists; this additionally enables the phase-1 LED
+    # breadcrumb/read-out on GPIO25. 1 = non-W Pico 2 bring-up (default),
+    # 0 = probe boards (Pico 2 W — GPIO25 is the CYW43 chip select there)
+    # and production. Configure with cmake -DR2P2_TZ_LED_DIAG=0.
+    R2P2_TZ_LED_DIAG=$<BOOL:${R2P2_TZ_LED_DIAG}>
 )
 
 target_include_directories(r2p2_tz_monitor PRIVATE
