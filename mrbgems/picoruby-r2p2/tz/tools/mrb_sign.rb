@@ -10,6 +10,9 @@
 #   pubkey  <key.pem> <mrb_pubkey.h>      emit the monitor's pubkey header
 #   sign    <key.pem> <in.mrb> <out.mrbx> [version]   wrap + sign (default 0)
 #   verify  <key.pem> <pkg.mrbx>          host-side round-trip check
+#   selftest-header <key.pem> <out.h>     emit ../ns/tz_selftest_pkgs.h
+#                                         (signed v3 + v1 packages for the
+#                                         on-target TZ.selftest)
 #
 # The signature is ECDSA P-256, raw r||s (32+32 bytes, big-endian), over
 # SHA-256(domain || header || payload).
@@ -108,7 +111,34 @@ when "verify"
   puts "signature #{ok ? 'OK' : 'FAILED'}, version #{version}"
   exit(ok ? 0 : 1)
 
+when "selftest-header"
+  key = OpenSSL::PKey::EC.new(File.read(ARGV.fetch(1)))
+  pkg = lambda do |version|
+    payload = "R2P2 TZ selftest package v#{version}\n"
+    hdr = header(payload.bytesize, version)
+    hdr + payload + raw_sig_from_der(key.dsa_sign_asn1(digest(hdr, payload)))
+  end
+  carray = lambda do |name, bytes|
+    rows = bytes.bytes.each_slice(12).map { |s| "    " + s.map { |b| format("0x%02x,", b) }.join(" ") }
+    "static const uint8_t #{name}[#{bytes.bytesize}] = {\n#{rows.join("\n")}\n};\n"
+  end
+  File.write(ARGV.fetch(2), <<~HEADER)
+    /* tz_selftest_pkgs.h — signed packages embedded in the on-target
+     * TZ.selftest (tz_selftest.c). GENERATED — regenerate after changing
+     * the envelope format or the signing key:
+     *   tools/mrb_sign.rb selftest-header tools/mrb_signing_dev.pem \\
+     *       ns/tz_selftest_pkgs.h */
+
+    #include <stdint.h>
+
+    /* version 3: verifies OK, advances the rollback shadow to 3 */
+    #{carray.call('tz_pkg_v3', pkg.call(3))}
+    /* version 1: rejected as rollback once v3 has been seen this boot */
+    #{carray.call('tz_pkg_v1', pkg.call(1))}
+  HEADER
+  puts "wrote #{ARGV[2]}"
+
 else
-  warn "usage: #{$0} keygen|pubkey|sign|verify ... (see file header)"
+  warn "usage: #{$0} keygen|pubkey|sign|verify|selftest-header ... (see file header)"
   exit 2
 end
