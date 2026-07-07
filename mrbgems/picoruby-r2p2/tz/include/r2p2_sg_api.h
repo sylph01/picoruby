@@ -86,9 +86,14 @@ typedef uint32_t sg_key_t;
  * page/rows + derivation + policy); the mapping table lives in the monitor
  * image only, so an NS rebuild cannot repoint or repolicy a slot. */
 enum sg_key_slot {
-  SG_SLOT_DEVICE_ROOT = 0, /* OTP-derived device root, DERIVE only        */
-  SG_SLOT_GATEWAY_PSK = 1, /* provisioned server<->device PSK             */
-  SG_SLOT_MRB_VERIFY  = 2, /* public key for sg_verify_mrb (verify-only)  */
+  SG_SLOT_DEVICE_ROOT = 0, /* OTP-derived device root                      */
+  SG_SLOT_GATEWAY_PSK = 1, /* provisioned server<->device PSK; sg_key_open
+                            * requires a prior successful sg_verify_mrb
+                            * this boot (the policy-gate latch)            */
+  SG_SLOT_MRB_VERIFY  = 2, /* names the sg_verify_mrb public key in policy
+                            * discussions; NOT keystore material (the key
+                            * is compiled into the monitor's verify path) —
+                            * sg_key_open returns SG_ERR_INVALID_SLOT      */
 };
 
 /* Key policy bits — readable by NS for introspection, settable only in the
@@ -207,12 +212,16 @@ SG_API int sg_flash_program(uint32_t offset, const uint8_t *data, uint32_t count
 
 /* ---- signed bytecode ----------------------------------------------------- */
 
-/* PHASE 2 — returns SG_ERR_NOT_PERMITTED in phase 1. Reserved in the ABI
- * now so the veneer table stays stable.
+/* Verify a signed .mrb package (format: r2p2_mrb_envelope.h; sign with
+ * tz/tools/mrb_sign.rb). ECDSA P-256 over SHA-256(domain||header||payload)
+ * against the monitor-compiled public key, plus a monotonic anti-rollback
+ * check (OTP thermometer rows, monitor-side; the counter advances on
+ * success — only when the monitor is built with R2P2_TZ_OTP_WRITE=1).
+ * Success unlocks SG_SLOT_GATEWAY_PSK for the rest of this boot.
  *
- * Will verify an authenticated .mrb package (envelope format TBD; ECDSA
- * signature vs HMAC seal undecided) against SG_SLOT_MRB_VERIFY, including
- * a monotonic rollback counter check (OTP thermometer rows, monitor-side).
+ * Returns: SG_OK; SG_ERR_AUTH_FAILED (bad signature); SG_ERR_NOT_PERMITTED
+ * (rollback: package older than the counter); SG_ERR_BAD_PARAM (malformed
+ * envelope, or version beyond counter capacity).
  *
  * Honest scope note: this attests the buffer contents at call time. NS owns
  * the buffer and the VM that will execute it, so this is a policy gate
