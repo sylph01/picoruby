@@ -11,7 +11,10 @@ Build: monitor standalone (`monitor/CMakeLists.txt`), NS via
 `R2P2_TRUSTZONE=1 rake r2p2:picoruby:pico2:prod` (see `ns/ns_build.cmake`),
 then `rake r2p2:tz:package` → `package/R2P2-TZ-combined.uf2`.
 
-Phase 2 (2026-07-07, not yet hardware-verified): the crypto veneers are
+Phase 2 (**verified on hardware 2026-07-07**, board 1 Pico 2, via
+`TZ.selftest` from irb — 39/39 checks: keystore/policy/handles, HKDF
+export determinism, AEAD round-trip + tamper + no-write-on-mismatch,
+verify_mrb signature/latch/rollback/tamper): the crypto veneers are
 real — OTP-backed keystore with chip-ID dev fallback on blank pages
 (`monitor/keystore.c`), HKDF/HMAC over the hardware SHA-256 and
 ChaCha20-Poly1305 over the mbedTLS chacha20/poly1305 slice
