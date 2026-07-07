@@ -328,6 +328,28 @@ static void partition_configure(void) {
     accessctrl_hw->gpio_nsmask[0] = 0x3fffffffu;
     accessctrl_hw->gpio_nsmask[1] = 0xc0000000u;
 
+    /* Pad bring-up for the NS pins. Found on hardware (pico2_w, 2026-07-07):
+     * NS writes to PADS_BANK0 do not land — the SDK's gpio_init/
+     * gpio_set_function pad writes (all via the atomic aliases) are
+     * silently dropped, leaving every pad at its reset value: ISO latch
+     * set, input disabled. Nothing NS "configures" ever reaches a pin
+     * (first casualty: the CYW43 PIO-SPI — WL_REG_ON never actually
+     * powered the WiFi chip; probe_up=-6 EIO). Empirically verified:
+     * clearing ISO from the Secure side makes the same NS bring-up
+     * succeed at once. So the monitor de-isolates and input-enables every
+     * NSMASK'd bank-0 pad: reset value minus ISO plus IE (pull-down and
+     * schmitt retained — the state stock firmware reaches after
+     * gpio_init). TODO: pin down the datasheet semantics (all NS pad
+     * writes vs only the atomic aliases) — decides whether NS needs a
+     * veneer for runtime pull/drive changes. */
+    for (uint32_t pin = 0; pin < 30; pin++) {
+        if (accessctrl_hw->gpio_nsmask[0] & (1u << pin)) {
+            hw_write_masked(&pads_bank0_hw->io[pin],
+                            PADS_BANK0_GPIO0_IE_BITS,
+                            PADS_BANK0_GPIO0_IE_BITS | PADS_BANK0_GPIO0_ISO_BITS);
+        }
+    }
+
     /* DMA: hand the first TZ_NS_DMA_CHANNELS channels to NS-Privileged and
      * LOCK the level (it would lock at first use anyway; locking now makes
      * the assignment explicit). Remaining channels stay Secure. */
