@@ -1,74 +1,47 @@
 /*
- * exit_ns.c — Non-secure _exit override for TZ bring-up. SKETCH / TEMPORARY.
+ * exit_ns.c — Non-secure _exit override (strong def beats the SDK's weak
+ * one). Reached when C-level abort()/exit() fires inside the VM, e.g. an
+ * mruby error escalating past the scheduler.
  *
- * On the TZ split the NS image has no UART/SWD console, and the mruby VM
- * reaches _exit two ways during a failed boot:
- *   1. main() returns after mrb_task_run() (a task raised, scheduler ended)
- *      -> handled by the keepalive loop in main.c (mrb still open there).
- *   2. a C-level abort()/panic *inside* mrb_task_run -> jumps straight to
- *      _exit, bypassing that loop. The stock weak _exit just bkpt-loops,
- *      which escalates to the monitor's HardFault handler (LED nibble
- *      read-out) and the USB port never comes up.
- *
- * This strong override (beats the SDK's __weak _exit) turns case 2 into a
- * console: keep servicing TinyUSB so the CDC port enumerates, and once the
- * host attaches, print the pending mruby error via global_mrb. Remove once
- * boot is clean.
- *
- * tud_task()/tud_cdc_connected() and picorb_hal_write are macros, so we must
- * pull the real headers (bare externs referenced non-existent symbols).
+ * Behavior: best-effort one-shot report of any pending mruby exception
+ * over the already-running USB CDC console, then quiesce USB and halt on
+ * a breakpoint. With the Debug Probe attached the bkpt stops the core
+ * right here (backtrace available); without a debugger it escalates to
+ * the monitor's Secure HardFault handler, which fills the tz_diag record
+ * at 0x20080000 (pc = this loop) and parks the core — either way the
+ * post-mortem is one SWD read away. See tz/tools/PROBE.md.
  */
 
 #include <string.h>
 #include "hardware/irq.h"
-#include "hardware/gpio.h"
 #include "mruby.h"
 
 extern mrb_state *global_mrb;
-extern const char *mrb_obj_classname(mrb_state *mrb, mrb_value obj);
+int mrb_hal_write(int fd, const void *buf, int nbytes); /* machine hal */
 
-/* Report the abort cause over the LED (GPIO25) as a small countable number
- * of slow blinks — USB CDC has proven unreadable in NS bring-up, and this
- * _exit path (C-level exit inside mrb_task_run) is the one actually taken.
- * The number matches main.c's tz_blink_count table, with distinct markers
- * for the _exit path: 14 = raw abort (no pending exception). */
+static void ns_out(const char *s) {
+    mrb_hal_write(2, s, (int)strlen(s));
+}
+
 static void ns_busy(uint32_t loops) {
     for (volatile uint32_t i = 0; i < loops; i++) __asm volatile ("nop");
-}
-#define NS_MS(n) ((n) * 25000u)  /* ~n ms at 150 MHz */
-static int ns_exc_index(const char *cls) {
-    static const char *names[] = {
-        "RuntimeError", "LoadError", "ArgumentError", "NoMethodError",   /* 2-5  */
-        "NameError", "TypeError", "StandardError", "NotImplementedError",/* 6-9  */
-        "IndexError", "KeyError", "RangeError", "ScriptError",           /* 10-13*/
-    };
-    for (int i = 0; i < 12; i++) if (strcmp(cls, names[i]) == 0) return i + 2;
-    return 15; /* an exception, but not one in the table */
-}
-static void __attribute__((noreturn)) ns_blink_count(int n) {
-    gpio_init(25); gpio_set_dir(25, GPIO_OUT);
-    for (;;) {
-        /* Unmistakable long ON start marker (~1.2s) — nothing else in the
-         * boot does this, so it separates the count from the shimmer. */
-        gpio_put(25, 1); ns_busy(NS_MS(1200));
-        gpio_put(25, 0); ns_busy(NS_MS(700));
-        /* Then N clearly-spaced blinks to count. */
-        for (int i = 0; i < n; i++) {
-            gpio_put(25, 1); ns_busy(NS_MS(250));
-            gpio_put(25, 0); ns_busy(NS_MS(550));
-        }
-        ns_busy(NS_MS(3000)); /* long gap before repeating */
-    }
 }
 
 void __attribute__((noreturn)) _exit(int status) {
     (void)status;
-    irq_set_enabled(USBCTRL_IRQ, false);
-    int n;
+    /* USB is still IRQ-serviced at this point; write while it lives, then
+     * give the host ~200 ms to drain the endpoint before quiescing. */
+    ns_out("\r\nR2P2-TZ: _exit reached");
     if (global_mrb && global_mrb->exc) {
-        n = ns_exc_index(mrb_obj_classname(global_mrb, mrb_obj_value(global_mrb->exc)));
-    } else {
-        n = 14; /* raw C-level abort, no pending mruby exception */
+        ns_out(" — pending exception: ");
+        ns_out(mrb_obj_classname(global_mrb,
+                                 mrb_obj_value(global_mrb->exc)));
     }
-    ns_blink_count(n); /* never returns */
+    ns_out("\r\n(core halting; attach probe / read tz_diag @0x20080000)\r\n");
+    ns_busy(5000000u);
+    irq_set_enabled(USBCTRL_IRQ, false);
+    for (;;) {
+        __asm volatile ("bkpt 0");
+        __asm volatile ("wfi");
+    }
 }

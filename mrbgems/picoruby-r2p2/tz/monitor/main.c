@@ -51,12 +51,52 @@
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_tz_config.h"  /* memory map, clock contract, TZ_NS_DMA_CHANNELS */
 #include "keystore.h"
+#include "tz_diag.h"
 
-/* ---- bring-up breadcrumbs (TEMPORARY) -----------------------------------
- * The monitor has no console, so first-silicon debugging uses the onboard
- * LED. Each boot stage blinks a distinct count; verify_failed strobes.
- * GPIO 25 = Pico 2 (non-W) LED — a Pico 2 W has no GPIO LED, so no light
- * there means "can't tell", not "dead". Remove once the handoff is proven. */
+/* ---- diagnostics ----------------------------------------------------------
+ * Primary channel: the tz_diag record at 0x20080000 (tz_diag.h), stamped
+ * at every boot stage and filled by the fault handlers — read it over SWD
+ * (Debug Probe; see tz/tools/PROBE.md). Halting is a quiet wfi loop so an
+ * attached probe finds an idle, inspectable core.
+ *
+ * Secondary channel (R2P2_TZ_LED_DIAG=1, non-W Pico 2 only): the phase-1
+ * LED breadcrumbs — stage blink counts, strobe on NS-hash mismatch, and
+ * the faulting-PC nibble read-out. Compiled out for probe boards and for
+ * production. */
+
+static tz_diag_t tz_diag __attribute__((section(".tz_diag"), used));
+
+static void __attribute__((noreturn)) diag_halt(void);
+
+static void diag_stage(uint32_t stage);
+
+/* Fill the fault record from the banked NS state + fault status registers.
+ * NS runs thread mode on MSP_NS, so the 8-word exception frame is there;
+ * guard the SP so a bogus value can't nest-fault. */
+static void __attribute__((noreturn)) diag_fault(void) {
+    uint32_t msp_ns, ipsr;
+    __asm volatile ("mrs %0, msp_ns" : "=r" (msp_ns));
+    __asm volatile ("mrs %0, ipsr" : "=r" (ipsr));
+    tz_diag.fault_kind = ipsr & 0x1ffu;
+    tz_diag.msp_ns = msp_ns;
+    if (msp_ns >= 0x20000000u && msp_ns < (0x20080000u - 32u)) {
+        const uint32_t *frame = (const uint32_t *)msp_ns;
+        tz_diag.lr   = frame[5];
+        tz_diag.pc   = frame[6];
+        tz_diag.xpsr = frame[7];
+    } else {
+        tz_diag.pc = 0xbadadd50u;
+    }
+    tz_diag.cfsr = *(volatile uint32_t *)0xe000ed28u;
+    tz_diag.hfsr = *(volatile uint32_t *)0xe000ed2cu;
+    tz_diag.bfar = *(volatile uint32_t *)0xe000ed38u;
+    tz_diag.sfsr = *(volatile uint32_t *)0xe000ede4u;
+    tz_diag.sfar = *(volatile uint32_t *)0xe000ede8u;
+    diag_halt();
+}
+
+#if R2P2_TZ_LED_DIAG
+
 #define TZ_LED_PIN 25
 static void busy_delay(uint32_t loops) {
     for (volatile uint32_t i = 0; i < loops; i++) __asm volatile ("nop");
@@ -89,37 +129,50 @@ static void led_nibble(uint v) {
     }
     busy_delay(BUSY_MS(2200)); /* inter-nibble gap */
 }
-/* Blink a 32-bit word as 8 nibbles, MSB first, forever (long gap between
- * repeats). Used to report the BusFault address (BFAR) = the peripheral
- * NS was denied. */
-static void __attribute__((noreturn)) blink_word(uint32_t w) {
+
+/* LED halt: blink the recorded faulting PC (or the stage that failed) as 8
+ * nibbles MSB-first, forever — the phase-1 read-out, map via addr2line. */
+static void __attribute__((noreturn)) diag_halt(void) {
+    uint32_t w = tz_diag.fault_kind >= 0x100u ? tz_diag.fault_kind
+                                              : tz_diag.pc;
     for (;;) {
         for (int s = 28; s >= 0; s -= 4) led_nibble((w >> s) & 0xfu);
-        busy_delay(BUSY_MS(5000)); /* long gap before repeating the address */
+        busy_delay(BUSY_MS(5000)); /* long gap before repeating */
     }
 }
 
-/* Faulting NS instruction address from the stacked exception frame. NS runs
- * thread mode on MSP_NS, so the 8-word frame is there and PC is word 6.
- * Guard the SP so a bogus value can't nest-fault. */
-static uint32_t ns_stacked_pc(void) {
-    uint32_t msp_ns;
-    __asm volatile ("mrs %0, msp_ns" : "=r" (msp_ns));
-    if (msp_ns >= 0x20000000u && msp_ns < (0x20080000u - 32u)) {
-        return ((const uint32_t *)msp_ns)[6];
-    }
-    return 0xbadadd50u;
+static void diag_stage(uint32_t stage) {
+    tz_diag.boot_stage = stage;
+    led_blink(stage);
 }
-/* All fault handlers report the faulting PC (map via addr2line). NS-origin
- * bus/usage/mem/secure faults escalate here (BFHFNMINS=0, NS handlers off).
- * A HardFault is usually an escalated NS UsageFault (undefined instr / NOCP
- * coprocessor / unaligned). PC first, then the type count, so the address
- * and the class are both visible. */
-void isr_busfault(void)    { blink_word(ns_stacked_pc()); }
-void isr_hardfault(void)   { blink_word(ns_stacked_pc()); }
-void isr_securefault(void) { blink_word(ns_stacked_pc()); }
-void isr_usagefault(void)  { blink_word(ns_stacked_pc()); }
-void isr_memmanage(void)   { blink_word(ns_stacked_pc()); }
+
+#else /* !R2P2_TZ_LED_DIAG — probe boards (Pico 2 W) and production */
+
+static void led_init(void) {}
+static void led_set(bool on) { (void)on; }
+
+static void __attribute__((noreturn)) diag_halt(void) {
+    for (;;) __asm volatile ("wfi");  /* quiet; attach the probe and read
+                                       * tz_diag at 0x20080000 */
+}
+
+static void diag_stage(uint32_t stage) {
+    tz_diag.boot_stage = stage;
+}
+
+#endif /* R2P2_TZ_LED_DIAG */
+
+/* NS-origin bus/usage/mem/secure faults escalate here (BFHFNMINS=0, NS
+ * handlers off). A HardFault is usually an escalated NS UsageFault
+ * (undefined instr / NOCP coprocessor / unaligned). Each handler fills the
+ * tz_diag record (kind = its IPSR exception number, plus the stacked NS
+ * PC/LR and the fault status registers) and halts — read over SWD, or as
+ * the LED PC read-out when R2P2_TZ_LED_DIAG=1. */
+void isr_busfault(void)    { diag_fault(); }
+void isr_hardfault(void)   { diag_fault(); }
+void isr_securefault(void) { diag_fault(); }
+void isr_usagefault(void)  { diag_fault(); }
+void isr_memmanage(void)   { diag_fault(); }
 
 /* All ACCESSCTRL registers except GPIO_NSMASK* require this password in the
  * upper half of the write data; writes without it bus-fault (§10.6). */
@@ -156,12 +209,19 @@ static const tz_ns_manifest_t tz_ns_manifest
     __attribute__((section(".ns_manifest"), used)) = { .magic = 0 };
 
 static void __attribute__((noreturn)) verify_failed(void) {
-    /* NS hash mismatch. Rapid strobe = self-identifying (distinct from any
-     * blink-count breadcrumb). Recovery is BOOTSEL, upstream in the bootrom. */
+    /* NS hash mismatch. Recorded as TZ_KIND_NS_HASH_MISMATCH for the probe;
+     * with the LED enabled, a rapid strobe = self-identifying (distinct
+     * from any blink-count breadcrumb). Recovery is BOOTSEL, upstream in
+     * the bootrom. */
+    tz_diag.fault_kind = TZ_KIND_NS_HASH_MISMATCH;
+#if R2P2_TZ_LED_DIAG
     for (;;) {
         led_set(true);  busy_delay(1000000u);   /* ~40 ms */
         led_set(false); busy_delay(1000000u);
     }
+#else
+    diag_halt();
+#endif
 }
 
 static void verify_ns_image(void) {
@@ -194,8 +254,10 @@ static void verify_ns_image(void) {
 
 static void monitor_derive_keys(void) {
     if (ks_init() != SG_OK) {
-        verify_failed(); /* SHA engine unavailable at boot: cannot happen,
-                          * but never continue with an unkeyed keystore */
+        /* SHA engine unavailable at boot: cannot happen, but never
+         * continue with an unkeyed keystore. */
+        tz_diag.fault_kind = TZ_KIND_KEYSTORE_FAILED;
+        diag_halt();
     }
 }
 
@@ -337,7 +399,7 @@ static void __attribute__((noreturn)) ns_launch(void) {
      * TODO(phase 2, PSG/pitchdetector): sg_launch_core1_ns veneer with
      * ACCESSCTRL FORCE_CORE_NS.CORE1 so core 1 runs NS-only. */
 
-    led_blink(4);             /* (F) SCS setup survived — about to blxns */
+    diag_stage(TZ_STAGE_NS_LAUNCHED); /* (F) SCS setup survived — blxns next */
     led_set(true);
 
     /* cmse_nonsecure_call: the compiler clears non-argument registers and
@@ -353,20 +415,22 @@ int main(void) {
      * covers .ns_manifest). Order matters: the NS image is authenticated
      * and keys come out of OTP (SW_LOCK ratchet closing behind them)
      * BEFORE anything Non-secure exists or runs. */
+    tz_diag.magic = TZ_DIAG_MAGIC;
     led_init();
-    led_set(true);            /* (A) monitor entered — solid on */
+    led_set(true);
+    diag_stage(TZ_STAGE_ENTERED);       /* (A) */
     /* Route configurable faults to their specific handlers instead of
-     * escalating everything to HardFault, so the LED tells us the exact
-     * fault class. NS bus/secure faults target these Secure handlers
-     * because BFHFNMINS=0. (Bring-up only.) */
+     * escalating everything to HardFault, so the diag record (and LED
+     * read-out) carries the exact fault class. NS bus/secure faults target
+     * these Secure handlers because BFHFNMINS=0. */
     m33_hw->shcsr |= M33_SHCSR_SECUREFAULTENA_BITS | M33_SHCSR_BUSFAULTENA_BITS
                    | M33_SHCSR_USGFAULTENA_BITS | M33_SHCSR_MEMFAULTENA_BITS;
-    verify_ns_image();        /* strobes forever on hash mismatch */
-    led_blink(1);             /* (B) NS verified */
+    verify_ns_image();        /* halts (kind=NS_HASH_MISMATCH) on mismatch */
+    diag_stage(TZ_STAGE_NS_VERIFIED);   /* (B) */
     monitor_derive_keys();
-    led_blink(2);             /* (C) keys derived */
+    diag_stage(TZ_STAGE_KEYS_DERIVED);  /* (C) */
     partition_configure();
-    led_blink(3);             /* (D) partition configured */
+    diag_stage(TZ_STAGE_PARTITIONED);   /* (D) */
     led_set(true);            /* (E) solid on — about to blxns into NS */
     ns_launch();
 }
