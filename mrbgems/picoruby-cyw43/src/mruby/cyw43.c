@@ -4,6 +4,7 @@
 #include <mruby/variable.h>
 #include <mruby/string.h>
 #include <mruby/class.h>
+#include <mruby/array.h>
 
 static bool cyw43_arch_init_flag = false;
 
@@ -43,6 +44,24 @@ static mrb_value
 mrb_s__init_error(mrb_state *mrb, mrb_value klass)
 {
   return mrb_fixnum_value(CYW43_init_last_error());
+}
+
+static mrb_value
+mrb_s__probe_up(mrb_state *mrb, mrb_value klass)
+{
+  return mrb_fixnum_value(CYW43_probe_up());
+}
+
+static mrb_value
+mrb_s__state(mrb_state *mrb, mrb_value klass)
+{
+  int st[4];
+  CYW43_debug_state(st);
+  mrb_value ary = mrb_ary_new_capa(mrb, 4);
+  for (int i = 0; i < 4; i++) {
+    mrb_ary_push(mrb, ary, mrb_fixnum_value(st[i]));
+  }
+  return ary;
 }
 
 #ifdef USE_WIFI
@@ -228,6 +247,8 @@ mrb_picoruby_cyw43_gem_init(mrb_state* mrb)
   mrb_define_class_method_id(mrb, class_CYW43, MRB_SYM(_init), mrb_s__init, MRB_ARGS_REQ(2));
   mrb_define_class_method_id(mrb, class_CYW43, MRB_SYM_Q(initialized), mrb_s_initialized_p, MRB_ARGS_NONE());
   mrb_define_class_method(mrb, class_CYW43, "_init_error", mrb_s__init_error, MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, class_CYW43, "_state", mrb_s__state, MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, class_CYW43, "_probe_up", mrb_s__probe_up, MRB_ARGS_NONE());
 #ifdef USE_WIFI
   mrb_define_class_method_id(mrb, class_CYW43, MRB_SYM(enable_sta_mode), mrb_s_enable_sta_mode, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, class_CYW43, MRB_SYM(disable_sta_mode), mrb_s_disable_sta_mode, MRB_ARGS_NONE());

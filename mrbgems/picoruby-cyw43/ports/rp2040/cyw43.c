@@ -72,6 +72,27 @@ CYW43_init_last_error(void)
   return cyw43_init_last_error;
 }
 
+/* Driver-state peek for bring-up debugging (CYW43._state):
+ * [initialized, itf_state bitmask, wifi_join_state, poll hook armed] */
+void
+CYW43_debug_state(int out[4])
+{
+  out[0] = cyw43_is_initialized(&cyw43_state) ? 1 : 0;
+  out[1] = (int)cyw43_state.itf_state;
+  out[2] = (int)cyw43_state.wifi_join_state;
+  out[3] = (cyw43_poll != NULL) ? 1 : 0;
+}
+
+/* Force the lazy chip bring-up (cyw43_ensure_up: WL_REG_ON power cycle,
+ * PIO-SPI bus init, firmware upload) and surface its error code, which
+ * the void cyw43_arch_* wrappers otherwise swallow. cyw43_gpio_set is
+ * the smallest public entry point that runs ensure_up first. */
+int
+CYW43_probe_up(void)
+{
+  return cyw43_gpio_set(&cyw43_state, 0, false);
+}
+
 int
 CYW43_arch_init_with_country(const uint8_t *country)
 {
@@ -121,6 +142,13 @@ void
 CYW43_arch_enable_sta_mode(void)
 {
   cyw43_arch_enable_sta_mode();
+#if PICO_CYW43_ARCH_POLL
+  /* Poll mode services the chip less promptly than the background IRQ;
+   * the default power-save PM then misses beacons and flaps the link
+   * (join succeeds, lease acquired, association drops seconds later).
+   * Performance PM is the standard poll-mode remedy. */
+  cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
+#endif
 }
 
 void
@@ -133,6 +161,7 @@ int
 CYW43_wifi_connect_with_dhcp(const char *ssid, const char *pw, uint32_t auth, uint32_t timeout_ms)
 {
   int result = cyw43_arch_wifi_connect_timeout_ms(ssid, pw, auth, timeout_ms);
+  cyw43_init_last_error = result; /* pico_error_codes; readable via CYW43._init_error */
   if (result == 0) {
     struct netif *netif = &cyw43_state.netif[CYW43_ITF_STA];
     if (!dhcp_supplied_address(netif)) {
