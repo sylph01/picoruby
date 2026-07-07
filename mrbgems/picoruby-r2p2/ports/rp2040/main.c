@@ -188,6 +188,16 @@ main(void)
   mrb_alloc_set_critical_section(heap_enter_critical, heap_exit_critical);
 #endif
   global_mrb = mrb;
+#if defined(R2P2_TRUSTZONE)
+  /* Phase-2 veneer exerciser (tz/ns/tz_selftest.c): run `TZ.selftest` from
+   * irb. Registered here because the R2P2 gem has no C gem_init of its own. */
+  {
+    extern mrb_value mrb_tz_selftest(mrb_state *mrb, mrb_value self);
+    struct RClass *tz_mod = mrb_define_module(mrb, "TZ");
+    mrb_define_class_method(mrb, tz_mod, "selftest", mrb_tz_selftest,
+                            MRB_ARGS_NONE());
+  }
+#endif
   mrc_irep *irep = mrb_read_irep(mrb, main_task);
   mrc_ccontext *cc = mrc_ccontext_new(mrb);
   mrb_value name = mrb_str_new_lit(mrb, "R2P2");
