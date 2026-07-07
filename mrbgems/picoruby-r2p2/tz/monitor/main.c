@@ -192,7 +192,14 @@ static const uint8_t tz_ns_irqs[] = {
     DMA_IRQ_0, DMA_IRQ_1, DMA_IRQ_2, DMA_IRQ_3,
     USBCTRL_IRQ,
     PIO0_IRQ_0, PIO0_IRQ_1, PIO1_IRQ_0, PIO1_IRQ_1, PIO2_IRQ_0, PIO2_IRQ_1,
-    IO_IRQ_BANK0,
+    /* Bank-0 GPIO interrupts are split per security domain (§10.6.1): an
+     * event on an NSMASK'd pin asserts IO_IRQ_BANK0_NS, never IO_IRQ_BANK0.
+     * All 30 user pins are NSMASK'd here, so _NS is the line that actually
+     * fires; 21 is kept routed too so the SDK's TZ-unaware
+     * irq_set_enabled(IO_IRQ_BANK0) stays a working no-op. NS-side vectoring
+     * of the _NS line is ns/gpio_irq_ns.c. Found the hard way: the cyw43
+     * host-wake LEVEL_HIGH IRQ never delivered → idle RX stalled. */
+    IO_IRQ_BANK0, IO_IRQ_BANK0_NS,
     SPI0_IRQ, SPI1_IRQ,
     UART0_IRQ, UART1_IRQ,
     ADC_IRQ_FIFO,
@@ -339,9 +346,20 @@ static void partition_configure(void) {
      * succeed at once. So the monitor de-isolates and input-enables every
      * NSMASK'd bank-0 pad: reset value minus ISO plus IE (pull-down and
      * schmitt retained — the state stock firmware reaches after
-     * gpio_init). TODO: pin down the datasheet semantics (all NS pad
-     * writes vs only the atomic aliases) — decides whether NS needs a
-     * veneer for runtime pull/drive changes. */
+     * gpio_init).
+     *
+     * Root cause (datasheet TODO resolved 2026-07-07): erratum RP2350-E3.
+     * On the QFN-60 package (this chip), NS access to PADS_BANK0 register
+     * N is gated by the WRONG GPIO_NSMASK bit — the QFN-80→60 pad
+     * remapping was left out of the permission wiring — so with
+     * nsmask0=0x3fffffff a scrambled subset of pads is NS-writable and
+     * the rest silently ignore NS writes (per-pin filter is RAZ/WI, not a
+     * bus fault; nothing to do with atomic aliases — plain NS pad writes
+     * are dropped the same way). The erratum's prescribed workaround is
+     * exactly this: Secure-side pad setup, plus a veneer if NS ever needs
+     * runtime pull/drive changes (it will: GPIO.pull_up et al. — add an
+     * sg_pad_write veneer when a gem actually needs it). Fixed in the A4
+     * stepping. */
     for (uint32_t pin = 0; pin < 30; pin++) {
         if (accessctrl_hw->gpio_nsmask[0] & (1u << pin)) {
             hw_write_masked(&pads_bank0_hw->io[pin],

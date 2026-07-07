@@ -48,6 +48,7 @@ function(r2p2_apply_tz_ns TARGET)
         ${R2P2_TZ_NS_DIR}/rand_ns.c
         ${R2P2_TZ_NS_DIR}/flash_ns.c
         ${R2P2_TZ_NS_DIR}/aon_ns.c
+        ${R2P2_TZ_NS_DIR}/gpio_irq_ns.c # vector IO_IRQ_BANK0_NS to the SDK's IRQ-21 handlers
         ${R2P2_TZ_NS_DIR}/exit_ns.c   # _exit override: report + bkpt (probe-friendly halt)
         ${R2P2_TZ_NS_DIR}/tz_selftest.c # `TZ.selftest` in irb: phase-2 veneer exerciser
         ${R2P2_TZ_NS_DIR}/tz_api.c      # Ruby surface: TZ.derive_key/verify_mrb, Digest::SHA256
