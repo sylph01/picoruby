@@ -118,8 +118,15 @@ namespace :r2p2 do
       sh "arm-none-eabi-objcopy --update-section .ns_manifest=#{manifest_bin} #{monitor_elf} #{patched_elf}"
 
       if ENV["R2P2_TZ_SIGKEY"]
-        # Seal AFTER patching so the signature covers the digest.
-        sh "#{picotool} seal --quiet --sig #{ENV['R2P2_TZ_SIGKEY']} #{patched_elf} #{patched_elf}"
+        # Seal AFTER patching so the signature covers the digest. Syntax:
+        # `picotool seal --sign <in> <out> <secp256k1-key.pem> [otp.json]`
+        # — the otp.json records the BOOTKEY fingerprint rows this key
+        # needs; keep it next to the artifacts for the (irreversible,
+        # board-1-only) secure-boot enable step later.
+        sealed_elf = "#{out_dir}/r2p2_tz_monitor_sealed.elf"
+        otp_json = "#{out_dir}/bootkey_otp.json"
+        sh "#{picotool} seal --quiet --sign #{patched_elf} #{sealed_elf} #{ENV['R2P2_TZ_SIGKEY']} #{otp_json}"
+        FileUtils.mv sealed_elf, patched_elf
       end
 
       monitor_uf2 = "#{out_dir}/r2p2_tz_monitor_packaged.uf2"
