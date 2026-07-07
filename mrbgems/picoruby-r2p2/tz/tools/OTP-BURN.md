@@ -110,4 +110,130 @@ BOOTSEL; an unsigned dev build is rejected by the mask ROM.
 
 Leaving CRIT1 debug bits clear keeps the probe working (tz_diag reads,
 gdb) after secure boot — fine for a development secure-boot board, not for
-a shipped one. Decide per board.
+a shipped one. Decide per board. **Board 1 (chip `561F…`) is intentionally
+kept this way — a debug board.** The section below is for a *different*,
+production board.
+
+---
+
+# Hardened production board (full lockdown)
+
+Everything above (A + B/C) makes the monitor non-bypassable but leaves the
+key rows **readable** — on board 1 they can still be dumped with
+`picotool otp dump` in BOOTSEL, and read via SWD. That's fine for a debug
+board; it is not fine for production. This section adds the locks that
+close those paths. Do it on a FRESH board, not board 1.
+
+## Threat model — what each control actually stops
+
+| Attacker | Stopped by |
+|---|---|
+| Compromised NS runtime / remote malware | Already stopped by secure boot + the TZ partition (NS can't address OTP, can't read SRAM8/9, only sees veneers). No OTP locks needed for this. |
+| Physical, USB + `picotool otp dump` in BOOTSEL | **Page LOCK_BL** (deny bootloader read of the key pages). |
+| Physical, NS-side bus read | **Page LOCK_NS** (already covered at runtime by the SW_LOCK ratchet + ACCESSCTRL; the fuse makes it permanent). |
+| Physical, SWD debug probe (reads OTP, or the derived keys from SRAM) | **CRIT1 debug-disable.** This is the dominant control — OTP locks are useless while debug is on. |
+| Invasive lab (decap / microprobe / glitch) | **CRIT1 glitch detectors**, and architecturally per-device keys so one extracted board doesn't scale. Residual risk remains; don't put irreplaceable secrets on the MCU. |
+
+## Ordering rules (why this sequence)
+
+- Keys are **written before** the page locks — `picotool otp load` uses the
+  bootloader, which LOCK_BL is about to forbid.
+- Debug-disable is **dead last**, after secure boot is proven to boot,
+  because it ends your only window to diagnose a bad burn.
+- Verify (boot + `TZ.selftest`) **between** each irreversible group while
+  debug still works.
+- Key pages get `LOCK_S = read-only`, never inaccessible — the monitor
+  must still read them at boot (`ks_init`). Inaccessible → keystore fails
+  → `diag_halt`.
+
+## P1. Provision REAL keys (pages 48/49)
+
+Same as group A, but with production key material: a **per-device random**
+DEVICE_ROOT (unique per board) and the **real server-shared** GATEWAY_PSK
+(not the random placeholder board 1 got).
+
+```sh
+picotool otp load -e -s 0xc00 device_root_<serial>.bin   # unique per board
+picotool otp load -e -s 0xc40 gateway_psk.bin            # real shared PSK
+```
+Boot, confirm `TZ.selftest` PASSED. (Last chance to read these back with
+`picotool otp dump` for your provisioning records — after P2 you can't.)
+
+## P2. Lock the key pages (deny NS / bootloader; Secure read-only)
+
+Field selectors let picotool handle the rows' 3-way majority-vote
+encoding — do not hand-write raw row values. LOCK states are
+thermometer-coded (advance-only), so these are permanent.
+
+```sh
+# page 48 (DEVICE_ROOT)
+picotool otp set PAGE48_LOCK1.LOCK_S  0x1   # Secure read-only (monitor still reads)
+picotool otp set PAGE48_LOCK1.LOCK_NS 0x3   # Non-secure: no access
+picotool otp set PAGE48_LOCK1.LOCK_BL 0x3   # bootloader (picotool): no access
+# page 49 (GATEWAY_PSK)
+picotool otp set PAGE49_LOCK1.LOCK_S  0x1
+picotool otp set PAGE49_LOCK1.LOCK_NS 0x3
+picotool otp set PAGE49_LOCK1.LOCK_BL 0x3
+```
+Rollback counter (page 50): if the monitor is built `R2P2_TZ_OTP_WRITE=1`
+it must keep WRITING page 50, so leave `LOCK_S = 0x0` there and only lock
+out NS/BL (`PAGE50_LOCK1.LOCK_NS 0x3`, `.LOCK_BL 0x3`). If rollback is
+unused, lock it like the key pages.
+
+Verify: reboot, `TZ.selftest` still PASSED (proves the monitor still reads
+the pages under LOCK_S=read-only). `picotool otp dump` of 0xc00/0xc40 in
+BOOTSEL should now be refused — that's the point.
+
+## P3. Glitch detectors
+
+```sh
+picotool otp set CRIT1.GLITCH_DETECTOR_ENABLE 0x1
+# optional: raise sensitivity (0..3) — test for spurious resets first
+# picotool otp set CRIT1.GLITCH_DETECTOR_SENS 0x1
+```
+Reboot and confirm stable boot (an over-sensitive detector can reset a
+clean board).
+
+## P4. BOOTKEY + secure boot
+
+As B/C above — `picotool otp load bootkey_otp.json` (bundles BOOTKEY +
+KEY_VALID + SECURE_BOOT_ENABLE). Reboot, confirm the signed image boots
+under enforcement, `TZ.selftest` PASSED. **Do not disable debug yet** —
+you still want it if the next reboot misbehaves.
+
+## P5. Disable debug (LAST — irreversible, ends SWD forever)
+
+Only after P4 boots cleanly. After this there is no probe, no gdb, no
+`tz_diag` over SWD on this board, ever.
+
+```sh
+picotool otp set CRIT1.SECURE_DEBUG_DISABLE 0x1   # bit 1
+picotool otp set CRIT1.DEBUG_DISABLE        0x1   # bit 2
+```
+Power-cycle. If it boots the signed image, the board is fully locked. If
+it doesn't, it's a brick with no recovery — which is why every prior group
+was verified first.
+
+## P6. (Optional) close boot paths — BOOT_FLAGS0
+
+Hardening vs. field-recoverability tradeoff. With secure boot on, the USB
+picoboot path only loads *signed* images, so keeping it enables signed
+field updates; disabling it removes that. Disable UART boot if unused:
+
+```sh
+# picotool otp set BOOT_FLAGS0.DISABLE_BOOTSEL_UART_BOOT 0x1
+# picotool otp set BOOT_FLAGS0.DISABLE_BOOTSEL_USB_PICOBOOT_IFC 0x1   # blocks signed reflash too
+```
+
+## Production provisioning summary (one board, in order)
+
+1. P1 real keys → verify boot
+2. P2 lock key pages (S=ro, NS=no, BL=no) → verify boot + dump refused
+3. P3 glitch detectors → verify stable boot
+4. P4 BOOTKEY + secure boot → verify enforced boot
+5. P5 debug disable → verify enforced boot (point of no diagnosis)
+6. P6 optional boot-path disables
+
+Each device needs its own `device_root_<serial>.bin`; GATEWAY_PSK is the
+shared value your server holds. Keep those off-repo, per the top of this
+file.
