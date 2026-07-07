@@ -23,9 +23,22 @@ micro-ecc; envelope format `include/r2p2_mrb_envelope.h`; host signer
 `tools/mrb_sign.rb`; OTP thermometer anti-rollback, write path gated
 behind `R2P2_TZ_OTP_WRITE=1`; success unlocks `SG_SLOT_GATEWAY_PSK`).
 RFC/host test vectors: `tools/sg_crypto_test.c` (build line in the file).
-Still open: combined-image signing/secure boot, real key provisioning to
-OTP pages 48/49. This directory holds the shared contract between
-the two firmware images of a Secure/Non-secure split R2P2:
+
+Also hardware-verified 2026-07-07: the **sealed-monitor path** (item 2
+minus the burn) — `R2P2_TZ_SIGKEY=tz/tools/boot_signing_dev.pem rake
+r2p2:tz:package` seals the patched monitor with picotool (`signature:
+verified`), emits `package/bootkey_otp.json` (the BOOTKEY fingerprint
+rows for the eventual, irreversible, board-1-only secure-boot enable),
+and the sealed image boots. And the **NS Ruby surface** (`tz/ns/tz_api.c`):
+`Digest::SHA256.digest/hexdigest` (hardware SHA-256 via `sg_sha256`;
+one-shot by decision), `TZ.derive_key(info, len=32, slot=0)` feeding
+`MbedTLS::Cipher#key=` (tier-2 session crypto — AES-256-GCM round-trip
+verified in irb on target), and `TZ.verify_mrb`. The picoruby-mbedtls gem
+is now in the pico2 build config; its entropy comes from `sg_random_bytes`
+via the rand_ns wrap. Still open: the secure-boot OTP burn itself, real
+key provisioning to OTP pages 48/49. This directory holds the shared
+contract between the two firmware images of a Secure/Non-secure split
+R2P2:
 
 - `include/r2p2_sg_api.h` — the Secure Gateway (veneer) API, compiled into
   both images
