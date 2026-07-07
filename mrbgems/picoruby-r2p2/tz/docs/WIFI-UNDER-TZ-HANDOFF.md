@@ -219,3 +219,78 @@ Unrelated to pads (QSPI is Secure-side).
 5. TLS via mbedTLS — self-signed P-256 cert generated; measure RAM
    during handshake (watch-out #4).
 Fix RX pump first; both rungs then likely just work.
+
+---
+
+## Status update (2026-07-07, session 2): LADDER COMPLETE — rungs 1–5 PASS
+
+Commit 40171f77 fixed open bug 1; all five rungs now pass on the
+pristine-OTP Pico 2 W under TZ, cold boot, no debugger, no pump loop.
+
+### Open bug 1 SOLVED: bank-0 GPIO IRQs are split per security domain
+
+Datasheet §10.6.1, last bullet-but-two: interrupts for an NSMASK'd pin
+assert **IO_IRQ_BANK0_NS (IRQ 22)**, never IO_IRQ_BANK0 (21). All 30
+user pins are NSMASK'd, so from NS the _NS line is the only one that
+ever fires — and the TZ-unaware SDK wires handlers + NVIC enables to 21.
+The cyw43 host-wake LEVEL_HIGH event (the thing that marks the poll
+worker pending once the 500 ms bus-sleep countdown dies) pended
+invisibly on Secure-targeted line 22 forever. Hence: TX fine, RX
+undelivered until any synchronous ioctl drained F2.
+
+Fix (commit 40171f77): monitor ITNS-routes IRQ 22; `ns/gpio_irq_ns.c`
+provides a strong `isr_irq22` that forwards to IRQ 21's vtable handler
+(looked up per-fire — SDK handler add/remove keeps working) and enables
+NVIC 22 from a pre-main constructor. This fixes **all** NS GPIO
+interrupt users, not just cyw43 (picoruby-gpio IRQs would have hit the
+same wall).
+
+Proof of idle delivery (not poll-window luck): TCP segment pushed by the
+host 6 s into a pure Ruby `sleep` (bus asleep, zero socket calls) was
+ACKed by the board's lwIP in **261 ms** (host-side TCP_INFO
+tcpi_unacked; scratchpad late_push_server.py).
+
+### Session-1 pads TODO also resolved: it's erratum RP2350-E3
+
+"NS pad writes never land" was never aliases-vs-plain: on QFN-60
+(RP2350A) the per-pin NS gating of PADS_BANK0 uses the WRONG
+GPIO_NSMASK bits (the QFN-80→60 pad remap was left out of the
+permission wiring; fixed in A4 stepping). With our nsmask, pads 0–17
+happen to be NS-writable and 18–29 (incl. all four CYW43 pins) silently
+RAZ/WI. The monitor-side pad init is exactly the erratum's prescribed
+workaround; when a gem needs runtime pull/drive changes from NS, add an
+`sg_pad_write` veneer (E3 workaround, second half). Full comment in
+`partition_configure`.
+
+### Verified this session (hardware, cold boot)
+
+- Rung 3 re-run with NO pump: join → `sleep 8` idle → LINK_UP (DHCP
+  lease 10.42.0.106 from the nmcli hotspot).
+- Rung 4: `TCPSocket` echo round-trip to 10.42.0.1:4444.
+- Rung 5: `SSLSocket` (verify NONE, self-signed P-256 server cert) —
+  TLS 1.2 ECDHE-ECDSA-AES128-GCM-SHA256 handshake + echo + clean close.
+  No OOM at current HEAP_SIZE_KB; fine-grained C-heap high-water
+  measurement (watch-out #4) still worth doing before the gateway work.
+- littlefs (open bug 2): the seeded-FS boot after a fresh
+  `picotool erase -r 0x10340000 0x10400000` came up clean this time
+  (bin executables all present). Bug remains open — it was never
+  root-caused, only not reproduced today. Watch it across reboots.
+
+### Still open / next
+
+- Open bug 2 (littlefs corruption under TZ) — unreproduced today but
+  un-root-caused; suspect multi-sector writes under checked_flash_op.
+- TX frames duplicated in AP-side tcpdump (session 1 observation) —
+  benign so far, not re-checked this session.
+- `sg_pad_write` veneer when a gem needs NS runtime pad changes (E3).
+- Soak: long-idle RX (minutes-hours), repeated join/leave, reboot
+  persistence of the FS.
+- Then: PHASE2-BACKLOG items and folding in secure boot (OTP still
+  pristine on this board).
+
+Ruby-side driving recipe (irb over CDC): `CYW43.init("JP")` →
+`CYW43.enable_sta_mode` → `CYW43.connect_timeout(ssid, psk,
+CYW43::Auth::WPA2_MIXED_PSK, 10)` → `CYW43.link_connected?(true)`;
+sockets are stock `TCPSocket` / `SSLContext`+`SSLSocket.open`.
+NB: the dev hotspot PSK used in session 2 should be rotated (it leaked
+into a terminal transcript via irb character echo).
