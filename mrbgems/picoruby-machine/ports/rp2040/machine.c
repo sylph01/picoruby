@@ -27,6 +27,10 @@
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
 
+#if defined(USE_WIFI) && PICO_CYW43_ARCH_POLL
+#include "pico/cyw43_arch.h"
+#endif
+
 /*-------------------------------------
  *
  * Signal flag (shared with machine.h)
@@ -298,6 +302,15 @@ picorb_hal_idle_cpu(mrb_state *mrb)
   /* NB: do NOT poll tud_task() here — USB is serviced from usb_irq_handler
    * (USBCTRL_IRQ). tud_task() is not reentrant, so calling it from both the
    * idle loop and the IRQ corrupts USB. */
+#if defined(USE_WIFI) && PICO_CYW43_ARCH_POLL
+  /* Poll-mode cyw43 (TZ builds): the driver has no background IRQ, so the
+   * VM idle loop services the chip and the lwIP timers. The async context
+   * only exists after cyw43_arch_init (CYW43._init from Ruby) — before
+   * that, cyw43_arch_poll() would dereference NULL. */
+  if (cyw43_arch_async_context() != NULL) {
+    cyw43_arch_poll();
+  }
+#endif
 #if defined(PICO_RP2040)
   __wfi();
 #elif defined(PICO_RP2350)

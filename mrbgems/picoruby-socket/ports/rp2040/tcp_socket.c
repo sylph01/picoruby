@@ -14,6 +14,10 @@
 #include "lwip/dns.h"
 #include "lwip/err.h"
 
+#ifdef PICO_CYW43_ARCH_POLL
+#include "pico/cyw43_arch.h"
+#endif
+
 /* Pre-allocated receive buffer size for TCP. */
 #ifndef TCP_RECV_BUF_SIZE
 #define TCP_RECV_BUF_SIZE 4096

@@ -12,9 +12,19 @@
 void
 Net_busy_wait_ms(int ms)
 {
+#if PICO_CYW43_ARCH_POLL
+  /* Poll mode (TZ builds): keep servicing the chip/lwIP timers across the
+   * whole wait — a single poll up front stalls the stack for `ms`. */
+  absolute_time_t deadline = make_timeout_time_ms(ms);
+  while (!time_reached(deadline)) {
+    cyw43_arch_poll();
+    cyw43_arch_wait_for_work_until(deadline);
+  }
+#else
   cyw43_arch_poll();
   busy_wait_ms(ms);
   cyw43_arch_poll();
+#endif
 }
 
 /* Lock LwIP for thread safety */
