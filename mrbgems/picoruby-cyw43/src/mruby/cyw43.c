@@ -39,6 +39,12 @@ mrb_s_initialized_p(mrb_state *mrb, mrb_value klass)
   return mrb_bool_value(cyw43_arch_init_flag);
 }
 
+static mrb_value
+mrb_s__init_error(mrb_state *mrb, mrb_value klass)
+{
+  return mrb_fixnum_value(CYW43_init_last_error());
+}
+
 #ifdef USE_WIFI
 static bool cyw43_arch_sta_mode_enabled = false;
 
@@ -221,6 +227,7 @@ mrb_picoruby_cyw43_gem_init(mrb_state* mrb)
 
   mrb_define_class_method_id(mrb, class_CYW43, MRB_SYM(_init), mrb_s__init, MRB_ARGS_REQ(2));
   mrb_define_class_method_id(mrb, class_CYW43, MRB_SYM_Q(initialized), mrb_s_initialized_p, MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, class_CYW43, "_init_error", mrb_s__init_error, MRB_ARGS_NONE());
 #ifdef USE_WIFI
   mrb_define_class_method_id(mrb, class_CYW43, MRB_SYM(enable_sta_mode), mrb_s_enable_sta_mode, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, class_CYW43, MRB_SYM(disable_sta_mode), mrb_s_disable_sta_mode, MRB_ARGS_NONE());

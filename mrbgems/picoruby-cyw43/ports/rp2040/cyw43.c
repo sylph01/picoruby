@@ -59,6 +59,19 @@ CYW43_dhcp_supplied(void)
   return dhcp_supplied_address(netif);
 }
 
+/* Last CYW43_arch_init_with_country failure, for post-mortem from Ruby
+ * (CYW43._init_error): a pico_error_codes value from cyw43_arch_init, or
+ * CYW43_INIT_ERR_LED_PROBE when init succeeded but the WL-GPIO LED
+ * loopback probe read back 0. 0 = no error recorded. */
+#define CYW43_INIT_ERR_LED_PROBE (-1000)
+static int cyw43_init_last_error = 0;
+
+int
+CYW43_init_last_error(void)
+{
+  return cyw43_init_last_error;
+}
+
 int
 CYW43_arch_init_with_country(const uint8_t *country)
 {
@@ -69,16 +82,33 @@ CYW43_arch_init_with_country(const uint8_t *country)
     res = cyw43_arch_init_with_country(CYW43_COUNTRY(country[0], country[1], 0));
   }
   if (res != 0) {
+    cyw43_init_last_error = res;
     return res; // error
   }
-  // Confirm whether the LED connecting to CYW43 works
+  // Historically this probed for a CYW43 by writing the WL LED GPIO and
+  // reading it back. cyw43_arch_init() succeeding already proves the chip
+  // is present (the firmware upload handshakes over PIO-SPI and fails on
+  // a chipless board), so a readback mismatch is recorded as a warning in
+  // cyw43_init_last_error but no longer fails the init. Observed on
+  // Pico 2 W under PICO_CYW43_ARCH_POLL: "ccgpioin" reads back 0 for the
+  // LED output even though init and the LED itself work.
   cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-  sleep_ms(5);
-  if (cyw43_arch_gpio_get(CYW43_WL_GPIO_LED_PIN) == 1) {
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-    return 0;
+#if PICO_CYW43_ARCH_POLL
+  // Poll mode: pump the driver while we wait, as the background IRQ would
+  absolute_time_t deadline = make_timeout_time_ms(5);
+  while (!time_reached(deadline)) {
+    cyw43_arch_poll();
   }
-  return -1; // Maybe No CYW43 module on the board
+#else
+  sleep_ms(5);
+#endif
+  if (cyw43_arch_gpio_get(CYW43_WL_GPIO_LED_PIN) == 1) {
+    cyw43_init_last_error = 0;
+  } else {
+    cyw43_init_last_error = CYW43_INIT_ERR_LED_PROBE; // warning only
+  }
+  cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+  return 0;
 }
 
 void
