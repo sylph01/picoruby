@@ -51,6 +51,7 @@ function(r2p2_apply_tz_ns TARGET)
         ${R2P2_TZ_NS_DIR}/exit_ns.c   # TEMP: _exit -> USB console for bring-up
         ${R2P2_TZ_NS_DIR}/ns_trap.c   # TEMP: wrap abort()/exit() -> blink caller addr
         ${R2P2_TZ_NS_DIR}/tz_selftest.c # `TZ.selftest` in irb: phase-2 veneer exerciser
+        ${R2P2_TZ_NS_DIR}/tz_api.c      # Ruby surface: TZ.derive_key/verify_mrb, Digest::SHA256
     )
 
     # NB: intentionally NOT linking pico_flash. flash_ns.c calls the bootrom

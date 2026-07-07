@@ -189,13 +189,12 @@ main(void)
 #endif
   global_mrb = mrb;
 #if defined(R2P2_TRUSTZONE)
-  /* Phase-2 veneer exerciser (tz/ns/tz_selftest.c): run `TZ.selftest` from
-   * irb. Registered here because the R2P2 gem has no C gem_init of its own. */
+  /* NS Ruby surface over the Secure veneers (tz/ns/tz_api.c): TZ.selftest,
+   * TZ.derive_key, TZ.verify_mrb, Digest::SHA256. Registered here because
+   * the R2P2 gem has no C gem_init of its own. */
   {
-    extern mrb_value mrb_tz_selftest(mrb_state *mrb, mrb_value self);
-    struct RClass *tz_mod = mrb_define_module(mrb, "TZ");
-    mrb_define_class_method(mrb, tz_mod, "selftest", mrb_tz_selftest,
-                            MRB_ARGS_NONE());
+    extern void mrb_tz_api_init(mrb_state *mrb);
+    mrb_tz_api_init(mrb);
   }
 #endif
   mrc_irep *irep = mrb_read_irep(mrb, main_task);

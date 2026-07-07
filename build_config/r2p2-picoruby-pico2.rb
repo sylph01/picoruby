@@ -56,4 +56,8 @@ MRuby::CrossBuild.new("r2p2-picoruby-pico2") do |conf|
   conf.gem core: 'picoruby-psg'
   conf.gem core: 'picoruby-shinonome'
   conf.gem core: 'picoruby-keyboard'
+  # NS-side session crypto: under TrustZone, TZ.derive_key (HKDF export
+  # from the Secure keystore) feeds MbedTLS::Cipher#key= — the tier-2
+  # session-key model. Software mbedTLS; no Secure peripheral access.
+  conf.gem core: 'picoruby-mbedtls'
 end
