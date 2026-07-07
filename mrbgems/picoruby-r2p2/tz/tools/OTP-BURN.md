@@ -25,11 +25,16 @@ The real-signed combined image must boot on board 1 with secure boot
 still OFF — proven repeatedly before touching group C. If you rebuild,
 re-verify.
 
-> **Burn log:** group A performed on board 1 (chip ID `561F…`) 2026-07-07
-> — both pages "Verified OK", keystore confirmed off dev-fallback
-> (`TZ.derive_key` fingerprint changed), selftest PASSED. Board 1's
-> GATEWAY_PSK is a random placeholder and now permanent. Groups B/C not
-> done.
+> **Burn log — board 1 (chip ID `561F…`), 2026-07-07. FULLY SEALED.**
+> - A: keys provisioned to pages 48/49, "Verified OK", keystore off
+>   dev-fallback (`TZ.derive_key` fingerprint changed), selftest PASSED.
+>   GATEWAY_PSK is a random placeholder, now permanent.
+> - B+C: `otp load bootkey_otp.json` burned BOOTKEY0 + KEY_VALID **and**
+>   SECURE_BOOT_ENABLE in one shot (the JSON bundled crit1 — see below).
+>   Debug left enabled. Board rebooted and booted the signed image under
+>   enforcement in ~2s; selftest PASSED. Board 1 now boots ONLY the
+>   boot_signing.pem-sealed image; flash it via `picotool load
+>   <sealed-combined.uf2>` in BOOTSEL.
 
 ## A. Provision keystore keys (irreversible, NON-bricking)
 
@@ -53,41 +58,53 @@ deployment write the value shared with the server instead.
 
 ## B. Burn the BOOTKEY fingerprint (irreversible, NON-bricking alone)
 
-Applies `bootkey0` (SHA-256 of the boot key's public point) and
-`BOOT_FLAGS1.KEY_VALID` from the seal JSON. Non-bricking on its own — the
-mask ROM only *enforces* it once C sets SECURE_BOOT_ENABLE.
+**CRITICAL — B and C are NOT separable via this JSON.** `picotool seal
+--sign` writes a `crit1: { secure_boot_enable: 1 }` block into
+`bootkey_otp.json` *in addition to* `bootkey0` + `key_valid`. So
 
 ```sh
 picotool otp load package/bootkey_otp.json
-# verify it took:
-picotool otp dump | grep '^0080:'          # BOOTKEY0 now non-zero
-picotool otp get BOOT_FLAGS1               # KEY_VALID = 1
 ```
 
-**Re-verify the signed image still boots here** (secure boot is still off,
-so a bad key burn is still recoverable via BOOTSEL at this point).
+applies BOTH the BOOTKEY *and* SECURE_BOOT_ENABLE in one shot — this line
+**is the point of no return**, not a non-bricking step. (Confirmed on
+board 1, 2026-07-07: the load echoed `crit1: secure_boot_enable:
+0x00000001` and CRIT1 read back 0x1 immediately.) It does NOT set the
+debug-disable bits, so SWD survives unless you add them.
+
+If you genuinely want B alone (fingerprint now, enable later), strip the
+`crit1` key from the JSON first:
+
+```sh
+python3 -c "import json;d=json.load(open('package/bootkey_otp.json'));d.pop('crit1',None);json.dump(d,open('bootkey_only.json','w'))"
+picotool otp load bootkey_only.json      # BOOTKEY + KEY_VALID only, non-bricking
+```
+
+Verify either way:
+
+```sh
+picotool otp dump | grep '^0080:'          # BOOTKEY0 now non-zero
+picotool otp get BOOT_FLAGS1               # KEY_VALID = 1
+picotool otp get CRIT1                      # SECURE_BOOT_ENABLE: 1 if the full JSON was used
+```
 
 ## C. Enable secure boot (IRREVERSIBLE and BRICK-CAPABLE)
 
-After this the mask ROM boots ONLY an image whose signature matches
-BOOTKEY0. A wrong/again-corrupt image = dead board with no BOOTSEL
-recovery. Do C only after B is verified and the signed image boots.
+Already done by the full-JSON load in B above. Only needed separately if
+you used the stripped `bootkey_only.json`:
 
 ```sh
-# disable debug first (optional but recommended for a real secure device;
-# note: this also ends SWD access for future diag reads):
+# optionally disable debug FIRST (ends SWD/probe access forever — omit to
+# keep the probe working on a dev secure-boot board):
 # picotool otp set -e CRIT1 0x2          # SECURE_DEBUG_DISABLE (bit 1)
 # picotool otp set -e CRIT1 0x4          # DEBUG_DISABLE (bit 2)
-# close unused boot paths (optional):
-# picotool otp set BOOT_FLAGS0 ...       # DISABLE_BOOTSEL_UART_BOOT etc.
 
-# the point of no return:
-picotool otp set -e CRIT1 0x1            # SECURE_BOOT_ENABLE (bit 0)
+picotool otp set -e CRIT1 0x1            # SECURE_BOOT_ENABLE (bit 0) — no return
 ```
 
-Then power-cycle and confirm the board still boots the signed image. From
-now on every flash must be the full sealed package; an unsigned dev build
-will be rejected by the mask ROM.
+After enabling: power-cycle and confirm the board still boots the signed
+image. From now on every flash must be the full sealed package loaded in
+BOOTSEL; an unsigned dev build is rejected by the mask ROM.
 
 ## If you keep debug (SWD) enabled
 
