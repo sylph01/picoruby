@@ -50,6 +50,7 @@
 
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_tz_config.h"  /* memory map, clock contract, TZ_NS_DMA_CHANNELS */
+#include "keystore.h"
 
 /* ---- bring-up breadcrumbs (TEMPORARY) -----------------------------------
  * The monitor has no console, so first-silicon debugging uses the onboard
@@ -187,23 +188,15 @@ static void verify_ns_image(void) {
 
 /* ---- key material ------------------------------------------------------- */
 
-/* Filled by monitor_derive_keys(), lives only in Secure SRAM8/9 .bss. */
-typedef struct {
-    uint8_t device_root[32];   /* HKDF-extracted from OTP key page          */
-    uint8_t gateway_psk[32];   /* provisioned PSK, read from its OTP page   */
-} tz_keystore_t;
-
-static tz_keystore_t keystore;
+/* Keystore lives in keystore.c (slot -> OTP mapping, policies, handles,
+ * rollback counter). ks_init() reads/derives the slot keys — chip-ID dev
+ * fallback on blank OTP pages — and ratchets SW_LOCK behind itself. */
 
 static void monitor_derive_keys(void) {
-    /* TODO:
-     *  - rom_func_otp_access() ECC reads of the key rows for
-     *    SG_SLOT_DEVICE_ROOT / SG_SLOT_GATEWAY_PSK into `keystore`
-     *  - HKDF-Extract via the SHA-256 accelerator (monitor owns it)
-     *  - ratchet OTP_SW_LOCKx for those pages to inaccessible — the tier-2
-     *    move kept as defense in depth; even Secure code can't reread the
-     *    master pages until reset
-     */
+    if (ks_init() != SG_OK) {
+        verify_failed(); /* SHA engine unavailable at boot: cannot happen,
+                          * but never continue with an unkeyed keystore */
+    }
 }
 
 /* ---- partition configuration -------------------------------------------- */

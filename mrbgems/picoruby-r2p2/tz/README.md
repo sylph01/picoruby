@@ -9,9 +9,19 @@ USB CDC. Field-verified veneer round-trips: `sg_random_bytes` (RNG gem),
 boot + runtime `File` write/read), `sg_sha256` (monitor-side NS verify).
 Build: monitor standalone (`monitor/CMakeLists.txt`), NS via
 `R2P2_TRUSTZONE=1 rake r2p2:picoruby:pico2:prod` (see `ns/ns_build.cmake`),
-then `rake r2p2:tz:package` → `package/R2P2-TZ-combined.uf2`. Still open:
-combined-image signing/secure boot, real crypto veneers (keystore, AEAD,
-HKDF), `sg_verify_mrb`. This directory holds the shared contract between
+then `rake r2p2:tz:package` → `package/R2P2-TZ-combined.uf2`.
+
+Phase 2 (2026-07-07, not yet hardware-verified): the crypto veneers are
+real — OTP-backed keystore with chip-ID dev fallback on blank pages
+(`monitor/keystore.c`), HKDF/HMAC over the hardware SHA-256 and
+ChaCha20-Poly1305 over the mbedTLS chacha20/poly1305 slice
+(`monitor/sg_crypto.c`), and `sg_verify_mrb` (ECDSA P-256 via vendored
+micro-ecc; envelope format `include/r2p2_mrb_envelope.h`; host signer
+`tools/mrb_sign.rb`; OTP thermometer anti-rollback, write path gated
+behind `R2P2_TZ_OTP_WRITE=1`; success unlocks `SG_SLOT_GATEWAY_PSK`).
+RFC/host test vectors: `tools/sg_crypto_test.c` (build line in the file).
+Still open: combined-image signing/secure boot, real key provisioning to
+OTP pages 48/49. This directory holds the shared contract between
 the two firmware images of a Secure/Non-secure split R2P2:
 
 - `include/r2p2_sg_api.h` — the Secure Gateway (veneer) API, compiled into
@@ -47,7 +57,11 @@ the two firmware images of a Secure/Non-secure split R2P2:
    in every variant.) Still no mbedTLS in the monitor.
 3. **`sg_verify_mrb` is deferred to phase 2** and returns
    `SG_ERR_NOT_PERMITTED` until the verification story (ECDSA vs HMAC seal)
-   is settled.
+   is settled. *(Settled 2026-07-07: ECDSA P-256 verify-only via vendored
+   micro-ecc — nothing to provision on pristine OTP, private key stays on
+   the host; HMAC seal documented as the fallback had it not fit. See
+   `include/r2p2_mrb_envelope.h` and the implementation in
+   `monitor/sg_veneers.c`.)*
 4. **AEAD is ChaCha20-Poly1305** (constant-time in software, no AES
    hardware on RP2350, small code). With HKDF over the hardware SHA-256,
    the monitor's whole crypto stack is a few KiB of freestanding code.
@@ -100,12 +114,18 @@ Consequences:
 - Core 1's NS stack moves out of SCRATCH_X into main RAM (handled in
   `ns/memmap_r2p2_ns.ld`); SDK `.scratch_x.*`/`.scratch_y.*` input sections
   are remapped to main RAM.
-- With phase-1 decisions (no mbedTLS, ChaCha20-Poly1305 + HKDF over the
-  hardware SHA-256), 8 KiB of data/stack RAM is comfortable. At *boot* the
-  monitor may additionally use main RAM as scratch (key derivation) as long
-  as it wipes it before configuring the SAU and jumping to NS. If phase 2
-  adds runtime ECDSA for `sg_verify_mrb`, revisit: tuned mbedTLS needs
-  ~4-6 KiB of stack, which is the whole budget.
+- With phase-1 decisions (no mbedTLS md/bignum, ChaCha20-Poly1305 + HKDF
+  over the hardware SHA-256), 8 KiB of data/stack RAM works. Measured
+  phase-2 budget (map file + `-fstack-usage`): .data+.bss ≈ 2.6 KiB, libc
+  heap 256 B, stack 4 KiB (`PICO_STACK_SIZE`), of which micro-ecc's
+  P-256 verify chain transiently needs ~1 KiB — the mbedTLS-ECDSA route
+  (~4-6 KiB stack) was avoided by vendoring micro-ecc. RAM vector table
+  and the default alarm pool are compiled out (`PICO_NO_RAM_VECTOR_TABLE`,
+  `PICO_TIME_DEFAULT_ALARM_POOL_DISABLED`). Re-measure on any crypto
+  change; the linker does not warn about stack overflow into .bss. At
+  *boot* the monitor may additionally use main RAM as scratch (key
+  derivation) as long as it wipes it before configuring the SAU and
+  jumping to NS.
 
 ## IDAU (verified, datasheet §10.2.2)
 

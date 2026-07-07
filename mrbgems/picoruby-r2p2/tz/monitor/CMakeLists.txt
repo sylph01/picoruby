@@ -19,17 +19,56 @@ include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 project(r2p2_tz_monitor C CXX ASM)
 pico_sdk_init()
 
+# The symmetric slice of the SDK-vendored mbedTLS (3.6): just the ChaCha20
+# and Poly1305 primitives — the AEAD construction, HKDF and HMAC are
+# sg_crypto.c over the hardware SHA-256. No md layer, no bignum/ECP.
+set(MBEDTLS_LIB $ENV{PICO_SDK_PATH}/lib/mbedtls/library)
+
 add_executable(r2p2_tz_monitor
     main.c
     sg_veneers.c
+    sg_crypto.c
+    keystore.c
+    vendor/micro-ecc/uECC.c
+    ${MBEDTLS_LIB}/chacha20.c
+    ${MBEDTLS_LIB}/poly1305.c
+    ${MBEDTLS_LIB}/platform_util.c
 )
 
 target_compile_definitions(r2p2_tz_monitor PRIVATE
     R2P2_TZ_MONITOR=1   # r2p2_sg_api.h: SG_API -> cmse_nonsecure_entry
     PICO_SECURE=1       # unlocks gpio_assign_to_ns()/irq_assign_to_ns()
+    MBEDTLS_CONFIG_FILE="mbedtls_config_monitor.h"
+    # micro-ecc (sg_verify_mrb): P-256 verify only; all inputs are public,
+    # so the small non-hardened verify path is exactly what we want.
+    uECC_SUPPORTS_secp160r1=0
+    uECC_SUPPORTS_secp192r1=0
+    uECC_SUPPORTS_secp224r1=0
+    uECC_SUPPORTS_secp256r1=1
+    uECC_SUPPORTS_secp256k1=0
+    uECC_SUPPORT_COMPRESSED_POINT=0
+    # RAM budget (8 KiB total, SRAM8+9): stack must absorb uECC_verify's
+    # ~1.5 KiB transient on top of veneer frames; the monitor barely mallocs
+    # (heap trimmed accordingly). Re-measure on any crypto change — the
+    # linker does NOT warn about stack overflow into .bss.
+    PICO_STACK_SIZE=0x1000
+    PICO_HEAP_SIZE=0x100
+    # RAM_S is 8 KiB; drop runtime-init conveniences the monitor never uses:
+    # no runtime IRQ handler swapping (vectors stay in Secure flash) and no
+    # default alarm pool (busy_delay is a spin loop).
+    PICO_NO_RAM_VECTOR_TABLE=1
+    PICO_TIME_DEFAULT_ALARM_POOL_DISABLED=1
+    # Anti-rollback counter OTP writes stay compiled OUT for dev boards; a
+    # RAM shadow keeps the semantics. Production monitors set this to 1.
+    R2P2_TZ_OTP_WRITE=0
 )
 
-target_include_directories(r2p2_tz_monitor PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../include)
+target_include_directories(r2p2_tz_monitor PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}                       # mbedtls_config_monitor.h, mrb_pubkey.h
+    ${CMAKE_CURRENT_LIST_DIR}/../include
+    $ENV{PICO_SDK_PATH}/lib/mbedtls/include
+    ${MBEDTLS_LIB}                                  # mbedtls' internal common.h
+)
 
 # Deliberately NOT pico_stdlib: no stdio, no UART, no alarm pool — every
 # library here is part of the trusted computing base, keep it minimal.
@@ -83,17 +122,8 @@ pico_add_extra_outputs(r2p2_tz_monitor)
 # makes the monitor non-bypassable; the monitor's signature then covers the
 # manifest, which covers the NS bytes.
 
-# ---- crypto slice (TODO: keystore/HKDF/AEAD veneers) -------------------------
-# The symmetric slice of the SDK-vendored mbedTLS — no bignum/ECP, a few
-# KiB of code, few hundred bytes of stack. Wire up together with a minimal
-# MBEDTLS_CONFIG_FILE (chacha20/poly1305/chachapoly/hkdf/md/sha256) when
-# the sg_key_*/sg_aead_*/sg_hmac_* stubs get real implementations:
-#
-# set(MBEDTLS_LIB $ENV{PICO_SDK_PATH}/lib/mbedtls/library)
-# target_sources(r2p2_tz_monitor PRIVATE
-#     ${MBEDTLS_LIB}/chacha20.c ${MBEDTLS_LIB}/poly1305.c
-#     ${MBEDTLS_LIB}/chachapoly.c ${MBEDTLS_LIB}/hkdf.c
-#     ${MBEDTLS_LIB}/md.c ${MBEDTLS_LIB}/sha256.c
-#     ${MBEDTLS_LIB}/constant_time.c ${MBEDTLS_LIB}/platform_util.c)
-# target_compile_definitions(r2p2_tz_monitor PRIVATE
-#     MBEDTLS_CONFIG_FILE="mbedtls_config_monitor.h")
+# ---- signing key (sg_verify_mrb) ---------------------------------------------
+# mrb_pubkey.h is generated: tools/mrb_sign.rb pubkey <key.pem> mrb_pubkey.h
+# The committed mrb_signing_dev.pem is a DEV key (private half in-repo, so
+# it authenticates nothing). Before enabling secure boot for real, generate
+# a fresh keypair off-repo and regenerate the header.
