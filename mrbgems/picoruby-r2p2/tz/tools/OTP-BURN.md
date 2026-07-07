@@ -25,6 +25,12 @@ The real-signed combined image must boot on board 1 with secure boot
 still OFF — proven repeatedly before touching group C. If you rebuild,
 re-verify.
 
+> **Burn log:** group A performed on board 1 (chip ID `561F…`) 2026-07-07
+> — both pages "Verified OK", keystore confirmed off dev-fallback
+> (`TZ.derive_key` fingerprint changed), selftest PASSED. Board 1's
+> GATEWAY_PSK is a random placeholder and now permanent. Groups B/C not
+> done.
+
 ## A. Provision keystore keys (irreversible, NON-bricking)
 
 Switches the keystore from chip-ID dev fallback to real OTP keys. ECC
