@@ -132,3 +132,17 @@ Items are roughly independent unless a dependency is noted. Each lists
 - **Full mbedTLS in the monitor** — the monitor uses only the ChaCha20 +
   Poly1305 primitive slice; no md/bignum/ECP. The 8 KiB RAM budget and the
   minimal-TCB principle stand.
+
+## Prioritization (2026-07-10, user decision)
+
+High priority, in order: **item 2** (drop psg/pitchdetector from the TZ
+VM), **item 1** (`sg_launch_core1_ns` + veneer reentrancy), **item 3**
+(`sg_deep_sleep` + `sg_aon_*`), **item 6** (production provisioning).
+
+Deferred:
+- Items 4 and 8 (stack sealing, debug lock): user is confident in the
+  mechanics from RP2350 Hacking Contest sample work; low risk, do near
+  production hardening.
+- Item 9 (logo): cosmetic; after the branch is mergeable.
+- Items 5 and 7 (separate signed app image, implib stability): blocked
+  on a rethink of the security model first.
