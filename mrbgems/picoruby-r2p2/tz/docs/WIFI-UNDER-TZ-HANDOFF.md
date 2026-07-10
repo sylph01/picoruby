@@ -375,3 +375,82 @@ CYW43::Auth::WPA2_MIXED_PSK, 10)` → `CYW43.link_connected?(true)`;
 sockets are stock `TCPSocket` / `SSLContext`+`SSLSocket.open`.
 NB: the dev hotspot PSK used in session 2 should be rotated (it leaked
 into a terminal transcript via irb character echo).
+
+---
+
+## Status update (2026-07-10, session 3): join/leave soak PASS on the
+## bug-3-fixed image; timeslice pump implemented
+
+Branch rebased onto master a7abf423 (75 commits replayed clean): picks up
+the full bug-3 fix set (picoruby #452 + mruby 88b93f66c) and the SSID/PSK
+length guard (#453). Image 20260710-387d3dd8 flashed to the pristine-OTP
+Pico 2 W.
+
+### Boot detour: littlefs "Corrupted @ lfs_file_read" — NOT a bug-2 repro
+
+First TZ boot loop-printed the corruption error (boot-resilience loop-print
+working as intended). The volume at 0x380000 had last been WRITTEN by the
+stock image during the crash-heavy bug-3 soaks (same LFS offset in both
+builds — no per-build override), so this is inherited damage, not a
+TZ-write repro of open bug 2. Forensic image saved:
+`soak/corrupted_fs_20260710.bin` (768 KiB, repo root, untracked). Fresh
+erase 0x10340000–0x10400000 + reseed came up clean; `TZ.selftest` PASSED
+on the fresh boot. Bug 2 stays open/unreproduced-by-TZ; if it recurs on a
+TZ-written volume, diff against the saved image.
+
+### Join/leave cycling soak (the item parked behind bug 3): PASS
+
+100 cycles, 63.7 min, driver `soak/soak_join_leave.py` (repo root,
+untracked; per-cycle-tagged results — v1's untagged windows misattributed
+slow-join results, don't regress to that). Per cycle: STA re-enable →
+real join (15 s) → link check → disconnect → STA re-enable → rescued
+failing join to a nonexistent AP (the original bug-3 trigger) → liveness
+probe → periodic GC pressure.
+
+- join_ok 61, join_transient 39 (ConnectTimeout on the real AP —
+  #439-flavor transients under rapid cycling; excluded from verdict),
+  join_anom 0.
+- Rescued failing joins: 98/100 caught cleanly. irb deaths 0, VM deaths 0,
+  no heap-corruption symptoms. The raise path that used to kill irb and
+  corrupt the NS heap is CLEAN under the merged fixes.
+- The 2 non-caught cases (cycles 14, 21) are a distinct cyw43-gem state
+  race, below.
+
+### New finding: connect_timeout can return true for the WRONG SSID
+
+Fingerprint (2/39 transient cycles, never otherwise): real join raises
+ConnectTimeout at 15 s, but the CYW43 firmware keeps that join attempt
+running; the next connect_timeout("no-such-ap", …) 10 s later returns
+TRUE without raising — CYW43_wifi_connect_with_dhcp's success poll checks
+link/DHCP state, which is SSID-agnostic, and the leftover join completes
+mid-call. Gem disconnect (which disables STA) between the two calls does
+not abort the in-flight firmware join. Pre-existing, not TZ-related, not
+a VM-integrity issue. Candidate upstream issue: validate the joined SSID
+(or abort in-flight joins) before reporting success.
+
+### Busy-VM starvation fix: timeslice pump (commit d3ab07ce)
+
+As prescribed by the soak findings: mruby submodule branch
+`task-switch-hal-hook` (afed8963a) adds `mrb_hal_task_switch_hook` to the
+task HAL — called by the scheduler on every task switch, thread context;
+no-op impls for the gem's posix/win/glib ports. rp2040 machine.c
+implements it as the cyw43 pump (shared pump_cyw43() with the idle path);
+esp32 no-op; picoruby's posix port needs none (mruby builds link
+mruby-task's own posix HAL). Busy VM now services the stack every
+timeslice (~12 ms) instead of never. Same single-owner logic as the
+tud_task/#451 rescope: lwIP-poll's owner is the VM thread (never pump
+from the tick IRQ), the hook just makes the owner's cadence unconditional.
+Host build + smoke OK; packaged as NS 20260710-d3ab07ce. TO VERIFY on
+device: starvation re-test = board runs a busy compute loop with a socket
+open; host runs `soak/late_push_server.py PORT "15,15,15,15,15"`; pass =
+sub-second ACKs during compute (was 5/5 stalls >25 s).
+
+### Ops notes
+
+- Soak tooling recreated at repo root `soak/` (untracked via
+  .git/info/exclude, survives branch switches): cdc.py (one-shot CDC
+  exchange), soak_join_leave.py, tcp_echo_server.py, late_push_server.py.
+- Hotspot PSK rotated this session (old one had leaked into a transcript).
+- Remaining soak items: hours-scale idle RX (passive, use
+  late_push_server.py with long gaps), FS-reboot persistence (~10
+  physical replugs), then PHASE2-BACKLOG.
