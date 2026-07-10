@@ -458,3 +458,44 @@ survived the reflash+reboot (one clean FS-reboot data point).
 - Remaining soak items: hours-scale idle RX (passive, use
   late_push_server.py with long gaps), FS-reboot persistence (~10
   physical replugs), then PHASE2-BACKLOG.
+
+### Session-3 afternoon addendum: idle-RX PASS at hours scale; hook PR
+### filed as mruby #6942, device-verified at the PR SHA
+
+- **Hours-scale idle RX: PASS** (board 1, pump image d3ab07ce, bus
+  fully idle mid-`sleep`): pushes after 5/10/15/30/45/60-minute gaps
+  all ACKed in 0.25–0.50 s. The session-2 ~3 s bimodal outliers are
+  GONE on the pump image — latency is flat out to a full hour. This
+  closes the hours-scale-idle soak item.
+- **Hook upstreamed: mruby PR #6942** (branch task-switch-hal-hook @
+  899a9aeb8, rebased onto post-#6938 master). #6938 (scheduler-driven
+  GC, merged 07-09) rewrote the same loop and added a THIRD starvation
+  mode — the pending-GC drain branch loops without reaching idle_cpu —
+  so the PR adds a drain-branch hook call too. gctest 788/788. NOTE:
+  trustzone-sketch-3 still pins the pre-rebase afed8963a (preserved on
+  the fork as tag `tz-pin-pre6938` after the force-push orphaned it);
+  when picoruby bumps mruby past #6938, move to the #6942 lineage.
+- **Verified at the PR SHA on a second factory-blank Pico 2 W**
+  (CDC-only, no probe; picoruby test branch `tz-mruby-6938-test` @
+  28d6dffc = submodule bump + MRB_GC_PROFILE): TZ.selftest PASS;
+  compute-starvation PASS (5/5 sub-second, one 3.6 s PM-wake outlier);
+  GC-drain servicing PASS — 13/13 probes ACKed 0.20–0.30 s during
+  churn with `GC.scheduler_driven = true`, and GC.stat proved the
+  drain branch was hot (prof_step_count=120, prof_sync_count=0).
+- **New findings from the board-2 session:**
+  - The #6938 grow-don't-collect caveat is real on the est arena: a
+    2000-string live set OOMs under scheduler-driven mode where
+    default mode collects (800 works). Tune GC.debt_limit /
+    GC.malloc_threshold before enabling scheduler_driven on device.
+  - Board 2 hit the CDC wedge TWICE, both right after churn workloads
+    with scheduler_driven on — possibly a new expression of the
+    bug-3-tail wedge (rapid cdc.py open/close is also a known
+    trigger). No probe on that board; flagged for the PICORB_DEBUG
+    hunt.
+  - Driving host-build r2p2 through a pty requires answering the
+    shell's terminal queries (ESC[5n → ESC[0n, ESC[6n → cursor
+    report) or it blocks at boot; bug3/host_churn.py drain() has the
+    pattern.
+- Remaining soak: FS-reboot persistence (~10 physical replugs; two
+  clean data points so far). Then: wrong-SSID upstream issue, #6942
+  review, PHASE2-BACKLOG.
