@@ -25,6 +25,7 @@ extern "C" {
   #define picorb_hal_enable_irq   mrb_task_enable_irq
   #define picorb_hal_disable_irq  mrb_task_disable_irq
   #define picorb_hal_idle_cpu     mrb_hal_task_idle_cpu
+  #define picorb_hal_task_switch_hook mrb_hal_task_switch_hook
   #define picorb_hal_sleep_us     mrb_hal_task_sleep_us
   #define picorb_tick             mrb_tick
   #define picorb_hal_write        mrb_hal_write
@@ -37,6 +38,7 @@ extern "C" {
 void picorb_tick(mrb_state *mrb);
 void picorb_hal_init(mrb_state *mrb);
 void picorb_hal_idle_cpu(mrb_state *mrb);
+void picorb_hal_task_switch_hook(mrb_state *mrb);
 #elif defined(PICORB_VM_MRUBYC)
 void picorb_tick();
 void picorb_hal_init(void);

@@ -292,6 +292,35 @@ picorb_hal_disable_irq(void)
   interrupt_nesting++;
 }
 
+#if defined(USE_WIFI) && PICO_CYW43_ARCH_POLL
+/* Poll-mode cyw43 (TZ builds): the driver has no background IRQ, so the VM
+ * must service the chip and the lwIP timers. The async context only exists
+ * after cyw43_arch_init (CYW43._init from Ruby) — before that,
+ * cyw43_arch_poll() would dereference NULL. Thread context only. */
+static void
+pump_cyw43(void)
+{
+  if (cyw43_arch_async_context() != NULL) {
+    cyw43_arch_poll();
+  }
+}
+#endif
+
+#if defined(PICORB_VM_MRUBY)
+void
+picorb_hal_task_switch_hook(mrb_state *mrb)
+{
+  (void)mrb;
+#if defined(USE_WIFI) && PICO_CYW43_ARCH_POLL
+  /* Pumping only from idle_cpu starves the network stack whenever a
+   * compute-bound task keeps the ready queue full (ACKs/retransmits/DHCP
+   * renewal stall until true idle); the scheduler calls this on every task
+   * switch, so the stack is serviced at least once per timeslice. */
+  pump_cyw43();
+#endif
+}
+#endif
+
 void
 #if defined(PICORB_VM_MRUBYC)
 picorb_hal_idle_cpu()
@@ -303,13 +332,7 @@ picorb_hal_idle_cpu(mrb_state *mrb)
    * (USBCTRL_IRQ). tud_task() is not reentrant, so calling it from both the
    * idle loop and the IRQ corrupts USB. */
 #if defined(USE_WIFI) && PICO_CYW43_ARCH_POLL
-  /* Poll-mode cyw43 (TZ builds): the driver has no background IRQ, so the
-   * VM idle loop services the chip and the lwIP timers. The async context
-   * only exists after cyw43_arch_init (CYW43._init from Ruby) — before
-   * that, cyw43_arch_poll() would dereference NULL. */
-  if (cyw43_arch_async_context() != NULL) {
-    cyw43_arch_poll();
-  }
+  pump_cyw43();
 #endif
 #if defined(PICO_RP2040)
   __wfi();
