@@ -440,10 +440,14 @@ mruby-task's own posix HAL). Busy VM now services the stack every
 timeslice (~12 ms) instead of never. Same single-owner logic as the
 tud_task/#451 rescope: lwIP-poll's owner is the VM thread (never pump
 from the tick IRQ), the hook just makes the owner's cadence unconditional.
-Host build + smoke OK; packaged as NS 20260710-d3ab07ce. TO VERIFY on
-device: starvation re-test = board runs a busy compute loop with a socket
-open; host runs `soak/late_push_server.py PORT "15,15,15,15,15"`; pass =
-sub-second ACKs during compute (was 5/5 stalls >25 s).
+Host build + smoke OK; packaged as NS 20260710-d3ab07ce.
+**VERIFIED ON DEVICE (same day): starvation re-test PASS** — board ran a
+110 s pure-Ruby busy loop (1.09 M iterations) with a TCP socket open;
+host pushed 5 probes into the compute window
+(`soak/late_push_server.py 4444 "20,15,15,15,15"`): all ACKed in
+0.15-0.45 s (was 5/5 stalls >25 s at true-idle-only pumping). VM healthy
+after; TZ.selftest PASSED on this image on fresh boot; the seeded FS also
+survived the reflash+reboot (one clean FS-reboot data point).
 
 ### Ops notes
 
