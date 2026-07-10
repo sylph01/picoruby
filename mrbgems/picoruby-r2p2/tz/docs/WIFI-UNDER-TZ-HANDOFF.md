@@ -499,3 +499,24 @@ survived the reflash+reboot (one clean FS-reboot data point).
 - Remaining soak: FS-reboot persistence (~10 physical replugs; two
   clean data points so far). Then: wrong-SSID upstream issue, #6942
   review, PHASE2-BACKLOG.
+
+### FS-reboot persistence soak: PASS (2026-07-10, closes the soak list)
+
+8 physical power cycles on board 1 (pump image d3ab07ce, littlefs seeded
+fresh this morning). Every cycle: clean boot (no lfs corruption
+loop-print), a marker file written the previous cycle read back intact
+(write→POR→read), and /bin/uptime read through lfs_file_read (the exact
+path open bug 2 corrupted). Final boot also passed TZ.selftest. With the
+2 earlier reboots today that is 10 clean boots on a TZ-written volume —
+open bug 2 remains unreproduced by TZ writes; the one corrupted volume
+seen today was inherited from the stock-image crash soaks (image saved
+in soak/). Bug 2 stays formally open but is now strongly suspected to
+need a crashing writer, not a TZ flash path.
+
+Ops note for CDC-driving scripts: the FIRST open of the CDC port after
+re-enumeration reliably eats the exchange (input flushed mid-boot);
+send a throwaway probe exchange first, then the real one.
+
+**ALL soak items are now closed** (long-idle RX, busy-VM starvation,
+join/leave cycling, hours-scale idle, FS-reboot persistence). Next:
+wrong-SSID gem issue, #6942 review, then PHASE2-BACKLOG.
