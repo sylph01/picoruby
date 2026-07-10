@@ -520,3 +520,23 @@ send a throwaway probe exchange first, then the real one.
 **ALL soak items are now closed** (long-idle RX, busy-VM starvation,
 join/leave cycling, hours-scale idle, FS-reboot persistence). Next:
 wrong-SSID gem issue, #6942 review, then PHASE2-BACKLOG.
+
+### Wrong-SSID race: root-caused, FIXED, device-verified (2026-07-10)
+
+The soak finding (connect_timeout returning true for "no-such-ap") is
+fully closed. Root cause is three SDK/firmware behaviors composing:
+the SDK's connect loop abandons a timed-out join without aborting it;
+the firmware auto-rejoins the stored SSID after wifi_leave + STA re-up;
+and the SDK's success poll checks interface link status only — never
+which network. Repro harness: `soak/repro_wrong_ssid.py` (repo root,
+untracked) — unfixed image: 4/6 wrong-SSID successes on the
+disconnect-shaped sequence, 0/6 back-to-back (a new SET_SSID overrides
+a still-in-flight join; it is the leave/re-up path that resurrects the
+stale one). Fix in ports/rp2040/cyw43.c (commit 7454997a): after the
+SDK reports success, verify the associated SSID via
+CYW43_IOCTL_GET_SSID and fail with PICO_ERROR_CONNECT_FAILED on
+mismatch; cyw43_wifi_leave() on every failure path so no join outlives
+its call. Post-fix on board 1: 0/12 across both sequences, normal
+full-timeout joins unaffected. Upstream: master-based branch
+`fix-wrong-ssid-connect` pushed to the fork (drops the TZ-only
+cyw43_init_last_error line); PR write-up by the user.
