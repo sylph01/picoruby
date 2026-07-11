@@ -48,6 +48,14 @@ option(R2P2_TZ_LED_DIAG "LED breadcrumb diagnostics on GPIO25 (non-W Pico 2 only
 # (picotool BOOTSEL is denied); see tools/OTP-BURN.md.
 option(R2P2_TZ_PROVISION_LOCKS "Burn key-page OTP locks at boot (production only)" OFF)
 
+# Set ACCESSCTRL.LOCK.DEBUG at boot, denying an attached debugger the
+# ACCESSCTRL security override. Production hardening, paired with the OTP
+# CRIT1 debug-disable (OTP-BURN.md P5). OFF by default — it would block the
+# probe/tz_diag bring-up workflow on dev boards. Independent of the OTP
+# flags: a board can be OTP-provisioned while still keeping SWD for
+# diagnosis (that is exactly the bring-up sequence), so this is its own knob.
+option(R2P2_TZ_LOCK_DEBUG "Lock the debugger out of ACCESSCTRL at boot (production only)" OFF)
+
 add_executable(r2p2_tz_monitor
     main.c
     sg_veneers.c
@@ -86,6 +94,7 @@ target_compile_definitions(r2p2_tz_monitor PRIVATE
     # RAM shadow keeps the semantics. Production monitors set this to 1.
     R2P2_TZ_OTP_WRITE=0
     R2P2_TZ_PROVISION_LOCKS=$<BOOL:${R2P2_TZ_PROVISION_LOCKS}>
+    R2P2_TZ_LOCK_DEBUG=$<BOOL:${R2P2_TZ_LOCK_DEBUG}>
     # Diagnostics channel (tz_diag.h): the probe-readable record at
     # 0x20080000 always exists; this additionally enables the phase-1 LED
     # breadcrumb/read-out on GPIO25. 1 = non-W Pico 2 bring-up (default),

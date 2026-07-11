@@ -150,14 +150,16 @@ check `Machine.get_hwclock` advanced across the nap).
 - **Where:** new veneers in `sg_veneers.c` + header slots; `ns/aon_ns.c`.
 - **Effort:** medium (POWMAN state machine is fiddly; keep the menu small).
 
-## 4. Secure-stack sealing
+## 4. Secure-stack sealing — DONE (2026-07-11, device-verified)
 
-- **What:** store the Arm sentinel `0xfef5eda5` at the Secure stack limits
-  (TrustZone-M stack-sealing recommendation) in the monitor startup.
-- **Why:** defense-in-depth against a return-into-unsealed-stack on the
-  Secure side. Currently a TODO in `ns_launch` / crt0.
-- **Where:** monitor crt0 / startup, `memmap_monitor_s.ld` stack symbols.
-- **Effort:** low.
+The linker (`memmap_monitor_s.ld`) reserves the top 8 bytes of RAM_S as
+`__StackSeal` and puts `__StackTop` (crt0's initial SP) below it;
+`tz_seal_secure_stack()` fills the two words with `0xfef5eda5` at boot,
+before anything Non-secure runs. A return that unstacks from the empty
+Secure stack faults on the seal. Written in C at boot (not a crt0 fork) so
+it stays inside the signed image. Verified on the sealed SparkFun board
+under secure-boot enforcement: boots + `TZ.selftest` PASSED with the SP
+moved down and the seal written.
 
 ## 5. Separate signed application image (design option)
 
@@ -199,15 +201,17 @@ check `Machine.get_hwclock` advanced across the nap).
   present but commented).
 - **Effort:** low, but only matters once updates decouple.
 
-## 8. Production debug lock in the monitor
+## 8. Production debug lock in the monitor — DONE (2026-07-11)
 
-- **What:** the monitor leaves `ACCESSCTRL.LOCK` debug bits clear during
-  bring-up (comment in `partition_configure`). A production monitor build
-  should set `ACCESSCTRL_LOCK_DEBUG_BITS`, coordinated with the OTP
-  `CRIT1` debug-disable (production hardening).
-- **Why:** defense-in-depth; ties into item 6.
-- **Where:** `partition_configure` in `tz/monitor/main.c`.
-- **Effort:** low.
+`partition_configure` sets `ACCESSCTRL_LOCK_DEBUG_BITS` in the ACCESSCTRL
+lock write when built `-DR2P2_TZ_LOCK_DEBUG=ON`, denying an attached
+debugger the ACCESSCTRL security override. Default OFF (a new `option()`,
+default build carries the bit clear) — it would block the probe/tz_diag
+bring-up workflow, and it is independent of the OTP flags: a board can be
+OTP-provisioned while keeping SWD for diagnosis (exactly the bring-up
+sequence). Pair it with the OTP CRIT1 debug-disable (OTP-BURN.md P5) for a
+production board. Both flag states compile-verified; the default (off) build
+is the one running on the sealed SparkFun board.
 
 ## 9. Cosmetic: R2P2 logo under TZ
 
@@ -234,10 +238,10 @@ High priority, in order: **item 2** (drop psg/pitchdetector from the TZ
 VM), **item 1** (`sg_launch_core1_ns` + veneer reentrancy), **item 3**
 (`sg_deep_sleep` + `sg_aon_*`), **item 6** (production provisioning).
 
+Done after item 6: items 4 and 8 (stack sealing, debug lock) — the
+monitor-side complements to the OTP hardening, both landed 2026-07-11.
+
 Deferred:
-- Items 4 and 8 (stack sealing, debug lock): user is confident in the
-  mechanics from RP2350 Hacking Contest sample work; low risk, do near
-  production hardening.
 - Item 9 (logo): cosmetic; after the branch is mergeable.
 - Items 5 and 7 (separate signed app image, implib stability): blocked
   on a rethink of the security model first.

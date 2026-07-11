@@ -446,12 +446,19 @@ static void partition_configure(void) {
      * thread. See tz_core1.h / core1_ns_trampoline. */
 
     /* Freeze the configuration: further ACCESSCTRL writes from the cores
-     * are ignored (LOCK bits are one-way until reset). DEBUG left unlocked
-     * during bring-up — set ACCESSCTRL_LOCK_DEBUG_BITS for production. */
+     * are ignored (LOCK bits are one-way until reset). The DEBUG lock denies
+     * an attached debugger the ACCESSCTRL security override, so it is set
+     * only in a production build (R2P2_TZ_LOCK_DEBUG) — it would otherwise
+     * block the probe/tz_diag bring-up workflow. Pair it with the OTP CRIT1
+     * debug-disable (tools/OTP-BURN.md P5). */
     accessctrl_hw->lock = AC_PASSWORD
                         | ACCESSCTRL_LOCK_CORE0_BITS
                         | ACCESSCTRL_LOCK_CORE1_BITS
-                        | ACCESSCTRL_LOCK_DMA_BITS;
+                        | ACCESSCTRL_LOCK_DMA_BITS
+#if R2P2_TZ_LOCK_DEBUG
+                        | ACCESSCTRL_LOCK_DEBUG_BITS
+#endif
+                        ;
 }
 
 /* ---- Non-secure launch --------------------------------------------------- */
@@ -485,9 +492,8 @@ static void __attribute__((noreturn)) ns_launch(void) {
 
     /* AIRCR defaults kept: BFHFNMINS=0 (bus/hard faults target Secure),
      * SYSRESETREQS=0 (NS may request system reset — the watchdog is NS
-     * anyway and any reset re-enters secure boot).
-     * TODO: seal the Secure stacks (store 0xfef5eda5 at the stack limits,
-     * ARM stack-sealing recommendation) in crt0/startup.
+     * anyway and any reset re-enters secure boot). The Secure stack seal is
+     * placed at boot (tz_seal_secure_stack, main).
      * Core 1: NS starts it with the sg_launch_core1_ns veneer, which
      * launches it Secure into core1_ns_trampoline (below) — the same
      * S->NS transition this function does for core 0. */
@@ -633,12 +639,27 @@ int tz_core1_launch_ns(uintptr_t ns_vtor, uintptr_t ns_entry,
     return SG_OK;
 }
 
+/* Armv8-M secure stack seal. The linker reserves the top 8 bytes of RAM_S
+ * (above the initial SP) as __StackSeal; filling them with the seal pattern
+ * means a function/exception return that unstacks from the empty Secure
+ * stack — e.g. a crafted return while control is in NS — faults on the seal
+ * instead of consuming attacker-influenced words. Written in C at boot (not
+ * a crt0 fork) so it is covered by the signed image; nothing Non-secure has
+ * run yet, so the seal words cannot have been used as stack. */
+extern uint32_t __StackSeal;   /* linker symbol: top 8 bytes of RAM_S */
+static void tz_seal_secure_stack(void) {
+    volatile uint32_t *seal = &__StackSeal;
+    seal[0] = 0xfef5eda5u;
+    seal[1] = 0xfef5eda5u;
+}
+
 int main(void) {
     /* Entered by the bootrom after verifying the monitor's signature (which
      * covers .ns_manifest). Order matters: the NS image is authenticated
      * and keys come out of OTP (SW_LOCK ratchet closing behind them)
      * BEFORE anything Non-secure exists or runs. */
     tz_diag.magic = TZ_DIAG_MAGIC;
+    tz_seal_secure_stack();
     led_init();
     led_set(true);
     diag_stage(TZ_STAGE_ENTERED);       /* (A) */

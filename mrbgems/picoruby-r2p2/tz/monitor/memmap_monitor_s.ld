@@ -203,8 +203,14 @@ SECTIONS
     __scratch_y_start__ = 0;
     __scratch_y_end__ = 0;
 
-    /* Monitor stack at the top of SRAM9. Single core, Secure only. */
-    __StackTop = ORIGIN(RAM_S) + LENGTH(RAM_S);
+    /* Monitor stack at the top of SRAM9. Single core, Secure only.
+     * The top 8 bytes are reserved for the Armv8-M secure stack seal: crt0
+     * loads the initial SP from __StackTop, so putting __StackTop 8 bytes
+     * below the end of RAM_S leaves the two seal words above every stack
+     * push. main() fills them (__StackSeal) with 0xfef5eda5 so a return that
+     * unstacks from the empty Secure stack faults on the seal. */
+    __StackSeal = ORIGIN(RAM_S) + LENGTH(RAM_S) - 8;
+    __StackTop = __StackSeal;
     __StackBottom = __StackTop - SIZEOF(.stack_dummy);
     PROVIDE(__stack = __StackTop);
     __HeapLimit = __StackBottom;
