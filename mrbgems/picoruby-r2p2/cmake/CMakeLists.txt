@@ -112,13 +112,25 @@ if(PICORB_VM_MRUBYC)
   list(REMOVE_ITEM SOURCE_FILES ${REMOVE_MRUBY_SRCS})
 endif()
 
-# NOTE: psg/pitchdetector cannot simply be cut by dropping their port .c
-# here — their Ruby-binding src/*.c is compiled into libmruby.a and
-# references the port symbols (psg_drv_*, PSG_tick_start_core1), so removing
-# the ports breaks the link. They therefore stay compiled in the NS build;
-# their core-1 launch will fault at runtime until the sg_launch_core1_ns
-# veneer exists (phase 2). Truly excluding them needs a TZ-specific mruby
-# build_config that drops the gems from the VM. See tz/README.md.
+# NOTE: cutting a gem with an rp2040 port takes both halves in step. Its
+# Ruby-binding src/*.c lives in libmruby.a and references the port symbols
+# (e.g. psg's psg_drv_*, PSG_tick_start_core1), so removing only the port
+# sources breaks the link; removing only the gem (via a TZ-specific mruby
+# build_config) leaves dead port objects in the image — including anything
+# the linker must keep, like pre-main constructors.
+if(R2P2_TRUSTZONE)
+  # The -tz build configs drop picoruby-psg from libmruby: its
+  # PSG_tick_start_core1 launches core 1, a Secure-only bootrom operation
+  # that faults under TZ until the sg_launch_core1_ns veneer exists
+  # (PHASE2-BACKLOG item 1). Drop the port half too — psg_port.c's
+  # constructor claims a SIO spinlock pre-main, which --gc-sections would
+  # NOT remove. (pitchdetector needs nothing: no build config includes the
+  # gem, so its unreferenced port objects are gc'd.)
+  file(GLOB REMOVE_PSG_SRCS CONFIGURE_DEPENDS
+    ${PICORUBY_ROOT}/mrbgems/picoruby-psg/ports/rp2040/*.c
+  )
+  list(REMOVE_ITEM SOURCE_FILES ${REMOVE_PSG_SRCS})
+endif()
 
 add_executable(${PROJECT_NAME}
   ${SOURCE_FILES}
@@ -168,9 +180,13 @@ target_link_directories(${PROJECT_NAME} PRIVATE
   ${PICORUBY_ROOT}/build/${MRUBY_CONFIG}/lib
 )
 
-pico_generate_pio_header(${PROJECT_NAME}
-  ${PICORUBY_ROOT}/mrbgems/picoruby-psg/ports/rp2040/psg_drv_mcp4922_pio.pio
-)
+if(NOT R2P2_TRUSTZONE)
+  # TZ builds compile no psg port sources (see the psg removal above), so
+  # the generated header would have no consumer.
+  pico_generate_pio_header(${PROJECT_NAME}
+    ${PICORUBY_ROOT}/mrbgems/picoruby-psg/ports/rp2040/psg_drv_mcp4922_pio.pio
+  )
+endif()
 
 target_link_options(${PROJECT_NAME} PRIVATE -Wl,--gc-sections)
 

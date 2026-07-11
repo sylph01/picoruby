@@ -107,7 +107,8 @@ function(r2p2_apply_tz_ns TARGET)
     #    signing with the monitor, partition table with the FS partition
     #    marked NS_R/NS_W.
     #  - gem source substitutions for the TZ build (see tz/README.md
-    #    "NS build: gem impact"): machine sleep/time paths; exclude
-    #    psg/pitchdetector. (rng/mbedtls/lwIP rand and both flash HALs
-    #    are already covered by rand_ns.c / flash_ns.c above.)
+    #    "NS build: gem impact"): machine sleep/time paths. (rng/mbedtls/
+    #    lwIP rand and both flash HALs are already covered by rand_ns.c /
+    #    flash_ns.c above; psg is excluded via the -tz build configs +
+    #    the psg port removal in cmake/CMakeLists.txt.)
 endfunction()

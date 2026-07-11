@@ -7,6 +7,10 @@ MRuby::CrossBuild.new("r2p2-picoruby-pico2_w-tz") do |conf|
   #   - no picoruby-ble / picoruby-ble-uart: TZ is WiFi-only for now
   #     (watch-out #5 — saves the btstack link, RAM and audit surface;
   #     the CYW43 firmware blob still contains BT, we just don't drive it)
+  #   - no picoruby-psg: its PSG_tick_start_core1 launches core 1, a
+  #     Secure-only bootrom operation that faults under TZ until the
+  #     sg_launch_core1_ns veneer exists (PHASE2-BACKLOG item 1; the
+  #     matching port-source removal is in cmake/CMakeLists.txt)
   # Selected automatically by `R2P2_TRUSTZONE=1 rake r2p2:picoruby:pico2_w:*`
   # (r2p2.rake prefers a `-tz` build config when one exists).
   #
@@ -68,7 +72,6 @@ MRuby::CrossBuild.new("r2p2-picoruby-pico2_w-tz") do |conf|
     # Shinonome is too big for debug build
     conf.gem core: 'picoruby-shinonome'
   end
-  conf.gem core: 'picoruby-psg'
   conf.gem core: 'picoruby-keyboard'
   # NS-side session crypto: TZ.derive_key (HKDF export from the Secure
   # keystore) feeds MbedTLS::Cipher#key= — the tier-2 session-key model.

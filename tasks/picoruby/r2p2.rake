@@ -6,9 +6,10 @@ load "#{R2P2_GEM_DIR}/r2p2_config.rb"
 ENV["PICO_SDK_PATH"] ||= "#{R2P2_GEM_DIR}/lib/pico-sdk"
 ENV["PICO_EXTRAS_PATH"] ||= "#{R2P2_GEM_DIR}/lib/pico-extras"
 
-# TZ builds use a dedicated `-tz` build config when one exists (e.g.
-# r2p2-picoruby-pico2_w-tz.rb trims the gem set for the NS image); boards
-# whose TZ gem set matches stock (pico2) just share the stock config.
+# TZ builds use a dedicated `-tz` build config when one exists; both
+# pico2 and pico2_w have one (they drop picoruby-psg — core-1 launch is
+# Secure-only; pico2_w-tz also drops BLE). Boards without a `-tz` config
+# fall back to the stock one.
 def r2p2_mruby_config_name(vm, board)
   name = "r2p2-#{vm}-#{board}"
   tz_name = "#{name}-tz"
