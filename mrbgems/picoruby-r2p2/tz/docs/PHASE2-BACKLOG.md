@@ -88,24 +88,37 @@ core-1 loop.
 
 ## 3. `sg_deep_sleep()` + `sg_aon_*`
 
-**AON + validation device-verified PASS; dormant nap FAILS on device —
-and it takes the USB HUB down with it (2026-07-11, two boards).**
-`TZ.selftest` passes the AON checks (clock live, monotonic advance,
-NULL/menu-arg rejection) and `sg_deep_sleep` argument validation on
-device. But `Machine.sleep 3` reproduces on BOTH spare pico2 boards:
-CDC never returns, and — decisive observation from attempt 2 with a
-healthy host — the ENTIRE USB hub the board is on drops (every sibling
-device vanishes; on this rig Bus 003 is internal to the PC → host
-reboot to recover). Root-cause hypothesis (high confidence): the veneer
-stops `clk_usb` with the USB pull-up still attached and a transaction
-possibly in flight; the electrically-frozen device wedges the hub. The
-stock RP2350 sleep path shares the gap (upstream comment says deep
-sleep "doesn't work yet"; never exercised with USB attached).
-**Fix candidate:** NS-side clean detach in `sleep_ns.c` —
-`tud_disconnect()` before `sg_deep_sleep`, USB re-init/`tud_connect()`
-after wake. Then SWD PC-sample a stuck board (probe on a DIFFERENT hub
-than the target!) to check whether the monitor-side wake path also
-sticks, before trusting the recipe. Fixed menu:
+**DONE — fully device-verified after two device-found bugs (2026-07-11,
+board 2 + probe).** Final state: `Machine.sleep N` naps for exactly N
+seconds (repeatable), USB detaches cleanly and re-enumerates ~1 s after
+wake, the SAME irb session survives, the wall clock counts through the
+nap, host/hub healthy, full selftest green (except item 1's known
+core-1 checks). Getting there took three device iterations:
+
+1. *USB hub kill.* The veneer stopped `clk_usb` with the pull-up
+   attached mid-transaction; the frozen device took down the ENTIRE hub
+   (all sibling devices; this rig's Bus 003 is internal → host reboot).
+   Fix: `sleep_ns.c` detaches first — flush, quiesce USBCTRL_IRQ (the
+   only tud_task caller under TZ), `tud_disconnect()`, nap,
+   `tud_connect()` + IRQ back after.
+2. *pico-extras `rosc_enable` idiom.* Writing the bare ENABLE field
+   mask zeroes FREQ_RANGE → ROSC stops dead → wake path spins forever
+   at 32 kHz (SWD PC-sample: parked in the stable-wait after a
+   successful alarm wake).
+3. *`clocks_init()`'s clk_ref-via-ROSC step.* Its glitchless switch
+   onto a not-actually-running ROSC stalls clk_ref/clk_sys outright —
+   the core stops mid-instruction, SWD dies entirely, and no software
+   timeout can ever fire. LED breadcrumbs + SWD-examinability decoded
+   this in one run.
+
+Redesigned recipe (sg_veneers.c): no ROSC involvement at all, no WFI —
+clock tree to LPOSC, PLLs/XOSC off, poll the POWMAN alarm flag at
+32 kHz (pico-extras' core also spins; equivalent power), then rebuild
+the boot clock tree strictly via verified sources (XOSC only after its
+STABLE, PLLs after lock). Design rule earned on device: **never point a
+glitchless mux at an unverified source — that failure mode is beyond
+any software bound.** LED breadcrumbs kept (nap = LED dark on the
+non-W pico2). Fixed menu:
 `sg_deep_sleep(SG_SLEEP_DORMANT_FOR_SECS, secs)` runs the pico-extras
 dormant recipe Secure-side (LPOSC + PLL/XOSC off + POWMAN alarm wake;
 PRIMASK_S held across the teardown; no vreg dialing yet); refuses while

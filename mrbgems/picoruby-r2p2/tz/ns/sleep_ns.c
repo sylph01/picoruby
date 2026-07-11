@@ -27,13 +27,27 @@
 #include "pico/stdlib.h"
 #include "hardware/irq.h"
 #include "hardware/timer.h"
+#include "hardware/regs/intctrl.h"
+#include "tusb.h"
 
 #include "../include/r2p2_sg_api.h"
 
 void __wrap_Machine_sleep(uint32_t seconds) {
     if (seconds == 0) return;
 
-    stdio_flush();
+    /* Detach from the USB bus BEFORE the veneer stops clk_usb. A device
+     * that freezes mid-transaction with its pull-up still attached wedges
+     * the upstream hub — device-verified 2026-07-11: one nap took down
+     * every sibling device on the host's (internal) hub, twice. Flush the
+     * console, give the IRQ-driven tud_task pump a moment to drain to the
+     * host, then quiesce the pump (under TZ, USBCTRL_IRQ is the ONLY
+     * tud_task caller — never call it from thread context) and drop the
+     * pull-up so the host sees an orderly disconnect. */
+    tud_cdc_write_flush();
+    busy_wait_ms(5);
+    irq_set_enabled(USBCTRL_IRQ, false);
+    tud_disconnect();
+    busy_wait_ms(2);
 
     /* machine.c's tick source is TIMER0 alarm 0; keep it quiet across the
      * clock teardown, exactly like the stock sleep paths do. */
@@ -43,6 +57,12 @@ void __wrap_Machine_sleep(uint32_t seconds) {
     int rc = sg_deep_sleep(SG_SLEEP_DORMANT_FOR_SECS, seconds);
 
     irq_set_enabled(alarm_irq, true);
+
+    /* Reattach: pull-up back on, IRQ pump back; the host re-enumerates
+     * and TinyUSB rebuilds its state from the bus reset. (The controller
+     * kept power through dormant; only its clock was stopped.) */
+    tud_connect();
+    irq_set_enabled(USBCTRL_IRQ, true);
 
     if (rc != SG_OK) {
         /* No low-power state available (busy veneer, core 1 running, ...):

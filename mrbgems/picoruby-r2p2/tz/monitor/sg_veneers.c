@@ -37,12 +37,11 @@
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "hardware/clocks.h"
+#include "hardware/gpio.h"
 #include "hardware/pll.h"
 #include "hardware/powman.h"
 #include "hardware/xosc.h"
 #include "hardware/structs/psm.h"
-#include "hardware/structs/rosc.h"
-#include "hardware/structs/scb.h"
 #include "hardware/structs/sio.h"
 #include "pico/runtime_init.h"
 
@@ -539,28 +538,38 @@ static int sg_aon_set_ms_locked(uint64_t ms) {
     return SG_OK;
 }
 
-/* pico-extras' rosc_enable/rosc_set_dormant, inlined: the monitor does not
- * pull in pico-extras, and both are two-register operations. Writing the
- * full ENABLE field mask enables (any value but the 0xd1e DISABLE magic);
- * the DORMANT magic stalls ROSC until a wake event, which stalls every
- * downstream clock — execution resumes here when the POWMAN alarm fires. */
-static void monitor_rosc_enable(void) {
-    rosc_hw->ctrl = ROSC_CTRL_ENABLE_BITS;
-    while (!(rosc_hw->status & ROSC_STATUS_STABLE_BITS)) tight_loop_contents();
-}
+/* LED breadcrumbs through the nap (non-W pico2 only, same channel as the
+ * boot-stage LED): OFF for the nap, ON the instant the alarm fires, OFF
+ * once the clock tree is restored, ON when the veneer hands back to NS.
+ * With SWD-examinable-or-not (32 kHz vs 150 MHz system) this pinpoints a
+ * wake-path hang to one stage in a single run. */
+#if R2P2_TZ_LED_DIAG
+#define SLEEP_LED(on) gpio_put(25, on)
+#else
+#define SLEEP_LED(on) ((void)0)
+#endif
 
-static void monitor_rosc_dormant(void) {
-    rosc_hw->dormant = ROSC_DORMANT_VALUE_DORMANT;
-    while (!(rosc_hw->status & ROSC_STATUS_STABLE_BITS)) tight_loop_contents();
-}
-
-/* The pico-extras dormant recipe (sleep_run_from_dormant_source(LPOSC) +
- * sleep_goto_dormant_until + sleep_power_up), Secure-side and synchronous:
- * NS blocks in the veneer for the whole nap. PRIMASK_S is set for the
- * duration — it boosts execution priority above every configurable
- * exception, NS interrupts included, so nothing preempts the clock
- * teardown; pended NS IRQs deliver after return. No vreg dialing (stock
- * drops to 1.10 V; a power optimization the fixed menu can grow later). */
+/* Low-power nap, Secure-side and synchronous: NS blocks in the veneer for
+ * the whole nap. Clock tree down to LPOSC (32 kHz), PLLs and XOSC off,
+ * then spin on the POWMAN alarm flag; the wake path rebuilds the boot
+ * clock configuration (the r2p2_tz_config clock contract holds again on
+ * return). PRIMASK_S is held throughout — it boosts execution priority
+ * above every configurable exception, NS interrupts included, so nothing
+ * preempts a 32 kHz clock tree; pended NS IRQs deliver after return.
+ *
+ * Deliberately NOT the pico-extras dormant recipe, though the power
+ * profile matches (their core spins at the dormant source's rate just
+ * like this one). Two of its idioms bricked this exact path on device
+ * (2026-07-11, SWD post-mortems): rosc_enable's bare-field-mask write
+ * zeroes FREQ_RANGE and stops the ROSC dead, and clocks_init()'s
+ * clk_ref glitchless switch onto ROSC stalls clk_sys outright when the
+ * ROSC isn't actually running — the core stops mid-instruction, beyond
+ * the reach of any software timeout. Hence the two design rules here:
+ * the ROSC is never touched, and no glitchless mux is ever pointed at a
+ * source that hasn't just been verified alive (LPOSC always runs; XOSC
+ * is switched to only after xosc_init's hardware startup counter reports
+ * STABLE). No WFI (nothing to wake it: the alarm flag is polled), no
+ * vreg dialing (a power optimization the fixed menu can grow later). */
 static int sg_deep_sleep_locked(uint32_t mode, uint32_t arg) {
     if (mode != SG_SLEEP_DORMANT_FOR_SECS) return SG_ERR_BAD_PARAM;
     if (arg == 0 || arg > SG_SLEEP_MAX_SECS) return SG_ERR_BAD_PARAM;
@@ -568,12 +577,8 @@ static int sg_deep_sleep_locked(uint32_t mode, uint32_t arg) {
     if (!powman_timer_is_running()) return SG_ERR_INTERNAL;
 
     uint32_t ints = save_and_disable_interrupts();
-    uint32_t scr = scb_hw->scr;
-    uint32_t sleep_en0 = clocks_hw->sleep_en0;
-    uint32_t sleep_en1 = clocks_hw->sleep_en1;
 
-    /* Run the whole clock tree from LPOSC (32 kHz), kill the PLLs and
-     * XOSC. From here to clocks_init() we execute at 32 kHz. */
+    /* --- down: everything from LPOSC (32 kHz), PLLs + XOSC off --------- */
     clock_configure(clk_ref, CLOCKS_CLK_REF_CTRL_SRC_VALUE_LPOSC_CLKSRC,
                     0, 32 * KHZ, 32 * KHZ);
     clock_configure(clk_sys, CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF,
@@ -581,8 +586,7 @@ static int sg_deep_sleep_locked(uint32_t mode, uint32_t arg) {
     clock_stop(clk_adc);
     clock_stop(clk_usb);
     clock_stop(clk_hstx);
-    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
-                    32 * KHZ, 32 * KHZ);
+    clock_stop(clk_peri);
     pll_deinit(pll_sys);
     pll_deinit(pll_usb);
     xosc_disable();
@@ -593,34 +597,50 @@ static int sg_deep_sleep_locked(uint32_t mode, uint32_t arg) {
     powman_timer_set_1khz_tick_source_lposc();
     powman_timer_set_ms(now_ms);
 
-    clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
-    clocks_hw->sleep_en1 = 0;
-
-    powman_enable_alarm_wakeup_at_ms(now_ms + (uint64_t)arg * 1000u);
-
-    scb_hw->scr |= M33_SCR_SLEEPDEEP_BITS;
-    monitor_rosc_dormant(); /* stalls here until the alarm wake event */
-
-    /* Awake. Disarm the alarm, restore the clock tree (clocks_init =
-     * runtime_init_clocks: XOSC + PLLs + the boot clk_sys config, so the
-     * r2p2_tz_config clock contract holds again), POWMAN back on XOSC. */
-    powman_disable_alarm_wakeup();
+    /* --- the nap: poll the alarm flag at 32 kHz ------------------------ */
+    powman_clear_alarm();
+    powman_timer_enable_alarm_at_ms(now_ms + (uint64_t)arg * 1000u);
+    SLEEP_LED(false);
+    while (!(powman_hw->timer & POWMAN_TIMER_ALARM_BITS)) tight_loop_contents();
+    SLEEP_LED(true);
     powman_timer_disable_alarm();
     powman_clear_alarm();
 
-    monitor_rosc_enable();
-    clocks_hw->sleep_en0 = ~0u;
-    clocks_hw->sleep_en1 = ~0u;
-    clocks_init();
+    /* --- wake: rebuild the boot clock tree via verified sources -------- */
+    xosc_init(); /* returns only after the XOSC startup counter -> STABLE */
+    clock_configure(clk_ref, CLOCKS_CLK_REF_CTRL_SRC_VALUE_XOSC_CLKSRC,
+                    0, XOSC_HZ, XOSC_HZ);
 
     now_ms = powman_timer_get_ms();
     powman_timer_set_1khz_tick_source_xosc();
     powman_timer_set_ms(now_ms);
 
-    clocks_hw->sleep_en0 = sleep_en0;
-    clocks_hw->sleep_en1 = sleep_en1;
-    scb_hw->scr = scr;
+    /* Same PLL/clock configuration as runtime_init_clocks, minus its
+     * clk_ref-via-ROSC detour. */
+    pll_init(pll_sys, PLL_SYS_REFDIV, PLL_SYS_VCO_FREQ_HZ,
+             PLL_SYS_POSTDIV1, PLL_SYS_POSTDIV2);
+    pll_init(pll_usb, PLL_USB_REFDIV, PLL_USB_VCO_FREQ_HZ,
+             PLL_USB_POSTDIV1, PLL_USB_POSTDIV2);
+
+    clock_configure_undivided(clk_sys,
+                              CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLKSRC_CLK_SYS_AUX,
+                              CLOCKS_CLK_SYS_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                              SYS_CLK_HZ);
+    clock_configure_undivided(clk_usb, 0,
+                              CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+                              USB_CLK_HZ);
+    clock_configure_undivided(clk_adc, 0,
+                              CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+                              USB_CLK_HZ);
+    clock_configure_undivided(clk_hstx, 0,
+                              CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLK_SYS,
+                              SYS_CLK_HZ);
+    clock_configure_undivided(clk_peri, 0,
+                              CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                              SYS_CLK_HZ);
+
     restore_interrupts(ints);
+    SLEEP_LED(true);
     return SG_OK;
 }
 

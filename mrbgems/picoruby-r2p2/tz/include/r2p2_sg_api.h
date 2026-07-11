@@ -280,14 +280,16 @@ SG_API int sg_launch_core1_ns(uintptr_t ns_vector_table, uintptr_t ns_entry,
  * are new enum values — the signature never changes (same extensibility
  * rule as sg_key_slot).
  *
- * SG_SLEEP_DORMANT_FOR_SECS: the pico-extras dormant recipe, Secure-side:
- * clocks down to LPOSC, PLLs deinit, XOSC off, POWMAN alarm at now+arg
- * seconds as the wake event, ROSC dormant. On wake the monitor restores
- * the full clock tree (clk_sys back to the boot configuration — the
- * r2p2_tz_config clock contract still holds on return) and re-anchors the
- * POWMAN tick source on XOSC. Returns with the wall clock (sg_aon_*)
- * having advanced by the sleep duration; TIMER0 (NS time_us_64) does NOT
- * advance while dormant — same as stock.
+ * SG_SLEEP_DORMANT_FOR_SECS: low-power nap, Secure-side: clocks down to
+ * LPOSC (32 kHz), PLLs deinit, XOSC off, then the monitor polls the
+ * POWMAN alarm (now+arg seconds). On wake it rebuilds the boot clock
+ * tree (the r2p2_tz_config clock contract still holds on return) and
+ * re-anchors the POWMAN tick source on XOSC. (The name is historical:
+ * the first cut used pico-extras' ROSC-dormant construct, which proved
+ * unwakeable on device — see sg_veneers.c for the post-mortem. Power
+ * profile is equivalent.) Returns with the wall clock (sg_aon_*) having
+ * advanced by the sleep duration; TIMER0 (NS time_us_64) does NOT
+ * advance during the nap — same as stock.
  *
  * Caller notes: NS should quiesce first (flush CDC output, pause its tick
  * alarm) — USB drops off the bus while clk_usb is stopped and the host
