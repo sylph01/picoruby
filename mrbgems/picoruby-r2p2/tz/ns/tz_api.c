@@ -35,6 +35,7 @@ static void tz_raise_sg(mrb_state *mrb, int rc) {
     case SG_ERR_NOT_PERMITTED: msg = "not permitted by key policy"; break;
     case SG_ERR_NO_RESOURCES:  msg = "secure keystore/engine busy";  break;
     case SG_ERR_BAD_BUFFER:    msg = "buffer rejected by monitor";   break;
+    case SG_ERR_BUSY:          msg = "secure gateway busy (reentry)"; break;
     default:                   msg = "secure gateway error";         break;
     }
     mrb_raise(mrb, E_RUNTIME_ERROR, msg);

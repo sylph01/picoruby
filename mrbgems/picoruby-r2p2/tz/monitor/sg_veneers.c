@@ -18,9 +18,13 @@
  * hardened). A buffer that fails validation returns SG_ERR_BAD_BUFFER
  * without being touched.
  *
- * Reentrancy: veneers assume a single NS caller (core 0, thread mode).
- * R2P2's cooperative scheduler satisfies this. TODO: once core 1 runs NS
- * (sg_launch_core1_ns), add a busy flag/spinlock at each entry.
+ * Reentrancy: veneers assume a single NS caller (core 0, thread mode);
+ * R2P2's cooperative scheduler satisfies this. Since sg_launch_core1_ns
+ * exists, entry is additionally serialized by a try-lock (see "reentrancy
+ * guard" below): anything that violates the contract gets SG_ERR_BUSY
+ * back instead of interleaving two callers through keystore/flash/SHA
+ * state. The guard wrappers live at the bottom of this file; the bodies
+ * are the static *_locked functions.
  */
 
 #include <string.h>
@@ -32,6 +36,8 @@
 #include "hardware/rcp.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/structs/psm.h"
+#include "hardware/structs/sio.h"
 
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_tz_config.h"
@@ -53,6 +59,37 @@ static bool ns_buffer_ok(const void *addr, size_t len, bool write) {
     return ok == RCP_MASK_TRUE;
 }
 
+/* ---- reentrancy guard ---------------------------------------------------- */
+
+/* Single NS caller (core 0, thread mode) is the contract; this makes a
+ * contract VIOLATION fail safe. The two ways to violate it are an NS IRQ
+ * handler calling sg_* while a preempted veneer is in flight (NS-targeted
+ * IRQs preempt Secure thread-mode execution), and a second core — core 1
+ * can't actually reach a veneer body (its bus is pinned NS, so the first
+ * monitor-flash fetch faults), but the lock doesn't care who the intruder
+ * is. Try-lock, not spin: contention is a bug or an attack, so answer
+ * SG_ERR_BUSY promptly rather than spin in Secure state. LDREX/STREX on
+ * Secure SRAM; the flag itself is unreachable from NS. sg_version stays
+ * unguarded (pure, and useful as an always-answers probe). */
+
+static volatile uint8_t sg_busy;
+
+static inline bool sg_guard_enter(void) {
+    return !__atomic_test_and_set(&sg_busy, __ATOMIC_ACQUIRE);
+}
+
+static inline void sg_guard_exit(void) {
+    __atomic_clear(&sg_busy, __ATOMIC_RELEASE);
+}
+
+/* Wrapper body for every guarded veneer entry point (bottom of file). */
+#define SG_GUARDED(expr) do {                       \
+        if (!sg_guard_enter()) return SG_ERR_BUSY;  \
+        int sg_rc_ = (expr);                        \
+        sg_guard_exit();                            \
+        return sg_rc_;                              \
+    } while (0)
+
 /* ---- lifecycle ---------------------------------------------------------- */
 
 SG_API int sg_version(void) {
@@ -64,7 +101,7 @@ SG_API int sg_version(void) {
 /* Secure-side pico_rand: on RP2350 its xoroshiro128** state is continuously
  * reseeded from the TRNG, so per-call TRNG latency is amortized here rather
  * than paid by every NS request. The NS image never touches the TRNG. */
-SG_API int sg_random_bytes(uint8_t *out, size_t len) {
+static int sg_random_bytes_locked(uint8_t *out, size_t len) {
     if (!out) return SG_ERR_BAD_PARAM;
     if (!ns_buffer_ok(out, len, true)) return SG_ERR_BAD_BUFFER;
     while (len > 0) {
@@ -81,8 +118,8 @@ SG_API int sg_random_bytes(uint8_t *out, size_t len) {
  * would need Secure SECCFG and claim bookkeeping; CPU feed is plenty for
  * veneer-sized inputs). Input is NS data hashing itself — NS mutating the
  * buffer mid-hash only changes NS's own result, so no TOCTOU copy needed. */
-SG_API int sg_sha256(const uint8_t *in, size_t len,
-                     uint8_t out[SG_SHA256_DIGEST_LEN]) {
+static int sg_sha256_locked(const uint8_t *in, size_t len,
+                            uint8_t out[SG_SHA256_DIGEST_LEN]) {
     if (!in || !out) return SG_ERR_BAD_PARAM;
     if (!ns_buffer_ok(in, len, false)) return SG_ERR_BAD_BUFFER;
     if (!ns_buffer_ok(out, SG_SHA256_DIGEST_LEN, true)) return SG_ERR_BAD_BUFFER;
@@ -100,7 +137,7 @@ SG_API int sg_sha256(const uint8_t *in, size_t len,
 
 /* ---- keystore / KDF ------------------------------------------------------ */
 
-SG_API int sg_key_open(uint32_t slot, sg_key_t *out_key) {
+static int sg_key_open_locked(uint32_t slot, sg_key_t *out_key) {
     if (!out_key) return SG_ERR_BAD_PARAM;
     if (!ns_buffer_ok(out_key, sizeof *out_key, true)) return SG_ERR_BAD_BUFFER;
     sg_key_t k;
@@ -109,11 +146,11 @@ SG_API int sg_key_open(uint32_t slot, sg_key_t *out_key) {
     return rc;
 }
 
-SG_API int sg_key_close(sg_key_t key) {
+static int sg_key_close_locked(sg_key_t key) {
     return ks_close(key);
 }
 
-SG_API int sg_key_get_policy(sg_key_t key, uint32_t *out_policy) {
+static int sg_key_get_policy_locked(sg_key_t key, uint32_t *out_policy) {
     if (!out_policy) return SG_ERR_BAD_PARAM;
     if (!ns_buffer_ok(out_policy, sizeof *out_policy, true))
         return SG_ERR_BAD_BUFFER;
@@ -123,8 +160,8 @@ SG_API int sg_key_get_policy(sg_key_t key, uint32_t *out_policy) {
     return rc;
 }
 
-SG_API int sg_key_derive(sg_key_t parent, const uint8_t *info,
-                         size_t info_len, sg_key_t *out_key) {
+static int sg_key_derive_locked(sg_key_t parent, const uint8_t *info,
+                                size_t info_len, sg_key_t *out_key) {
     if (!out_key || (info_len && !info)) return SG_ERR_BAD_PARAM;
     if (!ns_buffer_ok(info, info_len, false)) return SG_ERR_BAD_BUFFER;
     if (!ns_buffer_ok(out_key, sizeof *out_key, true)) return SG_ERR_BAD_BUFFER;
@@ -134,7 +171,7 @@ SG_API int sg_key_derive(sg_key_t parent, const uint8_t *info,
     return rc;
 }
 
-SG_API int sg_key_derive_export(sg_key_t parent, const sg_derive_export_t *req) {
+static int sg_key_derive_export_locked(sg_key_t parent, const sg_derive_export_t *req) {
     if (!req) return SG_ERR_BAD_PARAM;
     if (!ns_buffer_ok(req, sizeof *req, false)) return SG_ERR_BAD_BUFFER;
     /* TOCTOU rule: snapshot the request, then validate and use only the
@@ -176,7 +213,7 @@ static int aead_snapshot(sg_aead_op_t *ns_op, sg_aead_op_t *op) {
     return SG_OK;
 }
 
-SG_API int sg_aead_encrypt(sg_aead_op_t *ns_op) {
+static int sg_aead_encrypt_locked(sg_aead_op_t *ns_op) {
     sg_aead_op_t op;
     int rc = aead_snapshot(ns_op, &op);
     if (rc) return rc;
@@ -205,7 +242,7 @@ SG_API int sg_aead_encrypt(sg_aead_op_t *ns_op) {
     return SG_OK;
 }
 
-SG_API int sg_aead_decrypt(sg_aead_op_t *ns_op) {
+static int sg_aead_decrypt_locked(sg_aead_op_t *ns_op) {
     sg_aead_op_t op;
     int rc = aead_snapshot(ns_op, &op);
     if (rc) return rc;
@@ -247,8 +284,8 @@ SG_API int sg_aead_decrypt(sg_aead_op_t *ns_op) {
     return SG_OK;
 }
 
-SG_API int sg_hmac_sha256(sg_key_t key, const uint8_t *msg, size_t msg_len,
-                          uint8_t mac[SG_SHA256_DIGEST_LEN]) {
+static int sg_hmac_sha256_locked(sg_key_t key, const uint8_t *msg, size_t msg_len,
+                                 uint8_t mac[SG_SHA256_DIGEST_LEN]) {
     if (!mac || (msg_len && !msg)) return SG_ERR_BAD_PARAM;
     if (!ns_buffer_ok(msg, msg_len, false)) return SG_ERR_BAD_BUFFER;
     if (!ns_buffer_ok(mac, SG_SHA256_DIGEST_LEN, true)) return SG_ERR_BAD_BUFFER;
@@ -271,7 +308,7 @@ SG_API int sg_hmac_sha256(sg_key_t key, const uint8_t *msg, size_t msg_len,
 /* Mirrors flash.c's flash_flush_cache(): the ROM function ('F','C') is
  * Arm-S-only, hence this veneer. See the header for why NS can't do its
  * own cache maintenance. No parameters, no NS memory touched. */
-SG_API int sg_flash_flush_cache(void) {
+static int sg_flash_flush_cache_locked(void) {
     rom_flash_flush_cache_fn func =
         (rom_flash_flush_cache_fn) rom_func_lookup_inline(ROM_FUNC_FLASH_FLUSH_CACHE);
     func();
@@ -291,7 +328,7 @@ static bool fs_range_ok(uint32_t offset, uint32_t count) {
  * flush themselves. We only add interrupt masking so no IRQ handler is
  * fetched from the (temporarily unreadable) flash mid-op. Range is clamped
  * to the NS fs partition; NS can't reach the monitor or NS-code regions. */
-SG_API int sg_flash_erase(uint32_t offset, uint32_t count) {
+static int sg_flash_erase_locked(uint32_t offset, uint32_t count) {
     if (!fs_range_ok(offset, count)) return SG_ERR_BAD_PARAM;
     if ((offset & (FLASH_SECTOR_SIZE - 1)) || (count & (FLASH_SECTOR_SIZE - 1)))
         return SG_ERR_BAD_PARAM;
@@ -302,7 +339,7 @@ SG_API int sg_flash_erase(uint32_t offset, uint32_t count) {
     return SG_OK;
 }
 
-SG_API int sg_flash_program(uint32_t offset, const uint8_t *data, uint32_t count) {
+static int sg_flash_program_locked(uint32_t offset, const uint8_t *data, uint32_t count) {
     if (!fs_range_ok(offset, count)) return SG_ERR_BAD_PARAM;
     if ((offset & (FLASH_PAGE_SIZE - 1)) || (count & (FLASH_PAGE_SIZE - 1)))
         return SG_ERR_BAD_PARAM;
@@ -328,7 +365,7 @@ SG_API int sg_flash_program(uint32_t offset, const uint8_t *data, uint32_t count
  * attests the buffer contents at call time. NS owns the buffer and the VM
  * that will execute it; it is a policy gate, not an NS-integrity
  * guarantee. The boundary protects keys, not NS control flow. */
-SG_API int sg_verify_mrb(const uint8_t *pkg, size_t pkg_len) {
+static int sg_verify_mrb_locked(const uint8_t *pkg, size_t pkg_len) {
     if (!pkg) return SG_ERR_BAD_PARAM;
     if (pkg_len < sizeof(r2p2_mrb_env_hdr_t) + R2P2_MRB_SIG_LEN)
         return SG_ERR_BAD_PARAM;
@@ -372,4 +409,166 @@ SG_API int sg_verify_mrb(const uint8_t *pkg, size_t pkg_len) {
     if (rc) return rc;
     ks_set_mrb_verified();
     return SG_OK;
+}
+
+/* ---- core 1 ---------------------------------------------------------------- */
+
+/* Core 1 is the designated NS core (FORCE_CORE_NS pinned in
+ * partition_configure): its bus is NS forever, so handing it any entry
+ * point — even a Secure address — gives away nothing; a bad target just
+ * faults on core 1's side. The parameter checks below are therefore
+ * correctness courtesy, not a security boundary. The security-relevant
+ * parts are (a) PSM and the mailbox run Secure-side only, so NS cannot
+ * launch/reset core 1 behind the monitor's back, and (b) the bounded
+ * waits, so a wedged core 1 costs the caller an error, not a Secure-state
+ * hang. */
+
+/* ~10M spins ≈ a few hundred ms at 150 MHz — the bootrom responds in
+ * microseconds; the margin is for NS IRQs preempting us mid-handshake. */
+#define CORE1_FIFO_SPINS 10000000u
+
+static bool core1_fifo_push(uint32_t val) {
+    for (uint32_t spins = CORE1_FIFO_SPINS; spins; spins--) {
+        if (sio_hw->fifo_st & SIO_FIFO_ST_RDY_BITS) {
+            sio_hw->fifo_wr = val;
+            __sev();
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool core1_fifo_pop(uint32_t *out) {
+    for (uint32_t spins = CORE1_FIFO_SPINS; spins; spins--) {
+        if (sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS) {
+            *out = sio_hw->fifo_rd;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void core1_fifo_drain(void) {
+    while (sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS) (void)sio_hw->fifo_rd;
+}
+
+static bool ns_exec_addr_ok(uintptr_t a) {
+    return (a >= TZ_NS_FLASH_BASE && a <= TZ_NS_FLASH_LAST)
+        || (a >= TZ_NS_RAM_BASE && a <= TZ_NS_RAM_LAST);
+}
+
+static int sg_launch_core1_ns_locked(uintptr_t vtor, uintptr_t entry,
+                                     uintptr_t stack_top) {
+    if (entry != 0) {
+        if (!ns_exec_addr_ok(vtor) || (vtor & 0x7fu)) return SG_ERR_BAD_PARAM;
+        if (!ns_exec_addr_ok(entry)) return SG_ERR_BAD_PARAM;
+        /* Stack grows down from stack_top; require it in NS RAM. */
+        if ((stack_top & 7u) || stack_top <= TZ_NS_RAM_BASE ||
+            stack_top > TZ_NS_RAM_LAST + 1u) return SG_ERR_BAD_PARAM;
+    }
+
+    /* Hard-reset core 1 (PSM FRCE_OFF pulse, same sequence as the SDK's
+     * multicore_reset_core1; readback fences the APB store buffer). Kills
+     * any previous payload; core 1 re-enters the bootrom wait loop. */
+    hw_set_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
+    while (!(psm_hw->frce_off & PSM_FRCE_OFF_PROC1_BITS)) tight_loop_contents();
+    core1_fifo_drain();
+    hw_clear_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
+
+    /* Out of reset, core 1's bootrom drains its FIFO and pushes a 0. */
+    uint32_t v;
+    if (!core1_fifo_pop(&v)) return SG_ERR_INTERNAL;
+
+    if (entry == 0) return SG_OK; /* parked in the bootrom wait loop */
+
+    /* Bootrom mailbox launch protocol (datasheet §5.3; same sequence as
+     * the SDK's multicore_launch_core1_raw): each word is echoed back, a
+     * wrong echo restarts the sequence. Bounded overall so a
+     * never-syncing core 1 returns an error instead of wedging us. */
+    const uint32_t seq[] = { 0, 0, 1, vtor, stack_top, entry | 1u };
+    uint32_t seq_i = 0;
+    for (uint32_t attempts = 64; seq_i < count_of(seq); attempts--) {
+        if (!attempts) return SG_ERR_INTERNAL;
+        uint32_t cmd = seq[seq_i];
+        if (!cmd) {
+            core1_fifo_drain();
+            __sev(); /* core 1 may be waiting for FIFO space via WFE */
+        }
+        if (!core1_fifo_push(cmd)) return SG_ERR_INTERNAL;
+        uint32_t resp;
+        if (!core1_fifo_pop(&resp)) return SG_ERR_INTERNAL;
+        seq_i = (cmd == resp) ? seq_i + 1 : 0;
+    }
+    return SG_OK;
+}
+
+/* ---- veneer entry points (guard wrappers) --------------------------------- */
+
+/* Every entry point except sg_version() takes the try-lock, runs its
+ * _locked body, releases. Keep these one-liners boring: any early return
+ * added above this line must live in a _locked body, never here. */
+
+SG_API int sg_random_bytes(uint8_t *out, size_t len) {
+    SG_GUARDED(sg_random_bytes_locked(out, len));
+}
+
+SG_API int sg_sha256(const uint8_t *in, size_t len,
+                     uint8_t out[SG_SHA256_DIGEST_LEN]) {
+    SG_GUARDED(sg_sha256_locked(in, len, out));
+}
+
+SG_API int sg_key_open(uint32_t slot, sg_key_t *out_key) {
+    SG_GUARDED(sg_key_open_locked(slot, out_key));
+}
+
+SG_API int sg_key_close(sg_key_t key) {
+    SG_GUARDED(sg_key_close_locked(key));
+}
+
+SG_API int sg_key_get_policy(sg_key_t key, uint32_t *out_policy) {
+    SG_GUARDED(sg_key_get_policy_locked(key, out_policy));
+}
+
+SG_API int sg_key_derive(sg_key_t parent, const uint8_t *info,
+                         size_t info_len, sg_key_t *out_key) {
+    SG_GUARDED(sg_key_derive_locked(parent, info, info_len, out_key));
+}
+
+SG_API int sg_key_derive_export(sg_key_t parent, const sg_derive_export_t *req) {
+    SG_GUARDED(sg_key_derive_export_locked(parent, req));
+}
+
+SG_API int sg_aead_encrypt(sg_aead_op_t *ns_op) {
+    SG_GUARDED(sg_aead_encrypt_locked(ns_op));
+}
+
+SG_API int sg_aead_decrypt(sg_aead_op_t *ns_op) {
+    SG_GUARDED(sg_aead_decrypt_locked(ns_op));
+}
+
+SG_API int sg_hmac_sha256(sg_key_t key, const uint8_t *msg, size_t msg_len,
+                          uint8_t mac[SG_SHA256_DIGEST_LEN]) {
+    SG_GUARDED(sg_hmac_sha256_locked(key, msg, msg_len, mac));
+}
+
+SG_API int sg_flash_flush_cache(void) {
+    SG_GUARDED(sg_flash_flush_cache_locked());
+}
+
+SG_API int sg_flash_erase(uint32_t offset, uint32_t count) {
+    SG_GUARDED(sg_flash_erase_locked(offset, count));
+}
+
+SG_API int sg_flash_program(uint32_t offset, const uint8_t *data, uint32_t count) {
+    SG_GUARDED(sg_flash_program_locked(offset, data, count));
+}
+
+SG_API int sg_verify_mrb(const uint8_t *pkg, size_t pkg_len) {
+    SG_GUARDED(sg_verify_mrb_locked(pkg, pkg_len));
+}
+
+SG_API int sg_launch_core1_ns(uintptr_t ns_vector_table, uintptr_t ns_entry,
+                              uintptr_t ns_stack_top) {
+    SG_GUARDED(sg_launch_core1_ns_locked(ns_vector_table, ns_entry,
+                                         ns_stack_top));
 }

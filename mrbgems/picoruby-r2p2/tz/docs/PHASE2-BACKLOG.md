@@ -11,6 +11,17 @@ Items are roughly independent unless a dependency is noted. Each lists
 
 ## 1. `sg_launch_core1_ns()` — core-1 NS launch (+ veneer reentrancy)
 
+**DONE (2026-07-11), device verification pending.** Designated-NS-core
+scheme: `partition_configure` pins `FORCE_CORE_NS.CORE1` before the
+ACCESSCTRL lock; the veneer resets (PSM), launches (bootrom mailbox,
+bounded waits), or parks (`ns_entry == 0`) core 1. Reentrancy guard:
+try-lock at every veneer entry (`SG_ERR_BUSY`), `sg_version` exempt.
+ABI bumped to 0x0002. Note core 1 can never call veneers (bus pinned NS
+→ first Secure access faults); Secure services relay through core 0.
+`TZ.selftest` gained launch/park/relaunch + param-rejection checks —
+**run it on hardware before relying on this**: the forced-NS bootrom
+mailbox path is implemented per datasheet but not yet device-proven.
+
 - **What:** a veneer that launches core 1 into Non-secure state. The
   bootrom's core-1 launch protocol runs Secure-side, so NS cannot start
   core 1 itself. The monitor pins core 1 Non-secure
@@ -30,6 +41,15 @@ Items are roughly independent unless a dependency is noted. Each lists
   veneers is the real cost).
 
 ## 2. TZ-specific mruby build_config to drop psg/pitchdetector
+
+**DONE (2026-07-11, commit 9ca065ea).** psg dropped in both halves
+(`-tz` build configs for pico2 and pico2_w + port-source removal in the
+R2P2 CMake — the port constructor claims a SIO spinlock pre-main, so
+config-only removal wasn't enough). pitchdetector turned out to need
+nothing: no build config includes it, its port objects are gc'd, and it
+uses no core 1. Re-adding psg under TZ needs its port moved to
+`sg_launch_core1_ns` (item 1) plus a designated-NS-core audit of the
+core-1 loop.
 
 - **What:** a build config that genuinely removes psg/pitchdetector from
   the VM. Their `src/*.c` in `libmruby.a` reference the port symbols

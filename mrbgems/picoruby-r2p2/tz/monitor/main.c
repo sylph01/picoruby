@@ -398,6 +398,19 @@ static void partition_configure(void) {
     rom_set_ns_api_permission(BOOTROM_NS_API_get_sys_info, true);
     rom_set_ns_api_permission(BOOTROM_NS_API_reboot, true);
 
+    /* Designate core 1 as the Non-secure core (FORCE_CORE_NS, §10.6):
+     * every bus access core 1 ever makes is attributed Non-secure no
+     * matter its architectural state, so nothing that runs there — the
+     * bootrom wait loop included — can reach monitor flash/RAM, Secure
+     * peripherals, or the veneers. sg_launch_core1_ns releases it into an
+     * NS entry via the bootrom mailbox (the core-1 bootrom is
+     * security-aware and mailboxes through SIO_NONSEC when forced NS).
+     * Must be pinned HERE: the LOCK write below makes ACCESSCTRL ignore
+     * core 0 forever after, and CFGRESET deliberately cannot clear
+     * FORCE_CORE_NS. */
+    accessctrl_hw->force_core_ns = AC_PASSWORD
+                                 | ACCESSCTRL_FORCE_CORE_NS_CORE1_BITS;
+
     /* Freeze the configuration: further ACCESSCTRL writes from the cores
      * are ignored (LOCK bits are one-way until reset). DEBUG left unlocked
      * during bring-up — set ACCESSCTRL_LOCK_DEBUG_BITS for production. */
@@ -436,8 +449,8 @@ static void __attribute__((noreturn)) ns_launch(void) {
      * anyway and any reset re-enters secure boot).
      * TODO: seal the Secure stacks (store 0xfef5eda5 at the stack limits,
      * ARM stack-sealing recommendation) in crt0/startup.
-     * TODO(phase 2, PSG/pitchdetector): sg_launch_core1_ns veneer with
-     * ACCESSCTRL FORCE_CORE_NS.CORE1 so core 1 runs NS-only. */
+     * Core 1: pinned NS in partition_configure (FORCE_CORE_NS); NS starts
+     * it with the sg_launch_core1_ns veneer. */
 
     diag_stage(TZ_STAGE_NS_LAUNCHED); /* (F) SCS setup survived — blxns next */
     led_set(true);

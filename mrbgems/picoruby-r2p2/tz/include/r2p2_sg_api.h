@@ -25,7 +25,12 @@
  *  2. Calls are synchronous, run in Secure state on the caller's thread,
  *     are NOT reentrant, and must not be made from IRQ context. R2P2's
  *     cooperative task scheduler satisfies this naturally: a veneer call
- *     blocks the VM exactly like any other blocking C function.
+ *     blocks the VM exactly like any other blocking C function. The
+ *     monitor additionally serializes entry with a try-lock: a call that
+ *     arrives while another is in flight (an IRQ handler calling sg_*
+ *     over a preempted veneer, or a second core) returns SG_ERR_BUSY
+ *     instead of interleaving. sg_version() alone is exempt (pure).
+ *     Core 1 cannot call veneers at all — see sg_launch_core1_ns.
  *  3. Key material never crosses this boundary. The single deliberate
  *     exception is sg_key_derive_export(), which succeeds only for parent
  *     keys whose monitor-side policy carries SG_KEY_POLICY_EXPORT_DERIVED
@@ -51,8 +56,9 @@ extern "C" {
 #endif
 
 /* Bump on any ABI change. NS calls sg_version() at boot and refuses to run
- * against a mismatched monitor. */
-#define SG_API_VERSION 0x0001
+ * against a mismatched monitor.
+ * 0x0002: sg_launch_core1_ns, SG_ERR_BUSY + entry serialization. */
+#define SG_API_VERSION 0x0002
 
 /* noipa: GCC's IPA passes otherwise clone entry functions into local
  * `*.constprop.N` symbols (e.g. when a stub ignores its arguments), and
@@ -76,6 +82,7 @@ typedef enum {
   SG_ERR_AUTH_FAILED     = -7,  /* AEAD tag / signature verify failed */
   SG_ERR_BAD_PARAM       = -8,
   SG_ERR_INTERNAL        = -9,
+  SG_ERR_BUSY            = -10, /* another veneer call is in flight (rule 2) */
 } sg_status_t;
 
 /* Opaque key handle. Values are monitor-generated and meaningless to NS;
@@ -229,15 +236,42 @@ SG_API int sg_flash_program(uint32_t offset, const uint8_t *data, uint32_t count
  * integrity guarantee — the boundary protects keys, not NS control flow. */
 SG_API int sg_verify_mrb(const uint8_t *pkg, size_t pkg_len);
 
-/* ---- privileged services (TODO, unimplemented even in sketch) ----------- */
+/* ---- privileged services -------------------------------------------------- */
 
-/* Core 1 launch into NS state: the bootrom's core-1 launch protocol runs
- * Secure-side, so NS cannot start core 1 itself. The monitor pins core 1
- * Non-secure (ACCESSCTRL FORCE_CORE_NS) and releases it into the given NS
- * entry. Needed for picoruby-psg / pitchdetector.
- * SG_API int sg_launch_core1_ns(uintptr_t ns_vector_table,
- *                               uintptr_t ns_entry, uintptr_t ns_stack_top);
- */
+/* Launch core 1 into the Non-secure image. Core 1 is the designated NS
+ * core: partition_configure pins ACCESSCTRL FORCE_CORE_NS.CORE1 (before
+ * the ACCESSCTRL lock), so every bus access core 1 ever makes is
+ * attributed Non-secure no matter its architectural state — nothing that
+ * runs there can reach monitor flash/RAM, Secure peripherals, or key
+ * material. That includes the veneers: core 1 jumping at an sg_* address
+ * faults on its first Secure access. Core-1 code that needs a Secure
+ * service must relay through core 0.
+ *
+ * The monitor hard-resets core 1 (PSM — Secure-only, which is why NS
+ * cannot do any of this itself) and runs the bootrom mailbox launch
+ * protocol with the given NS vector table / stack top / entry. The
+ * bootrom's core-1 wait loop is security-aware and mailboxes via the
+ * SIO_NONSEC alias on a forced-NS core. Thumb bit on ns_entry is set by
+ * the monitor.
+ *
+ * ns_entry == 0: reset core 1 and leave it parked in the bootrom wait
+ * loop (the "stop core 1" operation; other args ignored). Calling while
+ * core 1 is already running is fine — the reset kills the old payload
+ * first.
+ *
+ * Parameter rules (SG_ERR_BAD_PARAM): vector table and entry in NS flash
+ * or NS RAM, vector table 128-byte aligned; stack top 8-byte aligned,
+ * stack in NS RAM (grows down from ns_stack_top).
+ *
+ * Flash hazard while core 1 runs: sg_flash_erase/program make XIP
+ * unreadable for their duration; NS must ensure core 1 neither executes
+ * from nor reads flash during those calls (the same
+ * PICO_FLASH_ASSUME_CORE1_SAFE contract stock R2P2 already builds with).
+ *
+ * Returns SG_OK once the bootrom handshake completes, SG_ERR_INTERNAL if
+ * core 1 stops responding (bounded waits — no indefinite Secure spin). */
+SG_API int sg_launch_core1_ns(uintptr_t ns_vector_table, uintptr_t ns_entry,
+                              uintptr_t ns_stack_top);
 
 /* Deep sleep / clock dialing: CLOCKS/PLL/POWMAN stay Secure-only, so
  * Machine.deep_sleep needs a veneer with a fixed menu of states rather than

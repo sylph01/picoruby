@@ -16,6 +16,9 @@
 
 #include <mruby.h>
 
+#include "hardware/structs/scb.h"
+#include "hardware/timer.h"
+
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_mrb_envelope.h"
 #include "tz_selftest_pkgs.h"
@@ -235,6 +238,52 @@ static void t_verify_mrb(void) {
             sg_verify_mrb(tz_pkg_v3, sizeof tz_pkg_v3) == SG_OK);
 }
 
+/* ---- core 1 ---------------------------------------------------------------- */
+
+/* Exercises sg_launch_core1_ns: launch core 1 into an NS entry that sets a
+ * flag and parks in WFI, verify the flag, stop core 1, and do it again to
+ * prove relaunch works. Also probes the parameter checks with a Secure
+ * vector-table address and a misaligned stack. */
+
+#define T_CORE1_MAGIC 0xC0DE1A11u
+
+static volatile uint32_t t_core1_flag;
+static uint32_t t_core1_stack[128] __attribute__((aligned(8)));
+
+static void t_core1_entry(void) {
+    t_core1_flag = T_CORE1_MAGIC;
+    for (;;) { __asm volatile ("wfi"); }
+}
+
+static bool t_core1_wait_flag(void) {
+    uint32_t t0 = time_us_32();
+    while (t_core1_flag != T_CORE1_MAGIC) {
+        if ((uint32_t)(time_us_32() - t0) > 500000u) return false;
+    }
+    return true;
+}
+
+static void t_core1(void) {
+    uintptr_t vtor  = scb_hw->vtor; /* NS view = VTOR_NS = our vector table */
+    uintptr_t entry = (uintptr_t)t_core1_entry;
+    uintptr_t sp    = (uintptr_t)&t_core1_stack[count_of(t_core1_stack)];
+
+    t_check("launch_core1(secure vtor) = BAD_PARAM",
+            sg_launch_core1_ns(0x10000000u, entry, sp) == SG_ERR_BAD_PARAM);
+    t_check("launch_core1(odd sp) = BAD_PARAM",
+            sg_launch_core1_ns(vtor, entry, sp - 4u + 1u) == SG_ERR_BAD_PARAM);
+
+    t_core1_flag = 0;
+    t_check("launch_core1", sg_launch_core1_ns(vtor, entry, sp) == SG_OK);
+    t_check("core 1 ran the NS entry", t_core1_wait_flag());
+    t_check("park core 1", sg_launch_core1_ns(0, 0, 0) == SG_OK);
+
+    t_core1_flag = 0;
+    t_check("relaunch core 1", sg_launch_core1_ns(vtor, entry, sp) == SG_OK);
+    t_check("core 1 ran again", t_core1_wait_flag());
+    t_check("park core 1 again", sg_launch_core1_ns(0, 0, 0) == SG_OK);
+}
+
 /* ---- entry ----------------------------------------------------------------- */
 
 mrb_value mrb_tz_selftest(mrb_state *mrb, mrb_value self) {
@@ -252,6 +301,7 @@ mrb_value mrb_tz_selftest(mrb_state *mrb, mrb_value self) {
         sg_key_close(root);
     }
     t_verify_mrb();
+    t_core1();
 
     t_out(t_failures ? "RESULT: FAILED\r\n" : "RESULT: PASSED\r\n");
     return mrb_bool_value(t_failures == 0);

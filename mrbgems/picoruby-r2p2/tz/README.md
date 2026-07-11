@@ -52,8 +52,9 @@ enforcement). Recipe + burn log: `tools/OTP-BURN.md` (note: the seal JSON
 bundles the enable bit, so `otp load bootkey_otp.json` is the point of no
 return). To reflash board 1 you must package with
 `R2P2_TZ_SIGKEY=~/.r2p2-tz-keys/boot_signing.pem`. Phase 2 is complete;
-remaining work is backlog (`sg_launch_core1_ns`, `sg_deep_sleep`,
-secure-stack sealing). This directory holds the shared contract between
+remaining work is backlog (see `docs/PHASE2-BACKLOG.md` for per-item
+status; `sg_launch_core1_ns` landed 2026-07-11, ABI 0x0002).
+This directory holds the shared contract between
 the two firmware images of a Secure/Non-secure split R2P2:
 
 - `include/r2p2_sg_api.h` — the Secure Gateway (veneer) API, compiled into
@@ -394,8 +395,8 @@ Gems that must change (or go) to fit the security model:
 | `picoruby-filesystem-fat` | unchanged | keeps calling `flash_range_program/erase`; the NS image `--wrap`s them (`ns/flash_ns.c` → bootrom `checked_flash_op`, partition-checked against NS_W, + `sg_flash_flush_cache()` since the ROM op does no cache maintenance and the ROM flush is Arm-S-only). NB: this gem's ports are excluded from the non-WiFi build anyway (littlefs is used) — the wrap covers whichever HAL is compiled. |
 | `picoruby-littlefs` | unchanged | same coverage via `ns/flash_ns.c` |
 | `picoruby-mbedtls` | unchanged | `mbedtls_hardware_poll` → `get_rand_64` is covered by the `get_rand_*` `--wrap`; raw-key `Cipher` API unchanged by design |
-| `picoruby-psg` | compiles; runtime-limited | its Ruby-binding `src/psg.c` is compiled into `libmruby.a` and references the port symbols, so the ports **cannot** be dropped at the R2P2-CMake level without a link error. Left compiled; its core-1 launch will fault at runtime until `sg_launch_core1_ns()` exists (phase 2). Truly excluding it needs a TZ-specific mruby build_config that drops the gem from the VM. |
-| `picoruby-pitchdetector` | compiles; runtime-limited | same coupling as psg |
+| `picoruby-psg` | **excluded from TZ builds** | dropped in both halves (backlog item 2, 2026-07-11): the `-tz` build configs remove the gem from `libmruby.a` and the R2P2 CMake removes its port sources (whose pre-main constructor `--gc-sections` would keep). The `sg_launch_core1_ns()` veneer now exists (backlog item 1), so re-adding psg is possible once its port calls the veneer instead of `multicore_launch_core1` and its core-1 loop is audited for the designated-NS-core model. |
+| `picoruby-pitchdetector` | not in the VM | no build config includes the gem; its unreferenced port objects are gc'd. Uses no core 1 (ADC+DMA). |
 | `picoruby-cyw43` / `-net` / `-socket` / `-ble` (pico2_w) | **defer/audit** | driver itself uses PIO/DMA/GPIO (all NS-granted incl. NSMASK bits); the lwIP/mbedTLS `pico_rand`→TRNG hazard is covered by the `ns/rand_ns.c` override. Remaining: general audit. Phase 1 targets plain pico2. |
 | `picoruby-watchdog` | unchanged | WATCHDOG NS-granted; tick already running (monitor) |
 | `picoruby-gpio/-uart/-i2c/-spi/-adc/-pwm/-pio/-irq/-usb-hid/-io-console` | unchanged | peripherals NS-granted, IRQs in ITNS |
@@ -403,11 +404,13 @@ Gems that must change (or go) to fit the security model:
 
 ## Known open items
 
-- Core 1: bootrom launch protocol is Secure-side; NS needs an
-  `sg_launch_core1_ns()` veneer (see header TODO) or PSG/pitchdetector
-  stay disabled in the first cut. `ACCESSCTRL_FORCE_CORE_NS` pins core 1
-  NS at the bus level — the datasheet explicitly endorses "all Secure
-  services run on core 0" schemes (§10.6.2).
+- Core 1: DONE (backlog item 1, 2026-07-11). `partition_configure` pins
+  `ACCESSCTRL_FORCE_CORE_NS.CORE1` (the datasheet's designated-NS-core
+  scheme, §10.6.2) and `sg_launch_core1_ns()` resets/launches/parks core 1
+  via the bootrom mailbox. Veneer entry is serialized by a try-lock
+  (`SG_ERR_BUSY` on contention); core 1 cannot call veneers at all — its
+  first Secure-bus access faults. `TZ.selftest` covers launch/park/
+  relaunch + parameter rejection.
 - Secure stack sealing (store `0xfef5eda5` at the Secure stack limits, per
   Arm's TrustZone-M recommendations) belongs in the monitor crt0/startup.
 - `Machine.deep_sleep` / vreg / clock dialing touch S-only peripherals →
