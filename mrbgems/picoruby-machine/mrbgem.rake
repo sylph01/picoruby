@@ -20,5 +20,9 @@ MRuby::Gem::Specification.new('picoruby-machine') do |spec|
     if build.posix?
       spec.add_dependency 'mruby-io'
     end
+    # This gem implements mruby-task's HAL (hal.h aliases picorb_hal_* to
+    # mrb_hal_task_*); depend on it so task_hal.h — the contract being
+    # implemented, including mrb_task_switch_reason — is on the include path.
+    spec.add_dependency 'mruby-task', gemdir: "#{MRUBY_ROOT}/mrbgems/picoruby-mruby/lib/mruby/mrbgems/mruby-task"
   end
 end

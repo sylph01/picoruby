@@ -200,9 +200,10 @@ picorb_hal_idle_cpu(mrb_state *mrb)
 
 #if defined(PICORB_VM_MRUBY)
 void
-picorb_hal_task_switch_hook(mrb_state *mrb)
+picorb_hal_task_switch_hook(mrb_state *mrb, mrb_task_switch_reason reason)
 {
   (void)mrb;
+  (void)reason;
   /* Nothing to service on this platform */
 }
 #endif

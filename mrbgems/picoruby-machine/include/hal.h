@@ -35,10 +35,11 @@ extern "C" {
 
 #if defined(PICORB_VM_MRUBY)
 #include "mruby.h"
+#include "task_hal.h" /* the HAL contract this gem implements (mrb_task_switch_reason) */
 void picorb_tick(mrb_state *mrb);
 void picorb_hal_init(mrb_state *mrb);
 void picorb_hal_idle_cpu(mrb_state *mrb);
-void picorb_hal_task_switch_hook(mrb_state *mrb);
+void picorb_hal_task_switch_hook(mrb_state *mrb, mrb_task_switch_reason reason);
 #elif defined(PICORB_VM_MRUBYC)
 void picorb_tick();
 void picorb_hal_init(void);
