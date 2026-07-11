@@ -11,45 +11,53 @@ Items are roughly independent unless a dependency is noted. Each lists
 
 ## 1. `sg_launch_core1_ns()` — core-1 NS launch (+ veneer reentrancy)
 
-**Reentrancy guard DONE + device-verified; core-1 LAUNCH FAILS ON DEVICE
-(2026-07-11), needs a design fix.** What passed on the new pico2 board
-(unsealed, image 4ff86745): the try-lock reentrancy guard (`SG_ERR_BUSY`,
-`sg_version` exempt, bodies renamed `*_locked`) — every other veneer in
-`TZ.selftest` still passes 39/39 through it — and the launch **parameter
-rejection** (secure-vtor and odd-sp both correctly `BAD_PARAM`). The
-monitor's bounded waits also proved out: a non-responding core 1 returns
-`SG_ERR_INTERNAL` and core 0 / the VM stay fully alive (no Secure hang).
+**DONE + device-verified (2026-07-11, probe pico2 board). Full
+launch/park/relaunch cycle PASSES** (`TZ.selftest` RESULT: PASSED, twice in
+one boot): launch → NS entry runs on core 1 → deep-sleep gated
+`NOT_PERMITTED` while core 1 is up → park → relaunch → runs again → park.
 
-What FAILS: the actual launch/park/relaunch (6 checks). `sg_launch_core1_ns`
-does not return `SG_OK`; core 1 never runs the NS entry. Root cause
-(high confidence, from the RP2350 bootrom source `arm8_bootrom_rt0.S`):
-the current design pins `FORCE_CORE_NS.CORE1` in `partition_configure`
-and then hands `ns_entry` straight to the bootrom mailbox — but
-  (a) the bootrom's core-1 wait/handshake loop executes from the **Secure**
-      bootrom and mailboxes via the **Secure** SIO alias (`SIO_BASE`
-      0xd0000000). A forced-NS core doing an NS-attributed access to the
-      Secure SIO alias (or NS instruction fetch from Secure ROM) bus-errors
-      → core 1 locks up before it can echo the handshake → our pop times
-      out → `SG_ERR_INTERNAL`; and
-  (b) even without the force bit, the bootrom finishes with `blx r6` to the
-      supplied PC. A plain BLX from Secure state to an NS address (ns_entry
-      is in the SAU-NS region) is an illegal transition (needs BLXNS), so a
-      direct-to-NS launch can't work this way regardless.
-**Fix direction:** launch core 1 through the normal Secure bootrom
-handshake into a monitor-resident **Secure trampoline** (not directly to
-ns_entry); the trampoline sets NS VTOR/MSP_NS and does the S→NS
-`cmse_nonsecure_call`/BXNS into ns_entry itself — exactly how core 0's
-`ns_launch` (main.c) already crosses into NS. Re-decide whether
-FORCE_CORE_NS belongs at all (it breaks the pre-launch bootrom handshake
-if set early; it could be applied by the trampoline just before BXNS, or
-dropped in favor of the architectural S→NS transition). This is a design
-change on a security boundary — deferred for a deliberate redo, not a
-quick patch. ABI already bumped to 0x0002 (`SG_ERR_BUSY`); keep it.
+**Design that shipped (Secure trampoline; FORCE_CORE_NS dropped):**
+`FORCE_CORE_NS.CORE1` was architecturally broken with the bootrom launch
+(a forced-NS core bus-errors on the Secure ROM/SIO handshake; and a plain
+bootrom `blx` into an NS address is an illegal S→NS transition). Instead,
+core 1 is launched through the ordinary Secure bootrom mailbox into a
+monitor-resident Secure trampoline (`core1_ns_trampoline`, main.c) which
+configures core 1's **banked** SAU + NSACR/CPACR identically to core 0's
+(shared helpers `tz_sau_configure_ns_regions` / `tz_grant_ns_coprocessors`),
+sets NS VTOR/MSP_NS, and BXNSes into the caller's entry. Veneer
+(`sg_veneers.c`) validates NS-range/alignment and delegates via
+`tz_core1.h`. Every launch starts with a PSM `FRCE_OFF` PROC1 pulse, so
+park/relaunch and payload replacement all go through one path.
+
+**RCP salt lessons (expensive to learn, do not repeat):**
+- Core 1's RCP salt is seeded once by the bootrom at cold boot (core 0
+  writes both cores' salts, `varm_boot_path.c` step 4) and **survives PSM
+  FRCE_OFF PROC1 pulses** — the SDK's `multicore_reset_core1`/relaunch has
+  no RCP handling at all and relies on exactly that. Relaunch after PSM
+  reset therefore needs no seeding.
+- Runtime re-seeding from core 0 (`mcrr p7,#8,…,c1`) is FATAL when the salt
+  is already valid: core 0 stalls forever mid-`mcrr`, un-haltable even over
+  SWD (memory reads via the bus AP still work — that's how the breadcrumb
+  was recovered). Never write the salt outside the bootrom cold path.
+- The "core 1 stuck at `wait_for_rcp_salt`" state that motivated seeding is
+  a **debug-probe artifact**: openocd's per-core resets clear core 1's RCP
+  while core 0's stays valid, so the bootrom's seed-skip (`bmi` on
+  canarystatus) leaves core 1 salt-less. In that state the launch fails
+  bounded (`SG_ERR_INTERNAL`, core 0 and the VM stay alive). Recovery: any
+  full-chip reset — physical POR or watchdog trigger
+  (`mww 0x40018008 0x01fffff3; mww 0x400da000 0x80000000` over SWD, NOT
+  openocd `reset`). After openocd `program … reset exit` the artifact state
+  is present; always watchdog-reboot before exercising the launch.
+
+ABI: SG_API_VERSION 0x0003 (`sg_launch_core1_ns`, `sg_deep_sleep`,
+`sg_aon_*`). Reentrancy try-lock guards (`SG_ERR_BUSY`) shipped earlier and
+re-verified through the full selftest.
 
 - **What:** a veneer that launches core 1 into Non-secure state. The
   bootrom's core-1 launch protocol runs Secure-side, so NS cannot start
-  core 1 itself. The monitor pins core 1 Non-secure
-  (`ACCESSCTRL FORCE_CORE_NS.CORE1`) and releases it into a given NS entry.
+  core 1 itself. The monitor launches core 1 into a Secure trampoline that
+  mirrors core 0's S→NS crossing (banked SAU + coprocessor grants, then
+  BXNS) — no bus-level FORCE_CORE_NS.
 - **Why:** picoruby-psg / pitchdetector launch core 1 at runtime; under TZ
   that faults today. Also any future move of cyw43 to core 1 for
   throughput.

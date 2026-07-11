@@ -37,7 +37,11 @@
 #include "pico/bootrom.h"
 #include "pico/sha256.h"
 #include "boot/bootrom_constants.h"
+#include "hardware/sync.h"
 #include "hardware/structs/sau.h"
+#include "hardware/structs/scb.h"
+#include "hardware/structs/sio.h"
+#include "hardware/structs/psm.h"
 #include "hardware/structs/accessctrl.h"
 #include "hardware/structs/nvic.h"
 #include "hardware/structs/m33.h"
@@ -51,6 +55,7 @@
 
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_tz_config.h"  /* memory map, clock contract, TZ_NS_DMA_CHANNELS */
+#include "tz_core1.h"
 #include "keystore.h"
 #include "tz_diag.h"
 
@@ -65,7 +70,7 @@
  * the faulting-PC nibble read-out. Compiled out for probe boards and for
  * production. */
 
-static tz_diag_t tz_diag __attribute__((section(".tz_diag"), used));
+static volatile tz_diag_t tz_diag __attribute__((section(".tz_diag"), used));
 
 static void __attribute__((noreturn)) diag_halt(void);
 
@@ -293,14 +298,21 @@ static void sau_region(uint32_t region, uint32_t base, uint32_t last, bool nsc) 
                  | M33_SAU_RLAR_ENABLE_BITS;
 }
 
-static void partition_configure(void) {
-    /* SAU: three regions; background stays Secure (monitor flash, SRAM8/9).
-     * Region 7 (bootrom) untouched. SAU is already enabled by the bootrom,
-     * but reasserting CTRL is harmless and self-documenting. */
+/* Program the SAU's three NS regions and enable it (ALLNS=0, background
+ * Secure). The SAU is banked per core, so this configures whichever core
+ * runs it — core 0 in partition_configure, core 1 in its NS trampoline —
+ * from one source of truth. Region 7 (bootrom) untouched. */
+static void tz_sau_configure_ns_regions(void) {
     sau_region(0, TZ_SG_NSC_BASE, TZ_SG_NSC_LAST, true);   /* veneers: S+NSC */
     sau_region(1, TZ_NS_FLASH_BASE, TZ_NS_FLASH_LAST, false); /* NS code+FS  */
     sau_region(2, TZ_NS_RAM_BASE, TZ_NS_RAM_LAST, false);     /* NS RAM      */
-    sau_hw->ctrl = M33_SAU_CTRL_ENABLE_BITS;               /* ALLNS=0 */
+    sau_hw->ctrl = M33_SAU_CTRL_ENABLE_BITS;
+}
+
+static void partition_configure(void) {
+    /* SAU (this core = core 0). Already enabled by the bootrom, but
+     * reasserting is harmless and self-documenting. */
+    tz_sau_configure_ns_regions();
 
     /* ACCESSCTRL, memory side: strip NS from the monitor's SRAM banks.
      * They reset to 0xff (NS-accessible), and the SAU only filters the CPU —
@@ -413,18 +425,17 @@ static void partition_configure(void) {
     rom_set_ns_api_permission(BOOTROM_NS_API_get_sys_info, true);
     rom_set_ns_api_permission(BOOTROM_NS_API_reboot, true);
 
-    /* Designate core 1 as the Non-secure core (FORCE_CORE_NS, §10.6):
-     * every bus access core 1 ever makes is attributed Non-secure no
-     * matter its architectural state, so nothing that runs there — the
-     * bootrom wait loop included — can reach monitor flash/RAM, Secure
-     * peripherals, or the veneers. sg_launch_core1_ns releases it into an
-     * NS entry via the bootrom mailbox (the core-1 bootrom is
-     * security-aware and mailboxes through SIO_NONSEC when forced NS).
-     * Must be pinned HERE: the LOCK write below makes ACCESSCTRL ignore
-     * core 0 forever after, and CFGRESET deliberately cannot clear
-     * FORCE_CORE_NS. */
-    accessctrl_hw->force_core_ns = AC_PASSWORD
-                                 | ACCESSCTRL_FORCE_CORE_NS_CORE1_BITS;
+    /* Core 1 is deliberately NOT pinned Non-secure here (an earlier design
+     * set ACCESSCTRL FORCE_CORE_NS.CORE1). FORCE_CORE_NS forces core 1's
+     * bus accesses NS *unconditionally* — including while it executes its
+     * own bootrom launch loop, which runs from Secure ROM and mailboxes via
+     * the Secure SIO alias. Forced NS, core 1 bus-faults on that Secure
+     * ROM/SIO the instant it is released, so it can never complete the
+     * launch handshake (device-verified dead, 2026-07-11). Instead core 1
+     * is launched Secure into a monitor trampoline that does the S->NS
+     * transition itself (tz_core1_launch_ns); thereafter core 1's own
+     * banked SAU + ACCESSCTRL constrain it exactly as they do core 0's NS
+     * thread. See tz_core1.h / core1_ns_trampoline. */
 
     /* Freeze the configuration: further ACCESSCTRL writes from the cores
      * are ignored (LOCK bits are one-way until reset). DEBUG left unlocked
@@ -441,6 +452,20 @@ static void partition_configure(void) {
  * .vectors), i.e. at TZ_NS_FLASH_BASE. */
 typedef void (*ns_reset_fn)(void) __attribute__((cmse_nonsecure_call));
 
+/* Grant NS access to the coprocessors R2P2 uses, matching what the SDK's
+ * runtime_init_per_core_enable_coprocessors will then enable in CPACR_NS:
+ * CP10/CP11 FPU (R2P2 builds hard-float), CP4 DCP (the SDK's double-
+ * precision routines — the mruby VM is double-heavy), CP0 GPIO coprocessor.
+ * Without a grant the NS CPACR write is ineffective and the first use
+ * traps. CP7 (RCP) deliberately stays Secure. NSACR/CPACR are banked per
+ * core, so this grants for whichever core runs it. */
+static void tz_grant_ns_coprocessors(void) {
+    m33_hw->nsacr |= M33_NSACR_CP0_BITS | M33_NSACR_CP4_BITS
+                   | M33_NSACR_CP10_BITS | M33_NSACR_CP11_BITS;
+    m33_ns_hw->cpacr |= M33_CPACR_CP0_BITS | M33_CPACR_CP4_BITS
+                      | M33_CPACR_CP10_BITS | M33_CPACR_CP11_BITS;
+}
+
 static void __attribute__((noreturn)) ns_launch(void) {
     const uint32_t *ns_vtor = (const uint32_t *)TZ_NS_FLASH_BASE;
 
@@ -448,24 +473,16 @@ static void __attribute__((noreturn)) ns_launch(void) {
     m33_ns_hw->vtor = (uintptr_t)ns_vtor;
     __asm volatile ("msr msp_ns, %0" :: "r" (ns_vtor[0]));
 
-    /* Coprocessor grants to NS (NSACR), matching what the SDK's
-     * runtime_init_per_core_enable_coprocessors will then enable in
-     * CPACR_NS: CP10/CP11 FPU (R2P2 builds hard-float), CP4 DCP (the SDK's
-     * double-precision routines — the mruby VM is double-heavy), CP0 GPIO
-     * coprocessor. Without a grant the NS CPACR write is ineffective and
-     * the first use traps. CP7 (RCP) deliberately stays Secure. */
-    m33_hw->nsacr |= M33_NSACR_CP0_BITS | M33_NSACR_CP4_BITS
-                   | M33_NSACR_CP10_BITS | M33_NSACR_CP11_BITS;
-    m33_ns_hw->cpacr |= M33_CPACR_CP0_BITS | M33_CPACR_CP4_BITS
-                      | M33_CPACR_CP10_BITS | M33_CPACR_CP11_BITS;
+    tz_grant_ns_coprocessors();
 
     /* AIRCR defaults kept: BFHFNMINS=0 (bus/hard faults target Secure),
      * SYSRESETREQS=0 (NS may request system reset — the watchdog is NS
      * anyway and any reset re-enters secure boot).
      * TODO: seal the Secure stacks (store 0xfef5eda5 at the stack limits,
      * ARM stack-sealing recommendation) in crt0/startup.
-     * Core 1: pinned NS in partition_configure (FORCE_CORE_NS); NS starts
-     * it with the sg_launch_core1_ns veneer. */
+     * Core 1: NS starts it with the sg_launch_core1_ns veneer, which
+     * launches it Secure into core1_ns_trampoline (below) — the same
+     * S->NS transition this function does for core 0. */
 
     diag_stage(TZ_STAGE_NS_LAUNCHED); /* (F) SCS setup survived — blxns next */
     led_set(true);
@@ -476,6 +493,136 @@ static void __attribute__((noreturn)) ns_launch(void) {
     ns_reset_fn ns_reset = (ns_reset_fn)(uintptr_t)ns_vtor[1];
     ns_reset();
     __builtin_unreachable();
+}
+
+/* ---- core 1 (Non-secure) launch ----------------------------------------- */
+
+/* Inter-core FIFO helpers (bootrom mailbox). ~10M spins ≈ a few hundred ms
+ * at 150 MHz; the bootrom answers in microseconds, the margin covers NS
+ * IRQs preempting the handshake. Bounded so a wedged core 1 is an error,
+ * never a Secure hang. */
+#define CORE1_FIFO_SPINS 10000000u
+
+static bool core1_fifo_push(uint32_t val) {
+    for (uint32_t spins = CORE1_FIFO_SPINS; spins; spins--) {
+        if (sio_hw->fifo_st & SIO_FIFO_ST_RDY_BITS) {
+            sio_hw->fifo_wr = val;
+            __sev();
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool core1_fifo_pop(uint32_t *out) {
+    for (uint32_t spins = CORE1_FIFO_SPINS; spins; spins--) {
+        if (sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS) {
+            *out = sio_hw->fifo_rd;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void core1_fifo_drain(void) {
+    while (sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS) (void)sio_hw->fifo_rd;
+}
+
+/* NS entry params handed to the trampoline. Core-1 launch is serialized by
+ * the veneer try-lock, so a single slot suffices. Secure RAM (SRAM8/9,
+ * AC_SECURE_ONLY) — the trampoline reads it while still Secure; NS never
+ * touches it. */
+static struct {
+    uintptr_t ns_vtor;
+    uintptr_t ns_entry;
+    uintptr_t ns_stack_top;
+} core1_ns;
+
+/* Secure stack for the trampoline (bootrom sets SP to this before jumping).
+ * The trampoline's deepest path is trampoline -> tz_sau_configure_ns_regions
+ * -> sau_region, ~32 B of frames; 80 B is comfortable margin. Kept small
+ * because RAM_S (SRAM8/9) is only 8 KiB and nearly full. Nothing preempts
+ * the ~dozen-instruction Secure trampoline (core 1 has no NVIC sources
+ * enabled yet), so no exception frame lands here. */
+static uint32_t core1_tramp_stack[20] __attribute__((aligned(8)));
+
+/* Runs on core 1 in Secure state — the bootrom launched it here. Mirror
+ * core 0's crossing into NS: configure core 1's banked SAU and coprocessor
+ * grants, point NS VTOR/MSP at the caller's entry, then BXNS. Everything
+ * before the transition is trusted monitor code executing Secure; after it
+ * core 1 is genuinely Non-secure and its own SAU + ACCESSCTRL constrain it. */
+static void __attribute__((noreturn)) core1_ns_trampoline(void) {
+    tz_sau_configure_ns_regions();   /* core 1's banked SAU (same as core 0) */
+    tz_grant_ns_coprocessors();      /* core 1's banked NSACR/CPACR          */
+
+    m33_ns_hw->vtor = core1_ns.ns_vtor;
+    __asm volatile ("msr msp_ns, %0" :: "r" (core1_ns.ns_stack_top));
+
+    ns_reset_fn ns_entry = (ns_reset_fn)core1_ns.ns_entry;
+    ns_entry();                      /* BXNS into the NS entry point */
+    __builtin_unreachable();
+}
+
+/* Whether a payload is live on core 1 (deep-sleep gate). */
+static bool core1_running;
+
+/* Core 1's RCP salt: seeded once by the bootrom at cold boot (varm_boot_path
+ * step 4, core 0 writes both cores' salts) and NOT cleared by a PSM
+ * FRCE_OFF PROC1 pulse — the SDK's multicore_reset_core1/relaunch relies on
+ * exactly that. So after our reset pulse core 1 skips wait_for_rcp_salt and
+ * parks in wait_for_vector. Do NOT try to (re)seed it from here: a runtime
+ * mcrr p7,#8,…,c1 with the salt already valid stalls core 0 forever
+ * (device-verified: wedged un-haltable mid-mcrr, breadcrumb 0x11). The one
+ * state where core 1 does wait for a salt is debugger-induced (openocd
+ * per-core resets clear core 1's RCP while core 0's stays valid); that
+ * shows up as a bounded SG_ERR_INTERNAL below and a physical POR fixes it. */
+
+int tz_core1_launch_ns(uintptr_t ns_vtor, uintptr_t ns_entry,
+                       uintptr_t ns_stack_top) {
+    /* Hard-reset core 1 (PSM FRCE_OFF pulse; readback fences the APB store
+     * buffer) to a known bootrom state, killing any previous payload. */
+    hw_set_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
+    while (!(psm_hw->frce_off & PSM_FRCE_OFF_PROC1_BITS)) tight_loop_contents();
+    core1_fifo_drain();
+    hw_clear_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
+    core1_running = false;
+
+    uint32_t v;
+    if (!core1_fifo_pop(&v)) return SG_ERR_INTERNAL;
+
+    if (ns_entry == 0) return SG_OK; /* parked in the bootrom wait loop */
+
+    core1_ns.ns_vtor      = ns_vtor;
+    core1_ns.ns_entry     = ns_entry;
+    core1_ns.ns_stack_top = ns_stack_top;
+
+    /* Bootrom mailbox launch protocol (datasheet §5.3; same sequence as the
+     * SDK's multicore_launch_core1_raw). We launch core 1 into the SECURE
+     * trampoline — monitor VTOR, monitor Secure stack — not straight to the
+     * NS entry: a plain bootrom `blx` into an NS address would be an illegal
+     * S->NS transition. The trampoline does the transition properly. Each
+     * word is echoed; a wrong echo restarts the sequence. Bounded overall. */
+    const uint32_t seq[] = {
+        0, 0, 1,
+        scb_hw->vtor,                                        /* trampoline VTOR */
+        (uintptr_t)&core1_tramp_stack[count_of(core1_tramp_stack)],
+        (uintptr_t)core1_ns_trampoline | 1u,                 /* thumb bit */
+    };
+    uint32_t seq_i = 0;
+    for (uint32_t attempts = 64; seq_i < count_of(seq); attempts--) {
+        if (!attempts) return SG_ERR_INTERNAL;
+        uint32_t cmd = seq[seq_i];
+        if (!cmd) {
+            core1_fifo_drain();
+            __sev(); /* core 1 may be waiting for FIFO space via WFE */
+        }
+        if (!core1_fifo_push(cmd)) return SG_ERR_INTERNAL;
+        uint32_t resp;
+        if (!core1_fifo_pop(&resp)) return SG_ERR_INTERNAL;
+        seq_i = (cmd == resp) ? seq_i + 1 : 0;
+    }
+    core1_running = true;
+    return SG_OK;
 }
 
 int main(void) {

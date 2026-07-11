@@ -296,6 +296,8 @@ static void t_core1(void) {
     t_core1_flag = 0;
     t_check("launch_core1", sg_launch_core1_ns(vtor, entry, sp) == SG_OK);
     t_check("core 1 ran the NS entry", t_core1_wait_flag());
+    t_check("deep_sleep gated while core 1 up = NOT_PERMITTED",
+            sg_deep_sleep(SG_SLEEP_DORMANT_FOR_SECS, 1) == SG_ERR_NOT_PERMITTED);
     t_check("park core 1", sg_launch_core1_ns(0, 0, 0) == SG_OK);
 
     t_core1_flag = 0;

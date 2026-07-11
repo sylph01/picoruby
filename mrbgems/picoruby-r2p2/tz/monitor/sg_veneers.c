@@ -41,13 +41,12 @@
 #include "hardware/pll.h"
 #include "hardware/powman.h"
 #include "hardware/xosc.h"
-#include "hardware/structs/psm.h"
-#include "hardware/structs/sio.h"
 #include "pico/runtime_init.h"
 
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_tz_config.h"
 #include "../include/r2p2_mrb_envelope.h"
+#include "tz_core1.h"
 #include "keystore.h"
 #include "sg_crypto.h"
 #include "mrb_pubkey.h"
@@ -419,53 +418,21 @@ static int sg_verify_mrb_locked(const uint8_t *pkg, size_t pkg_len) {
 
 /* ---- core 1 ---------------------------------------------------------------- */
 
-/* Core 1 is the designated NS core (FORCE_CORE_NS pinned in
- * partition_configure): its bus is NS forever, so handing it any entry
- * point — even a Secure address — gives away nothing; a bad target just
- * faults on core 1's side. The parameter checks below are therefore
- * correctness courtesy, not a security boundary. The security-relevant
- * parts are (a) PSM and the mailbox run Secure-side only, so NS cannot
- * launch/reset core 1 behind the monitor's back, and (b) the bounded
- * waits, so a wedged core 1 costs the caller an error, not a Secure-state
- * hang. */
-
-/* ~10M spins ≈ a few hundred ms at 150 MHz — the bootrom responds in
- * microseconds; the margin is for NS IRQs preempting us mid-handshake. */
-#define CORE1_FIFO_SPINS 10000000u
-
-static bool core1_fifo_push(uint32_t val) {
-    for (uint32_t spins = CORE1_FIFO_SPINS; spins; spins--) {
-        if (sio_hw->fifo_st & SIO_FIFO_ST_RDY_BITS) {
-            sio_hw->fifo_wr = val;
-            __sev();
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool core1_fifo_pop(uint32_t *out) {
-    for (uint32_t spins = CORE1_FIFO_SPINS; spins; spins--) {
-        if (sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS) {
-            *out = sio_hw->fifo_rd;
-            return true;
-        }
-    }
-    return false;
-}
-
-static void core1_fifo_drain(void) {
-    while (sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS) (void)sio_hw->fifo_rd;
-}
+/* The launch machinery (bootrom mailbox + the Secure S->NS trampoline)
+ * lives in main.c next to partition_configure/ns_launch, so core 1's SAU
+ * and coprocessor setup share one source of truth with core 0's. This
+ * veneer owns only the NS-facing contract: validate the caller's pointers
+ * (core 1 runs genuine NS code now, so a bad entry is a real fault to
+ * prevent, not cosmetic), then delegate. */
 
 static bool ns_exec_addr_ok(uintptr_t a) {
     return (a >= TZ_NS_FLASH_BASE && a <= TZ_NS_FLASH_LAST)
         || (a >= TZ_NS_RAM_BASE && a <= TZ_NS_RAM_LAST);
 }
 
-/* sg_deep_sleep refuses while core 1 is out running NS code (the monitor
- * cannot quiesce a forced-NS core, and a core executing from flash/SRAM
- * while the clock tree is torn down is undefined behavior territory). */
+/* sg_deep_sleep refuses while core 1 is out running NS code: the monitor
+ * cannot quiesce it, and a core executing from flash/SRAM while the clock
+ * tree is torn down is undefined-behavior territory. */
 static bool core1_launched;
 
 static int sg_launch_core1_ns_locked(uintptr_t vtor, uintptr_t entry,
@@ -478,43 +445,9 @@ static int sg_launch_core1_ns_locked(uintptr_t vtor, uintptr_t entry,
             stack_top > TZ_NS_RAM_LAST + 1u) return SG_ERR_BAD_PARAM;
     }
 
-    /* Hard-reset core 1 (PSM FRCE_OFF pulse, same sequence as the SDK's
-     * multicore_reset_core1; readback fences the APB store buffer). Kills
-     * any previous payload; core 1 re-enters the bootrom wait loop. */
-    hw_set_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
-    while (!(psm_hw->frce_off & PSM_FRCE_OFF_PROC1_BITS)) tight_loop_contents();
-    core1_fifo_drain();
-    hw_clear_bits(&psm_hw->frce_off, PSM_FRCE_OFF_PROC1_BITS);
-
-    /* Out of reset, core 1's bootrom drains its FIFO and pushes a 0. */
-    uint32_t v;
-    if (!core1_fifo_pop(&v)) return SG_ERR_INTERNAL;
-
-    if (entry == 0) { /* parked in the bootrom wait loop */
-        core1_launched = false;
-        return SG_OK;
-    }
-
-    /* Bootrom mailbox launch protocol (datasheet §5.3; same sequence as
-     * the SDK's multicore_launch_core1_raw): each word is echoed back, a
-     * wrong echo restarts the sequence. Bounded overall so a
-     * never-syncing core 1 returns an error instead of wedging us. */
-    const uint32_t seq[] = { 0, 0, 1, vtor, stack_top, entry | 1u };
-    uint32_t seq_i = 0;
-    for (uint32_t attempts = 64; seq_i < count_of(seq); attempts--) {
-        if (!attempts) return SG_ERR_INTERNAL;
-        uint32_t cmd = seq[seq_i];
-        if (!cmd) {
-            core1_fifo_drain();
-            __sev(); /* core 1 may be waiting for FIFO space via WFE */
-        }
-        if (!core1_fifo_push(cmd)) return SG_ERR_INTERNAL;
-        uint32_t resp;
-        if (!core1_fifo_pop(&resp)) return SG_ERR_INTERNAL;
-        seq_i = (cmd == resp) ? seq_i + 1 : 0;
-    }
-    core1_launched = true;
-    return SG_OK;
+    int rc = tz_core1_launch_ns(vtor, entry, stack_top);
+    if (rc == SG_OK) core1_launched = (entry != 0);
+    return rc;
 }
 
 /* ---- deep sleep / AON wall clock ------------------------------------------- */
