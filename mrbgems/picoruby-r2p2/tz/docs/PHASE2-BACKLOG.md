@@ -88,12 +88,24 @@ core-1 loop.
 
 ## 3. `sg_deep_sleep()` + `sg_aon_*`
 
-**DONE + partially device-verified (2026-07-11).** On the new pico2
-board, `TZ.selftest` passes the AON checks — clock live, monotonic
-advance under a busy wait, NULL/menu-arg rejection — and `sg_deep_sleep`
-argument validation. The dormant nap itself (`Machine.sleep`) is still
-the manual irb test (drops USB, re-enumerates); not yet exercised on
-this board. Fixed menu:
+**AON + validation device-verified PASS; dormant nap FAILS on device —
+and it takes the USB HUB down with it (2026-07-11, two boards).**
+`TZ.selftest` passes the AON checks (clock live, monotonic advance,
+NULL/menu-arg rejection) and `sg_deep_sleep` argument validation on
+device. But `Machine.sleep 3` reproduces on BOTH spare pico2 boards:
+CDC never returns, and — decisive observation from attempt 2 with a
+healthy host — the ENTIRE USB hub the board is on drops (every sibling
+device vanishes; on this rig Bus 003 is internal to the PC → host
+reboot to recover). Root-cause hypothesis (high confidence): the veneer
+stops `clk_usb` with the USB pull-up still attached and a transaction
+possibly in flight; the electrically-frozen device wedges the hub. The
+stock RP2350 sleep path shares the gap (upstream comment says deep
+sleep "doesn't work yet"; never exercised with USB attached).
+**Fix candidate:** NS-side clean detach in `sleep_ns.c` —
+`tud_disconnect()` before `sg_deep_sleep`, USB re-init/`tud_connect()`
+after wake. Then SWD PC-sample a stuck board (probe on a DIFFERENT hub
+than the target!) to check whether the monitor-side wake path also
+sticks, before trusting the recipe. Fixed menu:
 `sg_deep_sleep(SG_SLEEP_DORMANT_FOR_SECS, secs)` runs the pico-extras
 dormant recipe Secure-side (LPOSC + PLL/XOSC off + POWMAN alarm wake;
 PRIMASK_S held across the teardown; no vreg dialing yet); refuses while
