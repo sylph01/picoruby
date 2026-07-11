@@ -11,16 +11,40 @@ Items are roughly independent unless a dependency is noted. Each lists
 
 ## 1. `sg_launch_core1_ns()` — core-1 NS launch (+ veneer reentrancy)
 
-**DONE (2026-07-11), device verification pending.** Designated-NS-core
-scheme: `partition_configure` pins `FORCE_CORE_NS.CORE1` before the
-ACCESSCTRL lock; the veneer resets (PSM), launches (bootrom mailbox,
-bounded waits), or parks (`ns_entry == 0`) core 1. Reentrancy guard:
-try-lock at every veneer entry (`SG_ERR_BUSY`), `sg_version` exempt.
-ABI bumped to 0x0002. Note core 1 can never call veneers (bus pinned NS
-→ first Secure access faults); Secure services relay through core 0.
-`TZ.selftest` gained launch/park/relaunch + param-rejection checks —
-**run it on hardware before relying on this**: the forced-NS bootrom
-mailbox path is implemented per datasheet but not yet device-proven.
+**Reentrancy guard DONE + device-verified; core-1 LAUNCH FAILS ON DEVICE
+(2026-07-11), needs a design fix.** What passed on the new pico2 board
+(unsealed, image 4ff86745): the try-lock reentrancy guard (`SG_ERR_BUSY`,
+`sg_version` exempt, bodies renamed `*_locked`) — every other veneer in
+`TZ.selftest` still passes 39/39 through it — and the launch **parameter
+rejection** (secure-vtor and odd-sp both correctly `BAD_PARAM`). The
+monitor's bounded waits also proved out: a non-responding core 1 returns
+`SG_ERR_INTERNAL` and core 0 / the VM stay fully alive (no Secure hang).
+
+What FAILS: the actual launch/park/relaunch (6 checks). `sg_launch_core1_ns`
+does not return `SG_OK`; core 1 never runs the NS entry. Root cause
+(high confidence, from the RP2350 bootrom source `arm8_bootrom_rt0.S`):
+the current design pins `FORCE_CORE_NS.CORE1` in `partition_configure`
+and then hands `ns_entry` straight to the bootrom mailbox — but
+  (a) the bootrom's core-1 wait/handshake loop executes from the **Secure**
+      bootrom and mailboxes via the **Secure** SIO alias (`SIO_BASE`
+      0xd0000000). A forced-NS core doing an NS-attributed access to the
+      Secure SIO alias (or NS instruction fetch from Secure ROM) bus-errors
+      → core 1 locks up before it can echo the handshake → our pop times
+      out → `SG_ERR_INTERNAL`; and
+  (b) even without the force bit, the bootrom finishes with `blx r6` to the
+      supplied PC. A plain BLX from Secure state to an NS address (ns_entry
+      is in the SAU-NS region) is an illegal transition (needs BLXNS), so a
+      direct-to-NS launch can't work this way regardless.
+**Fix direction:** launch core 1 through the normal Secure bootrom
+handshake into a monitor-resident **Secure trampoline** (not directly to
+ns_entry); the trampoline sets NS VTOR/MSP_NS and does the S→NS
+`cmse_nonsecure_call`/BXNS into ns_entry itself — exactly how core 0's
+`ns_launch` (main.c) already crosses into NS. Re-decide whether
+FORCE_CORE_NS belongs at all (it breaks the pre-launch bootrom handshake
+if set early; it could be applied by the trampoline just before BXNS, or
+dropped in favor of the architectural S→NS transition). This is a design
+change on a security boundary — deferred for a deliberate redo, not a
+quick patch. ABI already bumped to 0x0002 (`SG_ERR_BUSY`); keep it.
 
 - **What:** a veneer that launches core 1 into Non-secure state. The
   bootrom's core-1 launch protocol runs Secure-side, so NS cannot start
@@ -64,7 +88,12 @@ core-1 loop.
 
 ## 3. `sg_deep_sleep()` + `sg_aon_*`
 
-**DONE (2026-07-11), device verification pending.** Fixed menu:
+**DONE + partially device-verified (2026-07-11).** On the new pico2
+board, `TZ.selftest` passes the AON checks — clock live, monotonic
+advance under a busy wait, NULL/menu-arg rejection — and `sg_deep_sleep`
+argument validation. The dormant nap itself (`Machine.sleep`) is still
+the manual irb test (drops USB, re-enumerates); not yet exercised on
+this board. Fixed menu:
 `sg_deep_sleep(SG_SLEEP_DORMANT_FOR_SECS, secs)` runs the pico-extras
 dormant recipe Secure-side (LPOSC + PLL/XOSC off + POWMAN alarm wake;
 PRIMASK_S held across the teardown; no vreg dialing yet); refuses while
