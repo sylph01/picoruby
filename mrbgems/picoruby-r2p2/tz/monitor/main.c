@@ -210,6 +210,14 @@ static const uint8_t tz_ns_irqs[] = {
     UART0_IRQ, UART1_IRQ,
     ADC_IRQ_FIFO,
     I2C0_IRQ, I2C1_IRQ,
+    /* Software-triggered user IRQs (SPAREIRQ_*): no hardware behind them,
+     * NS uses them as low-priority deferred-work vectors — the USB pump
+     * (machine.c usb_pump_worker) claims one via user_irq_claim_unused.
+     * Without ITNS routing, NS writes to their NVIC enable/pend bits are
+     * RAZ/WI and the pump silently never fires (device-found: USB never
+     * enumerates on the merged single-owner-tud_task image). */
+    FIRST_USER_IRQ + 0, FIRST_USER_IRQ + 1, FIRST_USER_IRQ + 2,
+    FIRST_USER_IRQ + 3, FIRST_USER_IRQ + 4, FIRST_USER_IRQ + 5,
 };
 
 /* ---- NS image verification ----------------------------------------------

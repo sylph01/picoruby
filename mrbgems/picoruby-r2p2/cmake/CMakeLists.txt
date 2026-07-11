@@ -298,6 +298,9 @@ if(PICORB_VM_MRUBY)
   add_compile_definitions(MRB_UTF8_STRING=1)
   target_include_directories(${PROJECT_NAME} PRIVATE
     ${PICORUBY_ROOT}/mrbgems/picoruby-mruby/lib/mruby/include
+    # picoruby-machine's hal.h implements mruby-task's HAL contract
+    # (task_hal.h, mrb_task_switch_reason)
+    ${PICORUBY_ROOT}/mrbgems/picoruby-mruby/lib/mruby/mrbgems/mruby-task/include
   )
 elseif(PICORB_VM_MRUBYC)
   add_compile_definitions(PICORB_VM_MRUBYC=1)
