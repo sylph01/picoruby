@@ -57,8 +57,9 @@ extern "C" {
 
 /* Bump on any ABI change. NS calls sg_version() at boot and refuses to run
  * against a mismatched monitor.
- * 0x0002: sg_launch_core1_ns, SG_ERR_BUSY + entry serialization. */
-#define SG_API_VERSION 0x0002
+ * 0x0002: sg_launch_core1_ns, SG_ERR_BUSY + entry serialization.
+ * 0x0003: sg_deep_sleep, sg_aon_get_ms/sg_aon_set_ms. */
+#define SG_API_VERSION 0x0003
 
 /* noipa: GCC's IPA passes otherwise clone entry functions into local
  * `*.constprop.N` symbols (e.g. when a stub ignores its arguments), and
@@ -273,11 +274,44 @@ SG_API int sg_verify_mrb(const uint8_t *pkg, size_t pkg_len);
 SG_API int sg_launch_core1_ns(uintptr_t ns_vector_table, uintptr_t ns_entry,
                               uintptr_t ns_stack_top);
 
-/* Deep sleep / clock dialing: CLOCKS/PLL/POWMAN stay Secure-only, so
- * Machine.deep_sleep needs a veneer with a fixed menu of states rather than
- * raw register access.
- * SG_API int sg_deep_sleep(uint32_t mode, uint32_t wake_mask);
- */
+/* Deep sleep. CLOCKS/PLL/XOSC/ROSC/POWMAN stay Secure-only, so
+ * Machine.sleep's low-power path cannot run from NS; this veneer offers a
+ * fixed MENU of sleep states rather than raw register access. New states
+ * are new enum values — the signature never changes (same extensibility
+ * rule as sg_key_slot).
+ *
+ * SG_SLEEP_DORMANT_FOR_SECS: the pico-extras dormant recipe, Secure-side:
+ * clocks down to LPOSC, PLLs deinit, XOSC off, POWMAN alarm at now+arg
+ * seconds as the wake event, ROSC dormant. On wake the monitor restores
+ * the full clock tree (clk_sys back to the boot configuration — the
+ * r2p2_tz_config clock contract still holds on return) and re-anchors the
+ * POWMAN tick source on XOSC. Returns with the wall clock (sg_aon_*)
+ * having advanced by the sleep duration; TIMER0 (NS time_us_64) does NOT
+ * advance while dormant — same as stock.
+ *
+ * Caller notes: NS should quiesce first (flush CDC output, pause its tick
+ * alarm) — USB drops off the bus while clk_usb is stopped and the host
+ * will re-enumerate after wake, exactly like the stock RP2350
+ * Machine.sleep path. Do not call with core 1 launched: core 1 is not
+ * quiesced by the monitor (park it first via sg_launch_core1_ns(0,0,0));
+ * the veneer refuses (SG_ERR_NOT_PERMITTED) if core 1 has been launched
+ * and not parked since boot. arg = seconds, 1..SG_SLEEP_MAX_SECS. */
+enum sg_sleep_mode {
+  SG_SLEEP_DORMANT_FOR_SECS = 1,
+};
+#define SG_SLEEP_MAX_SECS (7u * 24u * 3600u) /* sanity cap: one week */
+
+SG_API int sg_deep_sleep(uint32_t mode, uint32_t arg);
+
+/* Always-on wall clock over the Secure POWMAN AON timer (1 kHz). The
+ * monitor starts it at boot (tick source XOSC) and it keeps counting
+ * through sg_deep_sleep (tick source swaps to LPOSC while dormant) and
+ * watchdog reboots. ns/aon_ns.c wraps pico_aon_timer onto these, so
+ * Machine.set_hwclock / Time keep working and now survive deep sleep —
+ * the phase-1 TIMER0 software clock (which stopped during sleep) is
+ * replaced. Milliseconds; sub-ms of a set is truncated (1 kHz timer). */
+SG_API int sg_aon_get_ms(uint64_t *out_ms);
+SG_API int sg_aon_set_ms(uint64_t ms);
 
 #ifdef __cplusplus
 }

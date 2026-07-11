@@ -41,13 +41,16 @@ function(r2p2_apply_tz_ns TARGET)
     # flash_range_program with bootrom checked_flash_op calls (+ cache
     # flush via veneer), transitively fixing picoruby-filesystem-fat and
     # picoruby-littlefs.
-    # aon_ns.c: software wall clock (TIMER0) replacing pico_aon_timer, whose
-    # POWMAN backend is Secure-only (Machine.set_hwclock faults from NS).
+    # aon_ns.c: pico_aon_timer onto the sg_aon_* veneers (the monitor owns
+    # the POWMAN AON timer — Secure-only; survives deep sleep + reboots).
+    # sleep_ns.c: Machine.sleep onto sg_deep_sleep (CLOCKS/PLL/POWMAN
+    # dormant recipe runs Secure-side).
     target_sources(${TARGET} PRIVATE
         ${R2P2_TZ_NS_DIR}/runtime_init_ns.c
         ${R2P2_TZ_NS_DIR}/rand_ns.c
         ${R2P2_TZ_NS_DIR}/flash_ns.c
         ${R2P2_TZ_NS_DIR}/aon_ns.c
+        ${R2P2_TZ_NS_DIR}/sleep_ns.c
         ${R2P2_TZ_NS_DIR}/gpio_irq_ns.c # vector IO_IRQ_BANK0_NS to the SDK's IRQ-21 handlers
         ${R2P2_TZ_NS_DIR}/exit_ns.c   # _exit override: report + bkpt (probe-friendly halt)
         ${R2P2_TZ_NS_DIR}/tz_selftest.c # `TZ.selftest` in irb: phase-2 veneer exerciser
@@ -75,6 +78,7 @@ function(r2p2_apply_tz_ns TARGET)
         LINKER:--wrap=aon_timer_set_time
         LINKER:--wrap=aon_timer_get_time
         LINKER:--wrap=aon_timer_is_running
+        LINKER:--wrap=Machine_sleep
     )
 
     target_include_directories(${TARGET} PRIVATE
@@ -106,9 +110,8 @@ function(r2p2_apply_tz_ns TARGET)
     #  - picotool packaging: EXE_SECURITY=NS image type, combined-image
     #    signing with the monitor, partition table with the FS partition
     #    marked NS_R/NS_W.
-    #  - gem source substitutions for the TZ build (see tz/README.md
-    #    "NS build: gem impact"): machine sleep/time paths. (rng/mbedtls/
-    #    lwIP rand and both flash HALs are already covered by rand_ns.c /
-    #    flash_ns.c above; psg is excluded via the -tz build configs +
-    #    the psg port removal in cmake/CMakeLists.txt.)
+    # (Gem source substitutions are complete: rng/mbedtls/lwIP rand and
+    # both flash HALs via rand_ns.c/flash_ns.c, wall clock via aon_ns.c,
+    # Machine.sleep via sleep_ns.c; psg is excluded via the -tz build
+    # configs + the psg port removal in cmake/CMakeLists.txt.)
 endfunction()

@@ -389,7 +389,7 @@ Gems that must change (or go) to fit the security model:
 
 | Gem | Impact | What changes |
 |-----|--------|--------------|
-| `picoruby-machine` | **modify** | `Machine.set_hwclock`/time-of-day used `pico_aon_timer` (POWMAN, Secure-only) and faulted at boot; now backed by a TIMER0 software clock via `ns/aon_ns.c` (`--wrap` of the 4 `aon_timer_*` fns). Does not persist across deep sleep — a real AON clock needs an `sg_aon_*` veneer later. `Machine.deep_sleep`/`sleep` still touch XOSC/ROSC/CLOCKS/POWMAN → will fault if called from Ruby; `sg_deep_sleep()` veneer (phase 2) or disable. Unique-id via bootrom `get_sys_info` (NS API) works. `Machine.read_memory` of Secure addresses now SecureFaults (hardware-enforced). |
+| `picoruby-machine` | **modify** | `Machine.set_hwclock`/time-of-day: `ns/aon_ns.c` wraps the 4 `aon_timer_*` fns onto the `sg_aon_*` veneers (backlog item 3, 2026-07-11) — the monitor owns the POWMAN AON timer, so the wall clock now survives deep sleep and watchdog reboots (the phase-1 TIMER0 software clock is gone). `Machine.sleep`: `ns/sleep_ns.c` wraps it onto `sg_deep_sleep()` (the pico-extras dormant recipe runs Secure-side; USB re-enumerates after wake, same as stock; falls back to a plain timed sleep on veneer refusal). `Machine.deep_sleep` (GPIO wake) remains an empty stub upstream on RP2350 — nothing to wrap. Unique-id via bootrom `get_sys_info` (NS API) works. `Machine.read_memory` of Secure addresses now SecureFaults (hardware-enforced). |
 | `pico_bootsel_via_double_reset` | **dropped (TZ build)** | its `__attribute__((constructor))` reads `powman_hw->chip_reset` (POWMAN, Secure-only) before `main` → BusFault. Unlinked in the TZ build (main CMakeLists); BOOTSEL still reachable via the button / OTP `DOUBLE_TAP`. |
 | `picoruby-rng` | unchanged | keeps calling `get_rand_32()`; the NS image redirects `get_rand_*` to `sg_random_bytes()` via linker `--wrap` (`ns/rand_ns.c` — the TRNG is Secure-only and would fault from NS) |
 | `picoruby-filesystem-fat` | unchanged | keeps calling `flash_range_program/erase`; the NS image `--wrap`s them (`ns/flash_ns.c` → bootrom `checked_flash_op`, partition-checked against NS_W, + `sg_flash_flush_cache()` since the ROM op does no cache maintenance and the ROM flush is Arm-S-only). NB: this gem's ports are excluded from the non-WiFi build anyway (littlefs is used) — the wrap covers whichever HAL is compiled. |
@@ -413,8 +413,10 @@ Gems that must change (or go) to fit the security model:
   relaunch + parameter rejection.
 - Secure stack sealing (store `0xfef5eda5` at the Secure stack limits, per
   Arm's TrustZone-M recommendations) belongs in the monitor crt0/startup.
-- `Machine.deep_sleep` / vreg / clock dialing touch S-only peripherals →
-  needs an `sg_deep_sleep()` veneer or gets dropped initially.
+- Deep sleep: DONE (backlog item 3, 2026-07-11). `sg_deep_sleep(mode,
+  arg)` — fixed menu, `SG_SLEEP_DORMANT_FOR_SECS` only for now — plus
+  `sg_aon_get_ms/set_ms` over the Secure POWMAN timer. No vreg dialing
+  yet (menu can grow). Refuses while core 1 is launched.
 - `sg_verify_mrb` guarantees signature validity of the buffer *at the time
   of the call* — it is policy attestation, not NS memory integrity (NS can
   modify the buffer after the call; that is inherent and accepted: the

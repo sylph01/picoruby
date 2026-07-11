@@ -47,6 +47,7 @@
 #include "hardware/regs/dma.h"
 #include "hardware/regs/intctrl.h"
 #include "hardware/gpio.h"
+#include "hardware/powman.h"
 
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_tz_config.h"  /* memory map, clock contract, TZ_NS_DMA_CHANNELS */
@@ -268,6 +269,20 @@ static void monitor_derive_keys(void) {
     }
 }
 
+/* ---- AON wall clock ------------------------------------------------------- */
+
+/* Start the POWMAN 1 kHz timer (the sg_aon_* wall clock, and the wake
+ * source for sg_deep_sleep) on the XOSC tick source. If it is already
+ * running — a watchdog reboot, POWMAN survives — leave the count alone so
+ * the wall clock persists across NS-requested reboots, same as a real RTC. */
+static void monitor_aon_init(void) {
+    if (!powman_timer_is_running()) {
+        powman_timer_set_1khz_tick_source_xosc();
+        powman_timer_set_ms(0);
+        powman_timer_start();
+    }
+}
+
 /* ---- partition configuration -------------------------------------------- */
 
 static void sau_region(uint32_t region, uint32_t base, uint32_t last, bool nsc) {
@@ -482,6 +497,7 @@ int main(void) {
     diag_stage(TZ_STAGE_NS_VERIFIED);   /* (B) */
     monitor_derive_keys();
     diag_stage(TZ_STAGE_KEYS_DERIVED);  /* (C) */
+    monitor_aon_init();
     partition_configure();
     diag_stage(TZ_STAGE_PARTITIONED);   /* (D) */
     led_set(true);            /* (E) solid on — about to blxns into NS */

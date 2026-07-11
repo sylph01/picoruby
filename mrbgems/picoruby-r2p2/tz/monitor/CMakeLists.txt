@@ -100,6 +100,10 @@ target_link_libraries(r2p2_tz_monitor
     hardware_flash  # flash_range_erase/program behind sg_flash_* (RAM-resident)
     hardware_gpio   # gpio_assign_to_ns
     hardware_irq    # irq_assign_to_ns
+    hardware_powman # AON wall clock (sg_aon_*) + dormant wake alarm
+    hardware_clocks # clock_configure/clock_stop + clocks_init (sg_deep_sleep)
+    hardware_pll    # pll_deinit on the way into dormant
+    hardware_xosc   # xosc_disable on the way into dormant
 )
 
 pico_set_linker_script(r2p2_tz_monitor ${CMAKE_CURRENT_LIST_DIR}/memmap_monitor_s.ld)

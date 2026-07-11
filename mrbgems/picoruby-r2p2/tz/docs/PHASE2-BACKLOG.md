@@ -64,6 +64,19 @@ core-1 loop.
 
 ## 3. `sg_deep_sleep()` + `sg_aon_*`
 
+**DONE (2026-07-11), device verification pending.** Fixed menu:
+`sg_deep_sleep(SG_SLEEP_DORMANT_FOR_SECS, secs)` runs the pico-extras
+dormant recipe Secure-side (LPOSC + PLL/XOSC off + POWMAN alarm wake;
+PRIMASK_S held across the teardown; no vreg dialing yet); refuses while
+core 1 is launched. `sg_aon_get_ms/set_ms` expose the Secure POWMAN
+timer, started at boot by the monitor — wall clock persists across deep
+sleep AND watchdog reboots. NS side: `aon_ns.c` rewired from the TIMER0
+software clock to the veneers; new `sleep_ns.c` wraps `Machine_sleep`
+(falls back to plain timed sleep on refusal). ABI 0x0003.
+`TZ.selftest` covers AON liveness/advance + menu rejection; dormant
+itself is a manual irb test (`Machine.sleep 3` — USB re-enumerates,
+check `Machine.get_hwclock` advanced across the nap).
+
 - **What:** a fixed-menu veneer for `Machine.deep_sleep`/`sleep`. CLOCKS,
   ROSC, and POWMAN are Secure-only, so NS deep-sleep accesses fault. The
   veneer offers a closed set of sleep states rather than raw register

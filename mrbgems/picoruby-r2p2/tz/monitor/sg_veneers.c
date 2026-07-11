@@ -36,8 +36,15 @@
 #include "hardware/rcp.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/clocks.h"
+#include "hardware/pll.h"
+#include "hardware/powman.h"
+#include "hardware/xosc.h"
 #include "hardware/structs/psm.h"
+#include "hardware/structs/rosc.h"
+#include "hardware/structs/scb.h"
 #include "hardware/structs/sio.h"
+#include "pico/runtime_init.h"
 
 #include "../include/r2p2_sg_api.h"
 #include "../include/r2p2_tz_config.h"
@@ -457,6 +464,11 @@ static bool ns_exec_addr_ok(uintptr_t a) {
         || (a >= TZ_NS_RAM_BASE && a <= TZ_NS_RAM_LAST);
 }
 
+/* sg_deep_sleep refuses while core 1 is out running NS code (the monitor
+ * cannot quiesce a forced-NS core, and a core executing from flash/SRAM
+ * while the clock tree is torn down is undefined behavior territory). */
+static bool core1_launched;
+
 static int sg_launch_core1_ns_locked(uintptr_t vtor, uintptr_t entry,
                                      uintptr_t stack_top) {
     if (entry != 0) {
@@ -479,7 +491,10 @@ static int sg_launch_core1_ns_locked(uintptr_t vtor, uintptr_t entry,
     uint32_t v;
     if (!core1_fifo_pop(&v)) return SG_ERR_INTERNAL;
 
-    if (entry == 0) return SG_OK; /* parked in the bootrom wait loop */
+    if (entry == 0) { /* parked in the bootrom wait loop */
+        core1_launched = false;
+        return SG_OK;
+    }
 
     /* Bootrom mailbox launch protocol (datasheet §5.3; same sequence as
      * the SDK's multicore_launch_core1_raw): each word is echoed back, a
@@ -499,6 +514,113 @@ static int sg_launch_core1_ns_locked(uintptr_t vtor, uintptr_t entry,
         if (!core1_fifo_pop(&resp)) return SG_ERR_INTERNAL;
         seq_i = (cmd == resp) ? seq_i + 1 : 0;
     }
+    core1_launched = true;
+    return SG_OK;
+}
+
+/* ---- deep sleep / AON wall clock ------------------------------------------- */
+
+/* The AON wall clock is the Secure POWMAN 1 kHz timer; monitor_aon_init()
+ * (main.c) starts it at boot on the XOSC tick source. It keeps counting
+ * through deep sleep (tick source swaps to LPOSC below) and watchdog
+ * reboots — the two things the phase-1 TIMER0 software clock couldn't do. */
+
+static int sg_aon_get_ms_locked(uint64_t *out_ms) {
+    if (!out_ms) return SG_ERR_BAD_PARAM;
+    if (!ns_buffer_ok(out_ms, sizeof *out_ms, true)) return SG_ERR_BAD_BUFFER;
+    if (!powman_timer_is_running()) return SG_ERR_INTERNAL;
+    *out_ms = powman_timer_get_ms();
+    return SG_OK;
+}
+
+static int sg_aon_set_ms_locked(uint64_t ms) {
+    powman_timer_set_ms(ms); /* stops/restarts around the write if running */
+    if (!powman_timer_is_running()) powman_timer_start();
+    return SG_OK;
+}
+
+/* pico-extras' rosc_enable/rosc_set_dormant, inlined: the monitor does not
+ * pull in pico-extras, and both are two-register operations. Writing the
+ * full ENABLE field mask enables (any value but the 0xd1e DISABLE magic);
+ * the DORMANT magic stalls ROSC until a wake event, which stalls every
+ * downstream clock — execution resumes here when the POWMAN alarm fires. */
+static void monitor_rosc_enable(void) {
+    rosc_hw->ctrl = ROSC_CTRL_ENABLE_BITS;
+    while (!(rosc_hw->status & ROSC_STATUS_STABLE_BITS)) tight_loop_contents();
+}
+
+static void monitor_rosc_dormant(void) {
+    rosc_hw->dormant = ROSC_DORMANT_VALUE_DORMANT;
+    while (!(rosc_hw->status & ROSC_STATUS_STABLE_BITS)) tight_loop_contents();
+}
+
+/* The pico-extras dormant recipe (sleep_run_from_dormant_source(LPOSC) +
+ * sleep_goto_dormant_until + sleep_power_up), Secure-side and synchronous:
+ * NS blocks in the veneer for the whole nap. PRIMASK_S is set for the
+ * duration — it boosts execution priority above every configurable
+ * exception, NS interrupts included, so nothing preempts the clock
+ * teardown; pended NS IRQs deliver after return. No vreg dialing (stock
+ * drops to 1.10 V; a power optimization the fixed menu can grow later). */
+static int sg_deep_sleep_locked(uint32_t mode, uint32_t arg) {
+    if (mode != SG_SLEEP_DORMANT_FOR_SECS) return SG_ERR_BAD_PARAM;
+    if (arg == 0 || arg > SG_SLEEP_MAX_SECS) return SG_ERR_BAD_PARAM;
+    if (core1_launched) return SG_ERR_NOT_PERMITTED;
+    if (!powman_timer_is_running()) return SG_ERR_INTERNAL;
+
+    uint32_t ints = save_and_disable_interrupts();
+    uint32_t scr = scb_hw->scr;
+    uint32_t sleep_en0 = clocks_hw->sleep_en0;
+    uint32_t sleep_en1 = clocks_hw->sleep_en1;
+
+    /* Run the whole clock tree from LPOSC (32 kHz), kill the PLLs and
+     * XOSC. From here to clocks_init() we execute at 32 kHz. */
+    clock_configure(clk_ref, CLOCKS_CLK_REF_CTRL_SRC_VALUE_LPOSC_CLKSRC,
+                    0, 32 * KHZ, 32 * KHZ);
+    clock_configure(clk_sys, CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF,
+                    0, 32 * KHZ, 32 * KHZ);
+    clock_stop(clk_adc);
+    clock_stop(clk_usb);
+    clock_stop(clk_hstx);
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                    32 * KHZ, 32 * KHZ);
+    pll_deinit(pll_sys);
+    pll_deinit(pll_usb);
+    xosc_disable();
+
+    /* POWMAN tick must not die with XOSC: re-anchor on LPOSC, preserving
+     * the count (the wall clock ticks on through the nap). */
+    uint64_t now_ms = powman_timer_get_ms();
+    powman_timer_set_1khz_tick_source_lposc();
+    powman_timer_set_ms(now_ms);
+
+    clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
+    clocks_hw->sleep_en1 = 0;
+
+    powman_enable_alarm_wakeup_at_ms(now_ms + (uint64_t)arg * 1000u);
+
+    scb_hw->scr |= M33_SCR_SLEEPDEEP_BITS;
+    monitor_rosc_dormant(); /* stalls here until the alarm wake event */
+
+    /* Awake. Disarm the alarm, restore the clock tree (clocks_init =
+     * runtime_init_clocks: XOSC + PLLs + the boot clk_sys config, so the
+     * r2p2_tz_config clock contract holds again), POWMAN back on XOSC. */
+    powman_disable_alarm_wakeup();
+    powman_timer_disable_alarm();
+    powman_clear_alarm();
+
+    monitor_rosc_enable();
+    clocks_hw->sleep_en0 = ~0u;
+    clocks_hw->sleep_en1 = ~0u;
+    clocks_init();
+
+    now_ms = powman_timer_get_ms();
+    powman_timer_set_1khz_tick_source_xosc();
+    powman_timer_set_ms(now_ms);
+
+    clocks_hw->sleep_en0 = sleep_en0;
+    clocks_hw->sleep_en1 = sleep_en1;
+    scb_hw->scr = scr;
+    restore_interrupts(ints);
     return SG_OK;
 }
 
@@ -571,4 +693,16 @@ SG_API int sg_launch_core1_ns(uintptr_t ns_vector_table, uintptr_t ns_entry,
                               uintptr_t ns_stack_top) {
     SG_GUARDED(sg_launch_core1_ns_locked(ns_vector_table, ns_entry,
                                          ns_stack_top));
+}
+
+SG_API int sg_deep_sleep(uint32_t mode, uint32_t arg) {
+    SG_GUARDED(sg_deep_sleep_locked(mode, arg));
+}
+
+SG_API int sg_aon_get_ms(uint64_t *out_ms) {
+    SG_GUARDED(sg_aon_get_ms_locked(out_ms));
+}
+
+SG_API int sg_aon_set_ms(uint64_t ms) {
+    SG_GUARDED(sg_aon_set_ms_locked(ms));
 }

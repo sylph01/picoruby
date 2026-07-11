@@ -238,6 +238,26 @@ static void t_verify_mrb(void) {
             sg_verify_mrb(tz_pkg_v3, sizeof tz_pkg_v3) == SG_OK);
 }
 
+/* ---- AON wall clock -------------------------------------------------------- */
+
+/* sg_aon_* liveness: the monitor starts the POWMAN timer at boot, so it
+ * must be running and counting. sg_deep_sleep itself is NOT exercised
+ * here — it drops USB off the bus mid-selftest by design; test it from
+ * irb (`Machine.sleep 3`) with the CDC console expected to re-enumerate. */
+static void t_aon(void) {
+    uint64_t ms1 = 0, ms2 = 0;
+    t_check("aon_get_ms rc", sg_aon_get_ms(&ms1) == SG_OK);
+    busy_wait_us(15000);
+    t_check("aon_get_ms rc (2nd)", sg_aon_get_ms(&ms2) == SG_OK);
+    t_check("aon clock advances", ms2 > ms1 && (ms2 - ms1) < 1000u);
+    t_check("aon_get_ms(NULL) = BAD_PARAM",
+            sg_aon_get_ms(NULL) == SG_ERR_BAD_PARAM);
+    t_check("deep_sleep(bad mode) = BAD_PARAM",
+            sg_deep_sleep(0xffffffffu, 1) == SG_ERR_BAD_PARAM);
+    t_check("deep_sleep(0 secs) = BAD_PARAM",
+            sg_deep_sleep(SG_SLEEP_DORMANT_FOR_SECS, 0) == SG_ERR_BAD_PARAM);
+}
+
 /* ---- core 1 ---------------------------------------------------------------- */
 
 /* Exercises sg_launch_core1_ns: launch core 1 into an NS entry that sets a
@@ -301,6 +321,7 @@ mrb_value mrb_tz_selftest(mrb_state *mrb, mrb_value self) {
         sg_key_close(root);
     }
     t_verify_mrb();
+    t_aon();
     t_core1();
 
     t_out(t_failures ? "RESULT: FAILED\r\n" : "RESULT: PASSED\r\n");
