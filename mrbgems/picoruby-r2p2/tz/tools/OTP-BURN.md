@@ -161,28 +161,68 @@ Boot, confirm `TZ.selftest` PASSED. (Last chance to read these back with
 
 ## P2. Lock the key pages (deny NS / bootloader; Secure read-only)
 
-Field selectors let picotool handle the rows' 3-way majority-vote
-encoding — do not hand-write raw row values. LOCK states are
-thermometer-coded (advance-only), so these are permanent.
+Target lock state, both key pages: `LOCK_S=0x1` (Secure read-only — the
+monitor must still read them at `ks_init`), `LOCK_NS=0x3` and `LOCK_BL=0x3`
+(no access). LOCK states are thermometer-coded (advance-only), so permanent.
+Rollback counter (page 50): if the monitor is built `R2P2_TZ_OTP_WRITE=1` it
+must keep WRITING page 50, so leave `LOCK_S=0x0` and lock only NS/BL; if
+rollback is unused, lock it like the key pages.
+
+There are two ways to apply these, and **which one you must use depends on
+the board** (see the board-class caveat below):
+
+### P2 method A — picotool BOOTSEL (official Pico 2 and boards whose page 63 is bootloader-writable)
+
+Field selectors let picotool handle the 3-way majority-vote encoding — do
+not hand-write raw row values.
 
 ```sh
 # page 48 (DEVICE_ROOT)
-picotool otp set PAGE48_LOCK1.LOCK_S  0x1   # Secure read-only (monitor still reads)
-picotool otp set PAGE48_LOCK1.LOCK_NS 0x3   # Non-secure: no access
-picotool otp set PAGE48_LOCK1.LOCK_BL 0x3   # bootloader (picotool): no access
+picotool otp set PAGE48_LOCK1.LOCK_S  0x1
+picotool otp set PAGE48_LOCK1.LOCK_NS 0x3
+picotool otp set PAGE48_LOCK1.LOCK_BL 0x3
 # page 49 (GATEWAY_PSK)
 picotool otp set PAGE49_LOCK1.LOCK_S  0x1
 picotool otp set PAGE49_LOCK1.LOCK_NS 0x3
 picotool otp set PAGE49_LOCK1.LOCK_BL 0x3
+# page 50 (rollback), NS/BL only if the monitor still advances the counter:
+picotool otp set PAGE50_LOCK1.LOCK_NS 0x3
+picotool otp set PAGE50_LOCK1.LOCK_BL 0x3
 ```
-Rollback counter (page 50): if the monitor is built `R2P2_TZ_OTP_WRITE=1`
-it must keep WRITING page 50, so leave `LOCK_S = 0x0` there and only lock
-out NS/BL (`PAGE50_LOCK1.LOCK_NS 0x3`, `.LOCK_BL 0x3`). If rollback is
-unused, lock it like the key pages.
 
-Verify: reboot, `TZ.selftest` still PASSED (proves the monitor still reads
-the pages under LOCK_S=read-only). `picotool otp dump` of 0xc00/0xc40 in
-BOOTSEL should now be refused — that's the point.
+### P2 method B — monitor self-lock (boards where method A returns "permission failure")
+
+Build the monitor with `-DR2P2_TZ_PROVISION_LOCKS=ON`, package/seal, flash,
+and boot: `ks_provision_locks()` (keystore.c) burns the same locks via the
+bootrom `otp_access` from Secure code on first boot. Idempotent (thermometer
+locks) and gated two ways — the fuse-write code only exists when the flag is
+set, and even then it locks a page only if that page is actually
+key-provisioned (never a blank page, which would freeze the dev fallback).
+Default OFF; rebuild the normal image with the flag off afterward. This is
+the production-correct method regardless of board (bootrom `otp_access` from
+Secure is one of RP's three documented provisioning paths); on method-B
+boards it is the *only* way to burn the key-page locks.
+
+> **Board-class caveat (device-verified 2026-07-11, SparkFun Pro Micro
+> RP2350, chip `8AA23037959E1B47`):** the `PAGEnn_LOCK0/1` rows for pages
+> 48–63 physically live in **OTP page 63**. SparkFun ships this board with
+> page 63 pre-provisioned `LOCK_BL=1` (bootloader read-only), `LOCK_NS=1`,
+> `LOCK_S=0`. The USB bootloader honors `LOCK_BL`, so `picotool otp set
+> PAGE48_LOCK1…` returns "permission failure" — method A is impossible on
+> this board, permanently. `LOCK_S=0` leaves Secure code able to write, so
+> method B works. An official Pico 2 ships page 63 blank (all-zero locks)
+> and method A works there. Check with `picotool otp get PAGE63_LOCK1`
+> before choosing. Note the P4 pages (CRIT1 in page 1, BOOTKEY in page 2)
+> are NOT bootloader-locked on the SparkFun board (`LOCK_BL=0`), so P3/P4
+> stay on method A everywhere.
+
+Verify (either method): reboot, `TZ.selftest` still PASSED (proves the
+monitor still reads the pages under LOCK_S=read-only) and the derive
+fingerprints are unchanged. In BOOTSEL, a full `picotool otp dump` of the
+key rows (0x0c00 / 0x0c40) now shows `XXXXXXXX` (access refused) where it
+previously showed data — that's the point. (`picotool otp dump` has no row
+range; `-r` means *raw*. Read a single field with `picotool otp get`, or
+dump all and grep the `0c00:` / `0c40:` lines.)
 
 ## P3. Glitch detectors
 
@@ -228,7 +268,9 @@ field updates; disabling it removes that. Disable UART boot if unused:
 ## Production provisioning summary (one board, in order)
 
 1. P1 real keys → verify boot
-2. P2 lock key pages (S=ro, NS=no, BL=no) → verify boot + dump refused
+2. P2 lock key pages (S=ro, NS=no, BL=no) — method A (picotool) or method B
+   (monitor self-lock, for boards whose page 63 is BL-locked) → verify boot +
+   dump refused
 3. P3 glitch detectors → verify stable boot
 4. P4 BOOTKEY + secure boot → verify enforced boot
 5. P5 debug disable → verify enforced boot (point of no diagnosis)

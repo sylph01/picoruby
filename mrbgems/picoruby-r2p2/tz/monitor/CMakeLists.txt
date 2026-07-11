@@ -38,6 +38,16 @@ if(PICO_BOARD STREQUAL "pico2_w")
 endif()
 option(R2P2_TZ_LED_DIAG "LED breadcrumb diagnostics on GPIO25 (non-W Pico 2 only)" ON)
 
+# Permanent page-lock provisioning: at boot the monitor advances the OTP
+# fuse locks on provisioned key pages (Secure read-only, NS/BL no-access).
+# IRREVERSIBLE, so OFF by default — a dev image cannot lock a board. Even
+# when ON, ks_provision_locks() only touches a page that is actually
+# key-provisioned (never a blank page). Set with -DR2P2_TZ_PROVISION_LOCKS=ON
+# for a production/provisioning build. On SparkFun-class boards whose page 63
+# is bootloader-read-only this is the ONLY way to burn the key-page locks
+# (picotool BOOTSEL is denied); see tools/OTP-BURN.md.
+option(R2P2_TZ_PROVISION_LOCKS "Burn key-page OTP locks at boot (production only)" OFF)
+
 add_executable(r2p2_tz_monitor
     main.c
     sg_veneers.c
@@ -75,6 +85,7 @@ target_compile_definitions(r2p2_tz_monitor PRIVATE
     # Anti-rollback counter OTP writes stay compiled OUT for dev boards; a
     # RAM shadow keeps the semantics. Production monitors set this to 1.
     R2P2_TZ_OTP_WRITE=0
+    R2P2_TZ_PROVISION_LOCKS=$<BOOL:${R2P2_TZ_PROVISION_LOCKS}>
     # Diagnostics channel (tz_diag.h): the probe-readable record at
     # 0x20080000 always exists; this additionally enables the phase-1 LED
     # breadcrumb/read-out on GPIO25. 1 = non-W Pico 2 bring-up (default),

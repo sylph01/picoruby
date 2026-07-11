@@ -57,6 +57,15 @@ static void otp_read_key(uint32_t page, uint8_t out[32]) {
     }
 }
 
+/* PAGEnn_LOCK1 rows hold each page's permanent access locks. They live in
+ * OTP page 63 (rows 0xf81 + 2*page), NOT in page nn itself. Byte layout:
+ * bits[1:0]=LOCK_S, [3:2]=LOCK_NS, [5:4]=LOCK_BL; that byte is replicated
+ * into R1 (bits[15:8]) and R2 (bits[23:16]) and the hardware reads a
+ * per-bit majority vote across the three copies. */
+static inline uint32_t page_lock1_row(uint32_t page) {
+    return OTP_DATA_PAGE0_LOCK1_ROW + 2u * page;
+}
+
 /* ---- slot table ----------------------------------------------------------
  *
  * SG_SLOT_MRB_VERIFY is NOT here: the package-verify public key is compiled
@@ -131,6 +140,58 @@ static int handle_alloc(const uint8_t key_material[32], uint32_t policy,
     return SG_ERR_NO_RESOURCES;
 }
 
+/* ---- permanent page-lock provisioning ------------------------------------
+ *
+ * Advance the OTP fuse locks on the provisioned key pages: Secure read-only
+ * (the monitor must still read them at boot), Non-secure + bootloader
+ * no-access. This is the fuse form of the SW_LOCK ratchet's NS protection,
+ * plus it denies a physical `picotool otp dump` in BOOTSEL.
+ *
+ * IRREVERSIBLE. Two independent guards keep it safe:
+ *   - compile-time: the write body only exists when R2P2_TZ_PROVISION_LOCKS
+ *     is set, so a dev image carries no fuse-burning code at all;
+ *   - runtime: a page is locked only when it is actually key-provisioned
+ *     (dev_fallback == false). Never lock a blank page — LOCK_S=read-only on
+ *     a blank key page would freeze the dev fallback and block real
+ *     provisioning forever.
+ * Idempotent: lock fields are thermometer-coded, so re-writing an already
+ * locked row sets no new bits. */
+
+#if R2P2_TZ_PROVISION_LOCKS
+static int otp_advance_lock(uint32_t page, uint8_t lock_byte) {
+    uint32_t want = (uint32_t)lock_byte
+                  | ((uint32_t)lock_byte << 8)
+                  | ((uint32_t)lock_byte << 16);   /* R2:R1:byte majority copies */
+    uint32_t row = page_lock1_row(page);
+    if ((otp_raw_read(row) & want) == want) return SG_OK;   /* already locked */
+    otp_cmd_t cmd = { .flags = row | OTP_CMD_WRITE_BITS };
+    uint8_t buf[4] = { (uint8_t)want, (uint8_t)(want >> 8), (uint8_t)(want >> 16), 0 };
+    return rom_func_otp_access(buf, sizeof buf, cmd) == BOOTROM_OK
+               ? SG_OK : SG_ERR_INTERNAL;
+}
+#endif
+
+static int ks_provision_locks(void) {
+#if R2P2_TZ_PROVISION_LOCKS
+    /* Key pages: LOCK_S=1 (Secure read-only), LOCK_NS=3, LOCK_BL=3. */
+    static const uint8_t KEY_LOCK  = 0x3du;
+    /* Rollback page: leave Secure writable so the monitor can still advance
+     * the counter (R2P2_TZ_OTP_WRITE builds); deny NS + bootloader. */
+    static const uint8_t ROLL_LOCK = 0x3cu;   /* LOCK_S=0, LOCK_NS=3, LOCK_BL=3 */
+
+    for (uint32_t s = 0; s < KS_SLOT_COUNT; s++) {
+        if (slots[s].dev_fallback) continue;            /* never a blank page */
+        int rc = otp_advance_lock(slots[s].otp_page, KEY_LOCK);
+        if (rc != SG_OK) return rc;
+    }
+    if (!otp_page_blank(KS_PAGE_ROLLBACK)) {
+        int rc = otp_advance_lock(KS_PAGE_ROLLBACK, ROLL_LOCK);
+        if (rc != SG_OK) return rc;
+    }
+#endif
+    return SG_OK;
+}
+
 /* ---- init ----------------------------------------------------------------- */
 
 static bool mrb_verified_latch = false;
@@ -173,6 +234,12 @@ int ks_init(void) {
         }
     }
     tz_zeroize(chipid, sizeof chipid);
+
+    /* Permanent fuse locks (production). Must run BEFORE the SW_LOCK ratchet
+     * below, which makes the key pages unreadable for the rest of this boot
+     * — the blank/provisioned decision was captured above as dev_fallback,
+     * but ordering it first keeps the OTP state consistent. */
+    if (rc == SG_OK) rc = ks_provision_locks();
 
     /* Ratchet: SW_LOCK the key pages inaccessible (SEC and NSEC fields both
      * 0x3) until the next reset — even Secure code can no longer reread the
