@@ -591,6 +591,78 @@ mruby #6942); this part brings them back into the TZ tree — and, as
 with every merge this branch has done, the device found what the
 compiler couldn't.
 
+### The three upstream fixes, in detail
+
+All three were born on the TZ branch during the WiFi campaign and the
+bug-3 hunt (see the Interlude), were filed against upstream, and return
+here through the merge. What each actually is:
+
+**picoruby #451 — single-owner `tud_task()` via a low-priority USB pump
+(`aaf049ed`).** The root of a whole class of USB CDC races: `tud_task()`
+used to run at IRQ level (`usb_irq_handler` on USBCTRL_IRQ) *and* from
+several thread-level paths (`picorb_hal_getchar`, `Machine.tud_task`,
+signal polling, BLE init) — re-entering the TinyUSB device stack, which
+under `OPT_OS_NONE` has no internal locking. TinyUSB's own dcd handler
+already does the IRQ half correctly (service hardware, enqueue events);
+`tud_task()` is meant to drain that queue outside the ISR. The fix
+follows the pico-sdk `pico_stdio_usb` design: `usb_pump_worker()`,
+running in a claimed spare user IRQ at the *lowest* priority, becomes
+the only background `tud_task()` caller and the sole CDC FIFO consumer
+(draining RX into the stdin ring buffer). The USBCTRL_IRQ handler only
+*pends* the pump; the 1 ms tick re-pends it as a backstop so USB stays
+serviced while the VM computes. A `usb_mutex` serializes the pump
+against the thread-level write path (the worker try-locks and retires
+on contention); `picorb_hal_write` gains bounded flow control — on a
+full TX FIFO it pumps while holding the mutex and gives up after 500 ms
+if the host is gone, so prints are neither silently truncated nor an
+eternal stall. `picorb_hal_getchar` no longer touches TinyUSB at all.
+A diagnostic dividend: with the pump's observability, the remaining
+rapid-open/close CDC wedge was shown to be a *task-scheduling
+lost-wakeup* (RX provably reaches the ring buffer while the shell task
+stays parked) — never in the TinyUSB re-entry class at all; tracked
+separately.
+
+**picoruby #454 — verify the associated SSID before reporting connect
+success (`ddf13ba3`).** A `connect_timeout` that times out leaves its
+join *running in the CYW43 firmware* (the SDK's connect loop returns
+`PICO_ERROR_TIMEOUT` without aborting), and the attempt survives
+`wifi_leave` + STA re-up via the firmware's auto-rejoin of the stored
+SSID. Since the SDK's success poll checks interface link status only —
+never *which network* — a later connect to a different SSID can report
+success while associated to the previous one. Reproduced on a Pico 2 W:
+join the real AP with a 1 s timeout, disconnect, re-up STA, then
+connect to a nonexistent SSID — 4/6 attempts returned true for
+"no-such-ap" (back-to-back connects don't reproduce: a new `SET_SSID`
+overrides an in-flight join; it's the leave/re-up path that resurrects
+the stale one). The fix: after the SDK reports success, read the
+associated SSID (`CYW43_IOCTL_GET_SSID`) and fail on mismatch; on any
+failure, `cyw43_wifi_leave()` so no join outlives the call. Verified:
+0/12 wrong-SSID successes across both sequences.
+
+**mruby #6942 — `mrb_hal_task_switch_hook`, a load-independent platform
+servicing point (origin `d3ab07ce`, PR draft in
+`PR-DRAFT-task-switch-hal-hook.md`).** The scheduler's only platform
+hook used to be `mrb_hal_task_idle_cpu()`, which runs when no task is
+READY — so anything hung off it silently stops under load. Two loads
+defeat it: a compute-bound Ruby task (the ready queue never empties),
+and — since mruby #6938 — a scheduler-driven GC drain (the pending-GC
+branch loops `mrb_gc_step()` without reaching the idle hook). Under TZ
+this was fatal for WiFi: cyw43/lwIP run in NO_SYS poll mode, which is
+not IRQ-safe, so the pump *needs* a thread-context beat — and a
+pure-Ruby busy loop starved it (soak: 5/5 host probes stalled >25 s
+until the loop ended). The hook is called at the scheduler's control
+points in thread context — after every `execute_task()` return and
+after each GC step in the drain branch — bounding the servicing
+interval by the timeslice (~12 ms in the default config) regardless of
+what Ruby code does. The rp2040 port implements it as the cyw43 pump
+(shared with the idle path); ports with nothing to service get a no-op.
+Device evidence at the PR SHA: the same busy-loop probes ACKed
+sub-second (0.20–0.30 s), and 13/13 probes landed inside GC-drain
+windows with `MRB_GC_PROFILE` confirming the drain branch was hot. The
+*merged* edition of the hook grew a `mrb_task_switch_reason`
+discriminator — which is why the merge commit below has porting work to
+do, not just conflict resolution.
+
 ### `08dbdd4e` — merge master + adopt the merged hook API
 
 Fifteen master commits in, three conflicts worth recording.
