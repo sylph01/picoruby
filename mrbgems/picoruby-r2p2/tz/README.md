@@ -11,6 +11,12 @@ Build: monitor standalone (`monitor/CMakeLists.txt`), NS via
 `R2P2_TRUSTZONE=1 rake r2p2:picoruby:pico2:prod` (see `ns/ns_build.cmake`),
 then `rake r2p2:tz:package` → `package/R2P2-TZ-combined.uf2`.
 
+> **Synced with master in 2026-11** (pico-sdk 2.3.0, mruby scheduler-hook
+> API, mainline cyw43 poll mode, 32-bit word-boxed VM). The hardware
+> results quoted in this file predate that sync; see
+> `docs/MASTER-SYNC-2026-11.md` for what changed and what has been
+> re-verified since. Where the two disagree, the sync note wins.
+
 Phase 2 (**verified on hardware 2026-07-07**, board 1 Pico 2, via
 `TZ.selftest` from irb — 39/39 checks: keystore/policy/handles, HKDF
 export determinism, AEAD round-trip + tamper + no-write-on-mismatch,
@@ -138,7 +144,7 @@ per-bank gates cannot carve a contiguous Secure region out of it. The two
 
 | Range                     | Size    | Owner | Contents                                  |
 |---------------------------|---------|-------|-------------------------------------------|
-| 0x20000000 – 0x2007FFFF   | 512 KiB | NS    | R2P2 as today (heap_pool, stacks, .data)  |
+| 0x20000000 – 0x2007FFFF   | 512 KiB | NS    | R2P2 as today (.data, auto-sized heap, stacks) |
 | 0x20080000 – 0x20081FFF   | 8 KiB   | S     | Monitor .data/.bss/stack (SRAM8+SRAM9)    |
 
 Consequences:
@@ -296,10 +302,8 @@ PICO_SDK_PATH=/path/to/pico-sdk cmake -B build -S . && cmake --build build
 
 # 2. Non-secure R2P2 — links the implib from step 1
 cd <picoruby root>
-R2P2_TRUSTZONE=1 \
-  PICO_SDK_PATH=/path/to/pico-sdk \
-  PICO_EXTRAS_PATH=/path/to/pico-extras \
-  rake r2p2:picoruby:pico2:prod
+R2P2_TRUSTZONE=1 rake r2p2:picoruby:pico2:prod
+# (rake defaults PICO_SDK_PATH to lib/pico-sdk; pico-extras is no longer used)
 # artifacts in build/r2p2/picoruby/pico2/prod-tz/
 
 # 3. Package: patch NS digest into the monitor, seal, combined UF2
