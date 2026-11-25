@@ -43,8 +43,10 @@ function(r2p2_apply_tz_ns TARGET)
     # picoruby-littlefs.
     # aon_ns.c: pico_aon_timer onto the sg_aon_* veneers (the monitor owns
     # the POWMAN AON timer — Secure-only; survives deep sleep + reboots).
-    # sleep_ns.c: Machine.sleep onto sg_deep_sleep (CLOCKS/PLL/POWMAN
-    # dormant recipe runs Secure-side).
+    # sleep_ns.c: Machine_sleep_timer / Machine_sleep_gpio. Deep timer
+    # sleep goes onto sg_deep_sleep (the CLOCKS/PLL/POWMAN recipe runs
+    # Secure-side); light timer sleep is a plain wait; GPIO wake is
+    # reported as unsupported.
     target_sources(${TARGET} PRIVATE
         ${R2P2_TZ_NS_DIR}/runtime_init_ns.c
         ${R2P2_TZ_NS_DIR}/rand_ns.c
@@ -78,7 +80,8 @@ function(r2p2_apply_tz_ns TARGET)
         LINKER:--wrap=aon_timer_set_time
         LINKER:--wrap=aon_timer_get_time
         LINKER:--wrap=aon_timer_is_running
-        LINKER:--wrap=Machine_sleep
+        LINKER:--wrap=Machine_sleep_timer
+        LINKER:--wrap=Machine_sleep_gpio
     )
 
     target_include_directories(${TARGET} PRIVATE
