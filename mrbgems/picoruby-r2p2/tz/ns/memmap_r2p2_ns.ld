@@ -186,16 +186,13 @@ SECTIONS
         __bss_end__ = .;
     } > RAM
 
-    .heap (NOLOAD):
-    {
-        __end__ = .;
-        end = __end__;
-        KEEP(*(.heap*))
-    } > RAM
-
     /* SRAM8/SRAM9 belong to the Secure monitor; anything the SDK wanted in
      * a scratch bank lands in main RAM instead. Symbols preserved because
-     * SDK code copies __scratch_x_source__ -> __scratch_x_start__ at boot. */
+     * SDK code copies __scratch_x_source__ -> __scratch_x_start__ at boot.
+     *
+     * They must sit BELOW `end`: ports/rp2040/main.c hands the Ruby heap
+     * everything from `end` up to __StackLimit, so any section placed
+     * after `end` would be overwritten by the heap. */
     .scratch_x : {
         __scratch_x_start__ = .;
         *(.scratch_x.*)
@@ -211,6 +208,17 @@ SECTIONS
         __scratch_y_end__ = .;
     } > RAM AT > FLASH
     __scratch_y_source__ = LOADADDR(.scratch_y);
+
+    /* `end` is the first free byte of RAM: the Ruby heap starts here
+     * (main.c heap_locate). Nothing that holds data may follow it; the two
+     * stack dummies below only size the stacks, which live at the top of
+     * RAM. */
+    .heap (NOLOAD):
+    {
+        __end__ = .;
+        end = __end__;
+        KEEP(*(.heap*))
+    } > RAM
 
     /* Stack size calculation only (NOLOAD), as in the base script. */
     .stack1_dummy (NOLOAD):
@@ -252,7 +260,7 @@ SECTIONS
     PROVIDE (_end = __end__);
     PROVIDE (__llvm_libc_heap_limit = __HeapLimit);
 
-    ASSERT(__StackLimit >= __HeapLimit, "region RAM overflowed")
+    ASSERT(__end__ <= __StackLimit, "region RAM overflowed")
 
     /* NS image must not spill into the filesystem partition. */
     ASSERT(__flash_binary_end <= 0x10340000, "NS image overlaps filesystem partition")
