@@ -5,6 +5,21 @@
 #include "mruby/class.h"
 #include "mruby/data.h"
 #include "mruby/string.h"
+#include "mruby/variable.h"
+#ifdef PICO_CYW43_ARCH_POLL
+#include "task.h"
+#endif
+
+#ifdef PICO_CYW43_ARCH_POLL
+void
+TCPServer_notify_accepted(picorb_tcp_server_t *server)
+{
+  void *queue_ptr = TCPServer_event_queue(server);
+  bool pending = TCPServer_event_pending(server);
+  picorb_task_queue_notify(TCPServer_vm(server), queue_ptr, &pending);
+  TCPServer_set_event_pending(server, pending);
+}
+#endif
 
 /* Data type for TCPServer */
 static void
@@ -12,6 +27,15 @@ mrb_tcp_server_free(mrb_state *mrb, void *ptr)
 {
   if (ptr) {
     picorb_tcp_server_t *server = (picorb_tcp_server_t *)ptr;
+#ifdef PICO_CYW43_ARCH_POLL
+    /* GC sweep: detach the accept notification queue before closing so
+     * TCPServer_close does not push into a possibly swept Task::Queue. */
+    void *queue = TCPServer_event_queue(server);
+    if (queue) {
+      mrb_free(mrb, queue);
+      TCPServer_set_event_queue(server, mrb, NULL);
+    }
+#endif
     TCPServer_close(mrb, server);
   }
 }
@@ -41,7 +65,7 @@ mrb_tcp_server_initialize(mrb_state *mrb, mrb_value self)
 
   /* Parse host argument */
   if (mrb_string_p(host_arg)) {
-    host = RSTRING_PTR(host_arg);
+    host = RSTRING_CSTR(mrb, host_arg);
   } else if (!mrb_nil_p(host_arg)) {
     mrb_raise(mrb, E_TYPE_ERROR, "host must be a String or nil");
   }
@@ -58,19 +82,25 @@ mrb_tcp_server_initialize(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "backlog must be positive");
   }
 
-  /* Note: host parameter is currently ignored in embedded implementation */
-  /* All interfaces are bound regardless of host parameter */
-  (void)host;
-
   /* Create TCP server */
-  picorb_tcp_server_t *server = TCPServer_create(mrb, port, (int)backlog);
+  picorb_tcp_server_t *server = TCPServer_create(mrb, host, port, (int)backlog);
   if (!server) {
     mrb_raisef(mrb, E_RUNTIME_ERROR,
-               "failed to create TCP server on port %i (port may be in TIME_WAIT state, wait ~2 minutes and retry)",
-               port);
+               "failed to create TCP server on %s:%i (the host may not resolve, or the port be in use or in TIME_WAIT state)",
+               host ? host : "*", port);
   }
 
   mrb_data_init(self, server, &mrb_tcp_server_type);
+
+#ifdef PICO_CYW43_ARCH_POLL
+  void *queue_ptr = NULL;
+  if (!picorb_task_queue_attach(mrb, &self, &queue_ptr)) {
+    TCPServer_close(mrb, server);
+    DATA_PTR(self) = NULL;
+    mrb_raise(mrb, E_RUNTIME_ERROR, "failed to allocate event queue");
+  }
+  TCPServer_set_event_queue(server, mrb, queue_ptr);
+#endif
 
   return self;
 }
@@ -99,6 +129,12 @@ mrb_tcp_server_accept_nonblock(mrb_state *mrb, mrb_value self)
   tcp_socket_class = mrb_class_get_id(mrb, MRB_SYM(TCPSocket));
   client_obj = mrb_obj_value(mrb_data_object_alloc(mrb, tcp_socket_class, client, &mrb_socket_type));
 
+#ifdef PICO_CYW43_ARCH_POLL
+  if (!picorb_socket_attach_event_queue(mrb, &client_obj, client)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "failed to allocate event queue");
+  }
+#endif
+
   return client_obj;
 }
 
@@ -110,7 +146,8 @@ mrb_tcp_server_close(mrb_state *mrb, mrb_value self)
 
   server = (picorb_tcp_server_t *)mrb_data_get_ptr(mrb, self, &mrb_tcp_server_type);
   if (!server) {
-    mrb_raise(mrb, E_RUNTIME_ERROR, "server is not initialized");
+    /* Already closed. Match mruby/c and CRuby's idempotent close behavior. */
+    return mrb_nil_value();
   }
 
   if (!TCPServer_close(mrb, server)) {
@@ -121,6 +158,16 @@ mrb_tcp_server_close(mrb_state *mrb, mrb_value self)
   DATA_PTR(self) = NULL;
 
   return mrb_nil_value();
+}
+
+/* server.closed? -> true or false */
+static mrb_value
+mrb_tcp_server_closed_p(mrb_state *mrb, mrb_value self)
+{
+  picorb_tcp_server_t *server;
+
+  server = (picorb_tcp_server_t *)mrb_data_get_ptr(mrb, self, &mrb_tcp_server_type);
+  return mrb_bool_value(server == NULL);
 }
 
 void
@@ -134,4 +181,5 @@ tcp_server_init(mrb_state *mrb, struct RClass *basic_socket_class)
   mrb_define_method_id(mrb, tcp_server_class, MRB_SYM(initialize), mrb_tcp_server_initialize, MRB_ARGS_ARG(1, 2));
   mrb_define_method_id(mrb, tcp_server_class, MRB_SYM(accept_nonblock), mrb_tcp_server_accept_nonblock, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, tcp_server_class, MRB_SYM(close), mrb_tcp_server_close, MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, tcp_server_class, MRB_SYM_Q(closed), mrb_tcp_server_closed_p, MRB_ARGS_NONE());
 }

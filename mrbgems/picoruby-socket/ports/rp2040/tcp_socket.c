@@ -13,7 +13,6 @@
 #include "lwip/altcp.h"
 #include "lwip/dns.h"
 #include "lwip/err.h"
-
 #ifdef PICO_CYW43_ARCH_POLL
 #include "pico/cyw43_arch.h"
 #endif
@@ -22,6 +21,62 @@
 #ifndef TCP_RECV_BUF_SIZE
 #define TCP_RECV_BUF_SIZE 4096
 #endif
+
+/* Move bytes from sock->pending_pbuf into recv_buf while space allows and
+ * open the TCP window for the bytes consumed. The LwIP lock must be held. */
+static void
+socket_drain_pending_locked(picorb_socket_t *sock)
+{
+  struct pbuf *p = (struct pbuf *)sock->pending_pbuf;
+  if (!p) {
+    return;
+  }
+  size_t space = sock->recv_capacity - sock->recv_len;
+  size_t remain = p->tot_len - sock->pending_offset;
+  size_t n = remain < space ? remain : space;
+  if (n > 0) {
+    pbuf_copy_partial(p, sock->recv_buf + sock->recv_len, (u16_t)n, (u16_t)sock->pending_offset);
+    sock->recv_len += n;
+    sock->recv_buf[sock->recv_len] = '\0';
+    sock->pending_offset += n;
+    if (sock->pcb) {
+      altcp_recved(sock->pcb, (u16_t)n);
+    }
+  }
+  if (sock->pending_offset >= p->tot_len) {
+    pbuf_free(p);
+    sock->pending_pbuf = NULL;
+    sock->pending_offset = 0;
+  }
+}
+
+/* Called from the LwIP recv callback, so the lock is already held.
+ * The pbuf is owned by the socket from here on. Keeping it (instead of
+ * returning ERR_MEM) means LwIP never has to drop later segments, and the
+ * TCP window closes by itself because altcp_recved is only called for
+ * bytes that reached recv_buf. */
+void
+TCPSocket_store_pbuf(picorb_socket_t *sock, struct pbuf *pbuf)
+{
+  if (sock->pending_pbuf) {
+    pbuf_cat((struct pbuf *)sock->pending_pbuf, pbuf);
+  } else {
+    sock->pending_pbuf = pbuf;
+    sock->pending_offset = 0;
+  }
+  socket_drain_pending_locked(sock);
+}
+
+void
+TCPSocket_drain_pending(picorb_socket_t *sock)
+{
+  if (!sock || !sock->pending_pbuf || !sock->recv_buf) {
+    return;
+  }
+  lwip_begin();
+  socket_drain_pending_locked(sock);
+  lwip_end();
+}
 
 /* Callback prototypes */
 static err_t tcp_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err);
@@ -76,11 +131,14 @@ tcp_connected_callback(void *arg, struct altcp_pcb *pcb, err_t err)
   if (err != ERR_OK) {
     sock->state = SOCKET_STATE_ERROR;
     sock->connected = false;
+    snprintf(sock->errmsg, sizeof(sock->errmsg), "connect failed: %d", (int)err);
+    picorb_socket_notify_readable(sock);
     return err;
   }
 
   sock->state = SOCKET_STATE_CONNECTED;
   sock->connected = true;
+  picorb_socket_notify_readable(sock);
   return ERR_OK;
 }
 
@@ -103,6 +161,7 @@ tcp_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err
     if (pbuf) pbuf_free(pbuf);
     sock->state = SOCKET_STATE_ERROR;
     sock->connected = false;
+    picorb_socket_notify_readable(sock);
     D("tcp_recv_callback: error, state set to ERROR");
     return err;
   }
@@ -112,36 +171,16 @@ tcp_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err
     sock->state = SOCKET_STATE_CLOSED;
     sock->connected = false;
     sock->closed = true;
+    picorb_socket_notify_readable(sock);
     D("tcp_recv_callback: connection closed");
     return ERR_OK;
   }
 
-  /* Copy data into pre-allocated buffer (no heap allocation) */
-  size_t total_len = pbuf->tot_len;
-  size_t new_size = sock->recv_len + total_len;
-  D("tcp_recv_callback: receiving %zu bytes, current recv_len=%zu", total_len, sock->recv_len);
-
-  if (new_size > sock->recv_capacity) {
-    /* Buffer full - cannot accept more data */
-    D("tcp_recv_callback: buffer full, dropping data");
-    pbuf_free(pbuf);
-    return ERR_MEM;
-  }
-
-  /* Copy data from pbuf chain */
-  struct pbuf *current = pbuf;
-  size_t offset = sock->recv_len;
-  while (current) {
-    memcpy(sock->recv_buf + offset, current->payload, current->len);
-    offset += current->len;
-    current = current->next;
-  }
-  sock->recv_len = offset;
-  sock->recv_buf[sock->recv_len] = '\0';
-
-  /* Tell LwIP we processed the data */
-  altcp_recved(pcb, total_len);
-  pbuf_free(pbuf);
+  /* Copy what fits into the pre-allocated buffer (no heap allocation) and
+   * keep the rest as a pending pbuf until the application reads. */
+  D("tcp_recv_callback: receiving %u bytes, current recv_len=%zu", pbuf->tot_len, sock->recv_len);
+  TCPSocket_store_pbuf(sock, pbuf);
+  picorb_socket_notify_readable(sock);
 
   return ERR_OK;
 }
@@ -166,6 +205,7 @@ tcp_err_callback(void *arg, err_t err)
   sock->state = SOCKET_STATE_ERROR;
   sock->connected = false;
   sock->pcb = NULL; /* PCB is already freed by LwIP */
+  picorb_socket_notify_readable(sock);
 }
 
 /* Poll callback - called periodically by LwIP */
@@ -201,20 +241,30 @@ TCPSocket_connect(picorb_state *vm, picorb_socket_t *sock, const char *host, int
   int dns_result = Net_get_ip(host, &ip_addr);
   if (dns_result != 0) {
     D("TCP: DNS failed");
-    snprintf(sock->errmsg, sizeof(sock->errmsg),
-             "getaddrinfo(\"%s\"): Name or service not known", host);
+    const char *net_error = Net_get_last_error();
+    if (net_error && net_error[0]) {
+      snprintf(sock->errmsg, sizeof(sock->errmsg), "%s", net_error);
+    } else {
+      snprintf(sock->errmsg, sizeof(sock->errmsg),
+               "getaddrinfo(\"%s\"): Name or service not known", host);
+    }
     return false;
   }
   D("TCP: DNS ok");
 
-  /* Setup callbacks (same order as picoruby-net, with altcp_arg last) */
+  /* Setup callbacks */
   altcp_recv(sock->pcb, tcp_recv_callback);
   altcp_sent(sock->pcb, tcp_sent_callback);
   altcp_err(sock->pcb, tcp_err_callback);
   altcp_poll(sock->pcb, tcp_poll_callback, 4);  /* Poll every 2 seconds (4 * 500ms) */
   altcp_arg(sock->pcb, sock);
 
-  Net_busy_wait_ms(100);
+  /* Set the state before starting the asynchronous connection so callbacks
+   * cannot be overwritten if the backend completes immediately. */
+  strncpy(sock->remote_host, host, sizeof(sock->remote_host) - 1);
+  sock->remote_host[sizeof(sock->remote_host) - 1] = '\0';
+  sock->remote_port = port;
+  sock->state = SOCKET_STATE_CONNECTING;
 
   /* Initiate connection */
   D("TCP: connecting");
@@ -224,14 +274,14 @@ TCPSocket_connect(picorb_state *vm, picorb_socket_t *sock, const char *host, int
 
   if (err != ERR_OK) {
     D("TCP: connect err=%d\n", err);
+    sock->state = SOCKET_STATE_ERROR;
+    snprintf(sock->errmsg, sizeof(sock->errmsg), "connect failed: %d", (int)err);
     return false;
   }
 
-  /* Save connection info */
-  strncpy(sock->remote_host, host, sizeof(sock->remote_host) - 1);
-  sock->remote_host[sizeof(sock->remote_host) - 1] = '\0';
-  sock->remote_port = port;
-  sock->state = SOCKET_STATE_CONNECTING;
+  if (sock->event_queue) {
+    return true;
+  }
 
   /* Wait for connection to establish */
   D("TCP: waiting");
@@ -255,6 +305,13 @@ TCPSocket_connect(picorb_state *vm, picorb_socket_t *sock, const char *host, int
     sock->state = SOCKET_STATE_ERROR;
     return false;
   }
+}
+
+int
+TCPSocket_connection_state(picorb_state *vm, picorb_socket_t *sock)
+{
+  (void)vm;
+  return sock ? sock->state : SOCKET_STATE_ERROR;
 }
 
 /* Send data */
@@ -345,6 +402,9 @@ TCPSocket_recv(picorb_state *vm, picorb_socket_t *sock, void *buf, size_t len, b
     sock->recv_len = 0;
   }
 
+  /* Refill from the pending pbuf now that there is space again. */
+  TCPSocket_drain_pending(sock);
+
   return (ssize_t)to_copy;
 }
 
@@ -384,9 +444,23 @@ TCPSocket_close(picorb_state *vm, picorb_socket_t *sock)
     sock->pcb = NULL;
   }
 
+  if (sock->pending_pbuf) {
+    lwip_begin();
+    pbuf_free((struct pbuf *)sock->pending_pbuf);
+    lwip_end();
+    sock->pending_pbuf = NULL;
+    sock->pending_offset = 0;
+  }
+
   if (sock->recv_buf) {
     picorb_free(vm, sock->recv_buf);
     sock->recv_buf = NULL;
+  }
+
+  picorb_socket_notify_readable(sock);
+  if (sock->event_queue) {
+    picorb_free(vm, sock->event_queue);
+    sock->event_queue = NULL;
   }
 
   sock->state = SOCKET_STATE_CLOSED;

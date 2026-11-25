@@ -47,6 +47,7 @@ class Keyboard
   @repush_threshold_ms: Integer
   @keys_pressed: Hash[[Integer, Integer], bool]
   @active_keys: Hash[[Integer, Integer], Hash[Symbol, Integer]]
+  @press_keycodes: Hash[[Integer, Integer], Integer]
   @matrix: KeyboardMatrix
   @callback: (^(key_event_t) -> void) | nil
 
@@ -64,8 +65,9 @@ class Keyboard
 
   # Get list of layer names
   attr_reader layer_names: Array[Symbol]
-  # Get visual layout
-  attr_reader layout: Array[Array[Integer]]
+  # Get visual layout. The rows come from the splat of `row`, so they are
+  # not Array[Integer] to Spinel (a rest parameter is a boxed array).
+  attr_reader layout: Array[Array[untyped]]
   # Get currently pressed keys
   attr_reader keys_pressed: Hash[[Integer, Integer], bool]
 
@@ -129,6 +131,8 @@ class Keyboard
   private def deactivate_layer: ([Integer, Integer] key_pos, Integer layer_index) -> void
   # Activate a modifier
   private def activate_modifier: ([Integer, Integer] key_pos, Integer modifier_index) -> void
+  # Modifier bits of all active keys
+  private def current_modifier: () -> Integer
   # Deactivate a modifier
   private def deactivate_modifier: ([Integer, Integer] key_pos) -> void
 

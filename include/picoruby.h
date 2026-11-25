@@ -27,9 +27,15 @@
 #if defined(PICORB_VM_MRUBYC)
 
 #include <mrubyc.h>
+#if defined(PICORB_ALLOC_ESTALLOC) && defined(MRBC_ALLOC_LIBC)
+#include <estalloc_mrubyc.h>
+#else
+#define PICORB_ESTALLOC_MRUBYC_INIT(heap, size) ((void)0)
+#endif
 
-#define picorb_vm_init()  do { \
-  mrbc_init(vm_heap, HEAP_SIZE); \
+#define picorb_vm_init(heap, size)  do { \
+  PICORB_ESTALLOC_MRUBYC_INIT(heap, size); \
+  mrbc_init(heap, size); \
   vm = mrbc_vm_open(NULL); \
   picoruby_init_require(vm); \
 } while(0)
@@ -106,26 +112,37 @@ bool picoruby_load_model_by_name(const char *gem);
 #include <mruby/variable.h>
 #include <mruby/presym.h>
 #include <mruby/error.h>
+#include <stdlib.h>
 //#include "../mrbgems/picoruby-mruby/include/task.h"
-#if defined(PICORB_ALOC_TLSF)
-#include "../mrbgems/picoruby-mruby/lib/tlsf/tlsf.h"
-#elif defined(PICORB_ALLOC_O1HEAP)
-#include "../mrbgems/picoruby-mruby/lib/o1heap/o1heap/o1heap.h"
-#elif defined(PICORB_ALLOC_TINYALLOC)
-#include "../mrbgems/picoruby-mruby/lib/tinyalloc/tinyalloc.h"
-#elif defined(PICORB_ALLOC_ESTALLOC)
-#include "../mrbgems/picoruby-mruby/lib/estalloc/estalloc.h"
+#if defined(PICORB_ALLOC_ESTALLOC)
+#include "../mrbgems/picoruby-machine/lib/estalloc/estalloc.h"
+#include "../mrbgems/picoruby-machine/include/estalloc_mruby.h"
 #endif
-#include "../mrbgems/picoruby-mruby/include/alloc.h"
 
-#define picorb_vm_init()  do { \
-  vm = mrb_open_with_custom_alloc(vm_heap, HEAP_SIZE); \
-  if (vm == NULL) { \
+#if defined(PICORB_ALLOC_ESTALLOC)
+#define picorb_vm_init(heap, size)  do { \
+  vm = mrb_open_with_custom_alloc(heap, size); \
+  if (MRB_OPEN_FAILURE(vm)) { \
     fprintf(stderr, "%s: Invalid mrb_state, exiting mruby\n", *argv); \
+    mrb_print_error(vm); /* a gem init raised; handles NULL */ \
+    mrb_close(vm); \
     return EXIT_FAILURE; \
   } \
   global_mrb = vm; \
 } while(0)
+#else
+#define picorb_vm_init(heap, size)  do { \
+  (void)(heap); (void)(size); \
+  vm = mrb_open(); \
+  if (MRB_OPEN_FAILURE(vm)) { \
+    fprintf(stderr, "%s: Invalid mrb_state, exiting mruby\n", *argv); \
+    mrb_print_error(vm); /* a gem init raised; handles NULL */ \
+    mrb_close(vm); \
+    return EXIT_FAILURE; \
+  } \
+  global_mrb = vm; \
+} while(0)
+#endif
 
 #define picorb_warn(fmt, ...)   mrb_warn(mrb, fmt, ##__VA_ARGS__)
 
@@ -157,6 +174,8 @@ bool picoruby_load_model_by_name(const char *gem);
 
 // created in mruby/src/load.c
 mrb_irep *mrb_read_irep(mrb_state *mrb, const uint8_t *bin);
+// in mruby/src/state.c; mruby/irep.h is not included (see MRUBY_IREP_H above)
+void mrb_irep_decref(mrb_state *mrb, mrb_irep *irep);
 
 mrb_value mrb_task_run(mrb_state *mrb);
 

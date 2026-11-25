@@ -232,7 +232,7 @@ CYW43_ipv4_address(char *buf, size_t buflen)
 {
   const char *res;
   lwip_begin();
-  const ip4_addr_t *ip = netif_ip4_addr(netif_default);
+  const ip4_addr_t *ip = netif_ip4_addr(&cyw43_state.netif[CYW43_ITF_STA]);
   if (ip && ip->addr != 0) {
     res = ipaddr_ntoa_r(ip, buf, buflen);
   } else {
@@ -247,7 +247,7 @@ CYW43_ipv4_netmask(char *buf, size_t buflen)
 {
   const char *res;
   lwip_begin();
-  const ip4_addr_t *netmask = netif_ip4_netmask(netif_default);
+  const ip4_addr_t *netmask = netif_ip4_netmask(&cyw43_state.netif[CYW43_ITF_STA]);
   if (netmask && netmask->addr != 0) {
     res = ipaddr_ntoa_r(netmask, buf, buflen);
   } else {
@@ -262,7 +262,7 @@ CYW43_ipv4_gateway(char *buf, size_t buflen)
 {
   const char *res;
   lwip_begin();
-  const ip4_addr_t *gateway = netif_ip4_gw(netif_default);
+  const ip4_addr_t *gateway = netif_ip4_gw(&cyw43_state.netif[CYW43_ITF_STA]);
   if (gateway && gateway->addr != 0) {
     res = ipaddr_ntoa_r(gateway, buf, buflen);
   } else {

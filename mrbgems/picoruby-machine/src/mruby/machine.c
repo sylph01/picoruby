@@ -1,7 +1,10 @@
+#include <string.h>
 #include "mruby.h"
+#include "mruby/gc.h"
 #include "mruby/string.h"
 #include "mruby/presym.h"
 #include "mruby/array.h"
+#include "mruby/numeric.h"
 #include "../../include/machine.h"
 #include "../../include/hal.h"
 #include "../../../picoruby-io-console/include/io-console.h"
@@ -10,6 +13,9 @@ static inline void
 io_wait_for_input(mrb_state *mrb)
 {
   Machine_tud_task();
+  if (mrb_gc_scheduler_pending(mrb)) {
+    mrb_gc_step(mrb);
+  }
   picorb_hal_idle_cpu(mrb);
 }
 
@@ -53,7 +59,7 @@ mrb_s_delay_ms(mrb_state *mrb, mrb_value klass)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "delay time must be positive");
   }
   Machine_delay_ms((uint32_t)ms);
-  return mrb_fixnum_value(ms);
+  return mrb_int_value(mrb, ms);
 }
 
 static mrb_value
@@ -65,39 +71,66 @@ mrb_s_busy_wait_ms(mrb_state *mrb, mrb_value klass)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "delay time must be positive");
   }
   Machine_busy_wait_ms(ms);
-  return mrb_fixnum_value(ms);
+  return mrb_int_value(mrb, ms);
+}
+
+/* The Ruby-visible Machine.sleep lives in mrblib; these two private
+ * entry points are its C halves. The result enum keeps the exception
+ * class honest: an SDK resource failure is not an ArgumentError. */
+static void
+machine_sleep_raise_unless_ok(mrb_state *mrb, machine_sleep_result_t res)
+{
+  switch (res) {
+    case MACHINE_SLEEP_OK:
+      break;
+    case MACHINE_SLEEP_EINVAL:
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid sleep argument");
+      break;
+    case MACHINE_SLEEP_EUNSUPPORTED:
+      mrb_raise(mrb, E_NOTIMP_ERROR, "this sleep mode is not supported on this platform");
+      break;
+    case MACHINE_SLEEP_ERESOURCE:
+      mrb_raise(mrb, E_RUNTIME_ERROR, "sleep: hardware resource unavailable");
+      break;
+    case MACHINE_SLEEP_ESTATE:
+      mrb_raise(mrb, E_RUNTIME_ERROR, "sleep: machine state does not allow sleeping");
+      break;
+  }
 }
 
 static mrb_value
-mrb_s_sleep(mrb_state *mrb, mrb_value klass)
+mrb_s__sleep_timer(mrb_state *mrb, mrb_value klass)
 {
-  mrb_int sec;
-  mrb_get_args(mrb, "i", &sec);
-  if (sec < 0) {
-    mrb_raise(mrb, E_ARGUMENT_ERROR, "delay time must be positive");
+  mrb_bool deep;
+  mrb_value msv;
+  mrb_get_args(mrb, "bo", &deep, &msv);
+  /* The mrblib wrapper validates too; this is the authority for a
+   * direct private call. The port takes uint32_t: reject rather than
+   * wrap. Taken as int64_t so that a Bignum past mrb_int (the case for
+   * 2**32 under MRB_INT32) is range-checked here, not refused by "i". */
+  int64_t ms = mrb_as_int64(mrb, msv);
+  if (ms < 1 || 4294967295LL < ms) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "ms out of range");
   }
-  if (24 * 60 * 60 <= sec) {
-    mrb_raise(mrb, E_ARGUMENT_ERROR, "sleep length must be less than 24 hours (86400 sec)");
-  } else if (sec < 2) {
-    // Hangs if you attempt to sleep for 1 second.
-    mrb_warn(mrb, "Cannot sleep less than 2 sec\n");
-  } else {
-    mrb_warn(mrb, "Going to sleep %d sec\n", sec);
-    Machine_sleep(sec);
-  }
-  return mrb_fixnum_value(sec);
+  machine_sleep_raise_unless_ok(mrb, Machine_sleep_timer(deep, (uint32_t)ms));
+  return mrb_nil_value();
 }
 
 static mrb_value
-mrb_s_deep_sleep(mrb_state *mrb, mrb_value klass)
+mrb_s__sleep_gpio(mrb_state *mrb, mrb_value klass)
 {
-  mrb_notimplement(mrb);
-  // TODO: Implement
-  mrb_int sec;
-  mrb_get_args(mrb, "i", &sec);
-  mrb_warn(mrb, "Going to deep sleep\n");
-  //Machine_deep_sleep(GET_INT_ARG(1), v[2].tt == mrb_TT_TRUE, v[3].tt == mrb_TT_TRUE);
-  return mrb_fixnum_value(0);
+  mrb_bool deep, edge, high;
+  mrb_value pinv;
+  mrb_get_args(mrb, "bobb", &deep, &pinv, &edge, &high);
+  /* Range-check BEFORE narrowing to int: 2**32 would otherwise truncate
+   * to 0 and sleep on the wrong pin. Taken as int64_t for the same reason
+   * as ms above. The port checks the platform pin count. */
+  int64_t pin = mrb_as_int64(mrb, pinv);
+  if (pin < 0 || 2147483647LL < pin) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "pin out of range");
+  }
+  machine_sleep_raise_unless_ok(mrb, Machine_sleep_gpio(deep, (int)pin, edge, high));
+  return mrb_nil_value();
 }
 
 static mrb_value
@@ -125,7 +158,7 @@ mrb_s_stack_usage(mrb_state *mrb, mrb_value klass)
 {
   mrb_int usage = Machine_stack_usage();
   if (0 < usage) {
-    return mrb_fixnum_value(usage);
+    return mrb_int_value(mrb, usage);
   } else {
     return mrb_nil_value();
   }
@@ -166,7 +199,7 @@ mrb_s_get_hwclock(mrb_state *mrb, mrb_value self)
   struct timespec ts = {0};
   if (Machine_get_hwclock(&ts)) {
     mrb_value ary = mrb_ary_new_capa(mrb, 2);
-    mrb_ary_set(mrb, ary, 0, mrb_int_value(mrb, (mrb_int)ts.tv_sec));
+    mrb_ary_set(mrb, ary, 0, mrb_int64_value(mrb, (int64_t)ts.tv_sec));
     mrb_ary_set(mrb, ary, 1, mrb_int_value(mrb, (mrb_int)ts.tv_nsec));
     return ary;
   } else {
@@ -178,13 +211,15 @@ mrb_s_get_hwclock(mrb_state *mrb, mrb_value self)
 static mrb_value
 mrb_s_uptime_us(mrb_state *mrb, mrb_value self)
 {
-  return mrb_int_value(mrb, (mrb_int)Machine_uptime_us());
+  /* 64-bit counters: past mrb_int they become a Bignum instead of
+     wrapping (a 32-bit mrb_int holds about 35 minutes of microseconds). */
+  return mrb_uint64_value(mrb, Machine_uptime_us());
 }
 
 static mrb_value
 mrb_s_board_millis(mrb_state *mrb, mrb_value self)
 {
-  return mrb_int_value(mrb, (mrb_int)(Machine_uptime_us() / 1000));
+  return mrb_uint64_value(mrb, Machine_uptime_us() / 1000);
 }
 
 static mrb_value
@@ -312,7 +347,7 @@ mrb_io_write(mrb_state *mrb, mrb_value self)
   for (mrb_int i = 0; i < argc; i++) {
     total += print_sub(mrb, argv[i]);
   }
-  return mrb_fixnum_value(total);
+  return mrb_int_value(mrb, total);
 }
 #endif
 
@@ -455,6 +490,80 @@ mrb_s__reboot(mrb_state *mrb, mrb_value self)
   return mrb_nil_value();
 }
 
+#if defined(PICORB_PLATFORM_POSIX)
+/* SIGINT for a Ruby trap, on a POSIX process with no handler of its own
+ * (the picoruby command; r2p2 has its shell's). The OS handler only notes
+ * the signal; Signal.__dispatch_pending runs the Ruby handler later, at a
+ * point its caller chose. A second SIGINT before the first was taken does
+ * what an untrapped one does. */
+static volatile sig_atomic_t sigint_pending = 0;
+static bool sigint_trapped = false;
+
+static void
+on_sigint(int signum)
+{
+  if (sigint_pending) {
+    signal(signum, SIG_DFL);
+    raise(signum);
+    return;
+  }
+  sigint_pending = 1;
+}
+
+/* Machine.__trap_sigint(on): catch SIGINT for a Ruby handler, or stop */
+static mrb_value
+mrb_s__trap_sigint(mrb_state *mrb, mrb_value self)
+{
+  mrb_bool on;
+  mrb_get_args(mrb, "b", &on);
+  if (on && !sigint_trapped) {
+    struct sigaction current;
+    if (sigaction(SIGINT, NULL, &current) != 0 || current.sa_handler != SIG_DFL) {
+      return mrb_false_value();   /* someone else handles SIGINT */
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigint_trapped = true;
+    sigint_pending = 0;
+  }
+  else if (!on && sigint_trapped) {
+    signal(SIGINT, SIG_DFL);
+    sigint_trapped = false;
+    sigint_pending = 0;
+  }
+  return mrb_bool_value(sigint_trapped);
+}
+
+/* Machine.__sigint_pending?: was SIGINT caught since the last call? */
+static mrb_value
+mrb_s__sigint_pending_p(mrb_state *mrb, mrb_value self)
+{
+  if (!sigint_pending) return mrb_false_value();
+  sigint_pending = 0;
+  return mrb_true_value();
+}
+#else
+/* Elsewhere nothing catches SIGINT for a trap (r2p2's shell delivers it).
+ * The methods exist all the same, so that mrblib needs no respond_to? on
+ * the mruby VM. */
+static mrb_value
+mrb_s__trap_sigint(mrb_state *mrb, mrb_value self)
+{
+  mrb_bool on;
+  mrb_get_args(mrb, "b", &on);
+  return mrb_false_value();
+}
+
+static mrb_value
+mrb_s__sigint_pending_p(mrb_state *mrb, mrb_value self)
+{
+  return mrb_false_value();
+}
+#endif
+
 void
 mrb_picoruby_machine_gem_init(mrb_state* mrb)
 {
@@ -468,8 +577,14 @@ mrb_picoruby_machine_gem_init(mrb_state* mrb)
 
   mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(delay_ms), mrb_s_delay_ms, MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(busy_wait_ms), mrb_s_busy_wait_ms, MRB_ARGS_REQ(1));
-  mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(sleep), mrb_s_sleep, MRB_ARGS_REQ(1));
-  mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(deep_sleep), mrb_s_deep_sleep, MRB_ARGS_REQ(3));
+  {
+    /* Private singleton methods: the C halves of Machine.sleep must
+     * not be part of the public surface. Their names appear in
+     * mrblib/machine.rb, so the presym table has them. */
+    struct RClass *machine_singleton = mrb_singleton_class_ptr(mrb, mrb_obj_value(module_Machine));
+    mrb_define_private_method_id(mrb, machine_singleton, MRB_SYM(_sleep_timer), mrb_s__sleep_timer, MRB_ARGS_REQ(2));
+    mrb_define_private_method_id(mrb, machine_singleton, MRB_SYM(_sleep_gpio), mrb_s__sleep_gpio, MRB_ARGS_REQ(4));
+  }
   mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(unique_id), mrb_s_unique_id, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(read_memory), mrb_s_read_memory, MRB_ARGS_REQ(2));
   mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(stack_usage), mrb_s_stack_usage, MRB_ARGS_NONE());
@@ -502,6 +617,8 @@ mrb_picoruby_machine_gem_init(mrb_state* mrb)
   mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(_stdin_gets), mrb_io_gets, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(_stdin_getc), mrb_io_getc, MRB_ARGS_NONE());
 #endif
+  mrb_define_class_method_id(mrb, module_Machine, MRB_SYM(__trap_sigint), mrb_s__trap_sigint, MRB_ARGS_REQ(1));
+  mrb_define_class_method_id(mrb, module_Machine, MRB_SYM_Q(__sigint_pending), mrb_s__sigint_pending_p, MRB_ARGS_NONE());
 }
 
 void

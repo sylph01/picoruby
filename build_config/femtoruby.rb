@@ -5,10 +5,12 @@ MRuby::Build.new do |conf|
   conf.cc.defines << "PICORB_PLATFORM_POSIX"
   conf.cc.defines << "PICORB_INT64"
   conf.cc.defines << "MRBC_TICK_UNIT=4"
+  conf.cc.defines << "MRBC_TASK_SCHEDULER_HOOK"  # picoruby-irq event bridge
   conf.cc.defines << "MRBC_TIMESLICE_TICK_COUNT=3"
   conf.cc.defines << "MRBC_USE_STRING_UTF8"
+  conf.cc.defines << "MAX_SYMBOLS_COUNT=2000"
 
-  conf.femtoruby(alloc_libc: false)
+  conf.femtoruby
 
   # Link OpenSSL libraries for socket SSL support
   conf.linker.libraries << 'ssl'
@@ -22,4 +24,3 @@ MRuby::Build.new do |conf|
   conf.gem core: "picoruby-shinonome"
   conf.gem core: "picoruby-bin-r2p2"
 end
-

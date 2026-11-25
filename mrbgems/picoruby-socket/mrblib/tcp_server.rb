@@ -23,7 +23,8 @@ class TCPServer
   #   new(host, service)           - Listen on the specified host and port
   #   new(host, service, backlog)  - Full parameters with backlog
   #
-  # @param host [String, nil] Hostname or IP address (currently ignored in embedded impl)
+  # @param host [String, nil] Hostname or IPv4 address to listen on; nil or "" is every
+  #   interface (POSIX only: the embedded ports listen on every interface)
   # @param service [Integer] Port number to listen on (1-65535)
   # @param backlog [Integer] Maximum number of pending connections (default: 5)
   # @raise [ArgumentError] if port is invalid or wrong number of arguments
@@ -34,21 +35,16 @@ class TCPServer
   # Accept an incoming client connection (blocking, interruptible)
   #
   # This method blocks until a client connects to the server.
-  # Can be interrupted by raising Interrupt exception from another task or Ctrl-C.
+  # Ctrl-C closes the server and raises Interrupt here; a close from
+  # another task raises IOError instead.
   #
   # @return [TCPSocket] Connected client socket
-  # @raise [Interrupt] if interrupted by signal or external task
+  # @raise [Interrupt] if interrupted by Ctrl-C
+  # @raise [IOError] if the server was closed by another task
   def accept
-    Signal.trap(:INT) do
-      self.close
-    end
-    while true
-      client = accept_nonblock
-      break if client
-      sleep_ms 10
-    end
+    client = __wait_interruptible { accept_nonblock }
     # @type var client: TCPSocket
-    return client
+    client
   end
 
   # Accept an incoming client connection (non-blocking)
@@ -65,9 +61,14 @@ class TCPServer
   # This is a convenience method for the common pattern of accepting
   # connections in an infinite loop.
   #
+  # The INT handler is kept installed for the whole loop, so Ctrl-C while
+  # the block is still handling a client closes the listening socket too.
+  #
   # @yield [client] Passes each accepted client to the block
   # @yieldparam client [TCPSocket] Connected client socket
   # @return [void] Never returns (infinite loop)
+  # @raise [Interrupt] if interrupted by Ctrl-C
+  # @raise [IOError] if the server was closed by another task
   #
   # Example:
   #   server.accept_loop do |client|
@@ -76,9 +77,14 @@ class TCPServer
   #     client.close
   #   end
   def accept_loop
-    while true
-      client = accept
-      yield client
+    owner = __install_int_handler
+    begin
+      while true
+        client = accept
+        yield client
+      end
+    ensure
+      __restore_int_handler if owner
     end
   end
 

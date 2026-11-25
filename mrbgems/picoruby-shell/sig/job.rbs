@@ -1,7 +1,7 @@
 # Classes
 class Shell
   class Job
-    @sandbox: untyped
+    @sandbox: untyped | nil
     @params: Array[String]
 
     attr_reader name: String
@@ -9,7 +9,11 @@ class Shell
     def initialize: (*String params) -> void
     def exec: () -> bool
     def resume: () -> void
+    def poll_pending_suspend: () -> bool
     def state: () -> Symbol
+    def close: () -> void
     private def trap: () -> void
+    private def reap: (Array[Integer] before) -> void
+    private def task_ids: () -> Array[Integer]
   end
 end

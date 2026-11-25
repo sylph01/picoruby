@@ -1,17 +1,16 @@
 #ifndef SQLITE3_VFS_DEFINED_H_
 #define SQLITE3_VFS_DEFINED_H_
 
-#include <mrubyc.h>
-#include "../../picoruby-time/include/picogem_time.h"
-#include "../../picoruby-filesystem-fat/include/fat.h"
-#include "../lib/sqlite-amalgamation-3410100/sqlite3.h"
 #include "sqlite3_prb_methods.h"
+#include "../lib/sqlite-amalgamation-3530300/sqlite3.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define VFS_NAME "prb_vfs"
+
+int prb_sqlite3_setup(void);
 
 int prbVFSOpen(sqlite3_vfs *pVfs, const char *zName, sqlite3_file *pFile, int flags, int *pOutFlags);
 int prbVFSDelete(sqlite3_vfs *pVfs, const char *zName, int syncDir);
@@ -34,15 +33,9 @@ int prbIOSectorSize(sqlite3_file *pFile);
 int prbIODeviceCharacteristics(sqlite3_file *pFile);
 
 extern sqlite3_vfs prb_vfs;
-extern prb_vfs_methods vfs_methods;
-extern prb_time_methods time_methods;
-
-void set_vm_for_vfs(mrbc_vm *vm);
-mrbc_vm *get_vm_for_vfs(void);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* SQLITE3_VFS_DEFINED_H_ */
-

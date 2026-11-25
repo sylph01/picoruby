@@ -13,56 +13,32 @@ module JSON
   class JSONError < StandardError; end
   class ParserError < JSONError; end
   class GeneratorError < JSONError; end
+  class NestingError < ParserError; end
+  UnparserError = GeneratorError
   class DiggerError < JSONError; end
 
-  # Detect WASM build for Regexp-based optimization (lazy, cached)
-  def self.wasm_build?
-    return @wasm_build unless @wasm_build.nil?
-    @wasm_build = RUBY_DESCRIPTION.include?("wasm32")
-  end
-
-  # Toggle for Regexp optimization (can be set to false for benchmarking)
-  # Defaults to wasm_build? but can be overridden: JSON.use_regexp = false
-  def self.use_regexp?
-    return @use_regexp unless @use_regexp.nil?
-    @use_regexp = wasm_build?
-  end
-
-  def self.use_regexp=(val)
-    @use_regexp = val
-  end
-
-  # Regexp patterns (lazy initialization)
-  def self.ws_pattern
-    @ws_pattern ||= /^[ \t\n\r]+/
-  end
-
-  def self.string_content_pattern
-    @string_content_pattern ||= /^[^"\\]+/
-  end
-
-  def self.number_pattern
-    @number_pattern ||= /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/
-  end
-
+  # Parser and Digger scan the source by byte offset with getbyte/byteslice.
+  # With MRB_UTF8_STRING, String#[] by character index walks the string from
+  # its head whenever it holds a multibyte character, which made a whole parse
+  # quadratic in the input length.
   module Common
-    def expect(char)
-      if @json[@index] != char
-        raise JSON::JSONError.new("Expected '#{char}' at index #{@index}, but got '#{@json[@index]}'")
+    def expect(byte)
+      if @json.getbyte(@index) != byte
+        raise JSON::JSONError.new("Expected '#{byte.chr}' at index #{@index}, but got '#{@json.byteslice(@index, 1)}'")
       end
       @index += 1
     end
 
     def skip_whitespace
-      if JSON.use_regexp?
-        if md = JSON.ws_pattern.match(@json, @index)
-          @index = md.end(0)
-        end
-      else
-        while @index < @json.length && [' ', "\t", "\n", "\r"].include?(@json[@index])
-          @index += 1
-        end
+      json = @json
+      index = @index
+      while true
+        byte = json.getbyte(index)
+        # ' ', "\t", "\n", "\r"
+        break unless byte == 32 || byte == 9 || byte == 10 || byte == 13
+        index += 1
       end
+      @index = index
     end
 
     def parse_true
@@ -81,18 +57,195 @@ module JSON
     end
 
     def expect_sequence(sequence)
-      sequence.each_char do |char|
-        expect(char)
+      len = sequence.bytesize
+      if @json.byteslice(@index, len) != sequence
+        raise JSON::JSONError.new("Expected '#{sequence}' at index #{@index}")
       end
+      @index += len
     end
   end
 
-  def self.parse(json)
-    JSON::Parser.new(json).parse
+  # The options of generate as an object, as CRuby's JSON::State: indent,
+  # space, space_before, object_nl, array_nl, allow_nan, max_nesting,
+  # ascii_only, depth. A library that formats JSON itself may pass one
+  # to to_json.
+  class State
+    attr_accessor :indent, :space, :space_before, :object_nl, :array_nl,
+                  :allow_nan, :max_nesting, :ascii_only, :depth, :script_safe,
+                  :strict
+
+    def self.from_state(opts)
+      case opts
+      when State then opts
+      when Hash then new(opts)
+      else new
+      end
+    end
+
+    def initialize(opts = nil)
+      @indent = ''
+      @space = ''
+      @space_before = ''
+      @object_nl = ''
+      @array_nl = ''
+      @allow_nan = false
+      @max_nesting = 100
+      @ascii_only = false
+      @depth = 0
+      @script_safe = false
+      @strict = false
+      configure(opts) if opts
+    end
+
+    def configure(opts)
+      opts.each do |key, value|
+        case key.to_sym
+        when :indent then @indent = value
+        when :space then @space = value
+        when :space_before then @space_before = value
+        when :object_nl then @object_nl = value
+        when :array_nl then @array_nl = value
+        when :allow_nan then @allow_nan = value
+        when :max_nesting then @max_nesting = value || 0
+        when :ascii_only then @ascii_only = value
+        when :depth then @depth = value
+        when :script_safe, :escape_slash then @script_safe = value
+        when :strict then @strict = value
+        end
+      end
+      self
+    end
+    alias merge configure
+
+    def allow_nan?
+      @allow_nan
+    end
+
+    def ascii_only?
+      @ascii_only
+    end
+
+    def script_safe?
+      @script_safe
+    end
+
+    def strict?
+      @strict
+    end
+
+    def check_circular?
+      @max_nesting != 0
+    end
+
+    def [](name)
+      respond_to?(name) ? __send__(name) : nil
+    end
+
+    def []=(name, value)
+      configure(name => value)
+    end
+
+    def to_h
+      { indent: @indent, space: @space, space_before: @space_before, object_nl: @object_nl,
+        array_nl: @array_nl, allow_nan: @allow_nan, max_nesting: @max_nesting,
+        ascii_only: @ascii_only, depth: @depth, script_safe: @script_safe, strict: @strict }
+    end
+    alias to_hash to_h
+
+    def generate(obj)
+      JSON::Generator.new(obj, self).generate
+    end
   end
 
-  def self.generate(obj)
-    JSON::Generator.new(obj).generate
+  PRETTY_STATE_PROTOTYPE = { indent: '  ', space: ' ', object_nl: "\n", array_nl: "\n" }
+
+  # A piece of JSON text that goes into the output as it is
+  class Fragment
+    attr_reader :json
+
+    def initialize(json)
+      @json = json
+    end
+
+    def to_json(*)
+      @json
+    end
+
+    def ==(other)
+      other.is_a?(Fragment) && other.json == @json
+    end
+  end
+
+  # parse(source, symbolize_names: false) -> the value. The other options
+  # of CRuby's parse (max_nesting, allow_nan, create_additions, freeze)
+  # are accepted and ignored.
+  def self.parse(json, opts = nil)
+    raise TypeError, "no implicit conversion of nil into String" if json.nil?
+    symbolize = opts.is_a?(Hash) && (opts[:symbolize_names] || opts["symbolize_names"]) ? true : false
+    JSON::Parser.new(json, symbolize).parse
+  end
+
+  def self.parse!(json, opts = nil)
+    parse(json, opts)
+  end
+
+  # load(source) -> the value, nil for nil or an empty source
+  def self.load(source, proc = nil, opts = nil)
+    source = source.read if source.respond_to?(:read)
+    return nil if source.nil? || source.to_s.strip.empty?
+    result = parse(source, opts)
+    proc.call(result) if proc
+    result
+  end
+
+  def self.[](object, opts = nil)
+    object.is_a?(String) ? parse(object, opts) : generate(object, opts)
+  end
+
+  # generate(obj, opts = nil) -> String; opts is a Hash or a State
+  def self.generate(obj, opts = nil)
+    JSON::Generator.new(obj, opts ? State.from_state(opts) : nil).generate
+  end
+
+  def self.unparse(obj, opts = nil)
+    generate(obj, opts)
+  end
+
+  def self.fast_generate(obj, opts = nil)
+    generate(obj, opts)
+  end
+
+  def self.pretty_generate(obj, opts = nil)
+    state = State.new(PRETTY_STATE_PROTOTYPE)
+    state.configure(opts.is_a?(State) ? opts.to_h : opts) if opts
+    JSON::Generator.new(obj, state).generate
+  end
+
+  def self.pretty_unparse(obj, opts = nil)
+    pretty_generate(obj, opts)
+  end
+
+  # dump(obj, io = nil) -> the JSON text, written to io when given
+  def self.dump(obj, io = nil, limit = nil)
+    text = generate(obj)
+    if io
+      io.write(text)
+      io
+    else
+      text
+    end
+  end
+
+  def self.state
+    State
+  end
+
+  def self.parser
+    Parser
+  end
+
+  def self.generator
+    Generator
   end
 
   # Digger class is to dig into the JSON object especially dedicated
@@ -150,7 +303,7 @@ module JSON
         else
           raise ArgumentError.new("Unsupported type: #{key.class}")
         end
-        @json = @json[@start_index, @index - @start_index]
+        @json = @json.byteslice(@start_index, @index - @start_index) || ""
         @json.strip!
         reset
         # p @json
@@ -171,13 +324,6 @@ module JSON
       @stack = []
     end
 
-    # Override to never use Regexp for Digger (performance)
-    def skip_whitespace
-      while @index < @json.length && [' ', "\t", "\n", "\r"].include?(@json[@index] || "")
-        @index += 1
-      end
-    end
-
     def push_stack(type)
       @stack.push(type)
       #puts "push_stack: #{@stack}, index: #{@index}"
@@ -190,40 +336,48 @@ module JSON
 
     def dig_string(need_return)
       skip_whitespace
-      expect('"')
+      expect(34) # '"'
+      json = @json
       string_start = @index
-      while char = @json[@index]
-        if char == '\\'
-          @index += 2
-        elsif char == '"'
+      index = string_start
+      while byte = json.getbyte(index)
+        if byte == 92 # '\\'
+          index += 2
+        elsif byte == 34 # '"'
+          @index = index + 1
           if need_return
-            str = @json[string_start, @index - string_start]
+            return json.byteslice(string_start, index - string_start)
           end
-          @index += 1
-          return str
+          return nil
         else
-          @index += 1
+          index += 1
         end
       end
+      @index = index
       raise JSON::DiggerError.new("Unterminated string")
     end
 
     def dig_number
-      while char = @json[@index]
-        if char == '-' || char == '.' || char == 'e' || char == 'E' || ('0' <= char && char <= '9')
-          @index += 1
+      json = @json
+      index = @index
+      while byte = json.getbyte(index)
+        # '-', '+', '.', 'e', 'E', '0'..'9'
+        if byte == 45 || byte == 43 || byte == 46 || byte == 101 || byte == 69 || (48 <= byte && byte <= 57)
+          index += 1
         else
           break
         end
       end
+      @index = index
     end
 
     def dig_object(key)
       push_stack(:object)
       skip_whitespace
-      expect('{')
-      while char = @json[@index]
-        if char == '}'
+      expect(123) # '{'
+      skip_whitespace
+      while byte = @json.getbyte(@index)
+        if byte == 125 # '}'
           @index += 1
           if @stack[-1] == :object
             pop_stack
@@ -233,21 +387,21 @@ module JSON
         found_key = dig_string(true)
         if key && found_key == key
           skip_whitespace
-          expect(':')
+          expect(58) # ':'
           @start_index = @index
           dig_value
           return
         else
           skip_whitespace
-          expect(':')
+          expect(58) # ':'
           dig_value
           skip_whitespace
-          if @json[@index] == '}'# && @stack[-1] == :object
+          if @json.getbyte(@index) == 125 # '}' # && @stack[-1] == :object
             @index += 1
             pop_stack
             break
           end
-          expect(',')
+          expect(44) # ','
           skip_whitespace
         end
       end
@@ -258,26 +412,24 @@ module JSON
 
     def dig_value
       skip_whitespace
-      case @json[@index]
-      when '{'
+      byte = @json.getbyte(@index)
+      case byte
+      when 123 # '{'
         dig_object(nil)
-      when '['
+      when 91 # '['
         dig_array(nil)
-      when '"'
+      when 34 # '"'
         dig_string(false)
-      when 't'
-        skip_whitespace
+      when 116 # 't'
         parse_true
-      when 'f'
-        skip_whitespace
+      when 102 # 'f'
         parse_false
-      when 'n'
-        skip_whitespace
+      when 110 # 'n'
         parse_null
-      when '-', '0'
+      when 45, 48 # '-', '0'
         dig_number
       else
-        if @json[@index].to_i != 0 # from '1' to '9'
+        if byte && 49 <= byte && byte <= 57 # from '1' to '9'
           dig_number
         else
           @index += 1
@@ -288,16 +440,18 @@ module JSON
     def dig_array(array_pos)
       push_stack(:array)
       skip_whitespace
-      expect('[')
+      expect(91) # '['
       skip_whitespace
       current_array_pos = 0
+      found = false
       @start_index = @index if array_pos
-      while char = @json[@index]
-        case char
-        when ']'
+      while byte = @json.getbyte(@index)
+        case byte
+        when 93 # ']'
           @index += 1
+          pop_stack
           break
-        when ','
+        when 44 # ','
           @index += 1
           if @stack[-1] == :array
             if array_pos
@@ -309,12 +463,16 @@ module JSON
               current_array_pos += 1
             end
           end
+        when 32, 9, 10, 13 # ' ', "\t", "\n", "\r"
+          # dig_value would take a ',' after whitespace for a value
+          @index += 1
         else
+          found = true if current_array_pos == array_pos
           dig_value
         end
       end
-      if array_pos && current_array_pos < array_pos
-        JSON::DiggerError.new("Array index out of range")
+      if array_pos && !found
+        raise JSON::DiggerError.new("Array index out of range")
       end
     end
   end
@@ -322,8 +480,12 @@ module JSON
   class Generator
     include JSON::Common
 
-    def initialize(obj)
+    # state: nil for the compact output, or a State with the indent, the
+    # separators and allow_nan
+    def initialize(obj, state = nil)
       @obj = obj
+      @state = state
+      @depth = state ? state.depth : 0
     end
 
     def generate(obj = @obj)
@@ -332,91 +494,167 @@ module JSON
         generate_object(obj)
       when Array
         generate_array(obj)
-      when String, Symbol
+      when String
         generate_string(obj)
-      when Integer, Float
-        generate_number(obj)
+      when Symbol
+        generate_string(obj.to_s)
+      when Integer
+        obj.to_s
+      when Float
+        generate_float(obj)
       when TrueClass
         "true"
       when FalseClass
         "false"
       when NilClass
         'null'
+      when Fragment
+        obj.json
       else
-        generate_string(obj.to_s)
+        # any other object writes itself with its to_json, as in CRuby;
+        # Object#to_json writes its to_s. A State carries the depth here,
+        # so a to_json that generates with it goes on from this depth. The
+        # argument is always a State, as in CRuby, also for the compact output.
+        if obj.respond_to?(:to_json)
+          state = @state || State.new
+          depth = state.depth
+          state.depth = @depth
+          begin
+            obj.to_json(state)
+          ensure
+            state.depth = depth
+          end
+        else
+          generate_string(obj.to_s)
+        end
       end
     end
 
     # private
 
     def generate_object(obj)
-      result = '{'
+      state = @state
       keys = obj.keys
+      keys_size = keys.size
+      return '{}' if keys_size == 0
+      @depth += 1
+      check_nesting
+      result = '{'
+      if state
+        result << state.object_nl
+        indent = state.indent * @depth
+      end
       i = 0
-      while i < keys.size
-        result += ',' if 0 < i
+      while i < keys_size
+        if 0 < i
+          result << ','
+          result << state.object_nl if state
+        end
         key = keys[i]
-        result += "#{generate_string(key)}:#{generate(obj[key])}"
+        result << indent.to_s if state
+        result << generate_string(key.is_a?(String) ? key : key.to_s)
+        result << state.space_before if state
+        result << ':'
+        result << state.space if state
+        result << generate(obj[key])
         i += 1
       end
-      result += '}'
+      @depth -= 1
+      if state
+        result << state.object_nl
+        result << state.indent * @depth
+      end
+      result << '}'
     end
 
     def generate_array(obj)
+      state = @state
+      obj_size = obj.size
+      return '[]' if obj_size == 0
+      @depth += 1
+      check_nesting
       result = '['
+      if state
+        result << state.array_nl
+        indent = state.indent * @depth
+      end
       i = 0
-      while i < obj.size
-        result += ',' if 0 < i
-        result += generate(obj[i])
+      while i < obj_size
+        if 0 < i
+          result << ','
+          result << state.array_nl if state
+        end
+        result << indent.to_s if state
+        result << generate(obj[i])
         i += 1
       end
-      result += ']'
+      @depth -= 1
+      if state
+        result << state.array_nl
+        result << state.indent * @depth
+      end
+      result << ']'
+    end
+
+    def check_nesting
+      state = @state
+      max = state ? state.max_nesting : 100
+      if max && max > 0 && @depth > max
+        raise JSON::NestingError.new("nesting of #{@depth} is too deep")
+      end
     end
 
     HEX_CHARS = "0123456789abcdef"
 
-    def generate_string(obj)
-      # Manually escape special characters since PicoRuby does not support gsub nor Regexp
-      str = obj.to_s
+    # Scans the bytes and copies each run of plain ones with one byteslice;
+    # bytes of a multibyte character pass through, so a UTF-8 string
+    # costs no per-character work.
+    def generate_string(str)
       result = '"'
-      i = 0
-      while i < str.length
-        char = str[i]
-        case char
-        when '"'
-          result += '\\"'
-        when '\\'
-          result += '\\\\'
-        when "\b"
-          result += '\\b'
-        when "\f"
-          result += '\\f'
-        when "\n"
-          result += '\\n'
-        when "\r"
-          result += '\\r'
-        when "\t"
-          result += '\\t'
-        else
-          if char
-            code = char.ord
-            if code < 0x20
-              # Escape control characters as \u00XX
-              result += '\\u00'
-              result += (HEX_CHARS[code >> 4] || '0')
-              result += (HEX_CHARS[code & 0x0f] || '0')
-            else
-              result += char
-            end
-          end
+      state = @state
+      script_safe = state ? state.script_safe? : false
+      run_start = 0
+      index = 0
+      while byte = str.getbyte(index)
+        escaped = if byte == 34 then '\\"'
+                  elsif byte == 92 then '\\\\'
+                  elsif byte == 47 && script_safe then '\\/'
+                  elsif byte == 226 && script_safe && str.getbyte(index + 1) == 128 &&
+                        ((last = str.getbyte(index + 2)) == 168 || last == 169)
+                    last == 168 ? '\\u2028' : '\\u2029'
+                  elsif byte >= 32 then nil
+                  elsif byte == 8 then '\\b'
+                  elsif byte == 12 then '\\f'
+                  elsif byte == 10 then '\\n'
+                  elsif byte == 13 then '\\r'
+                  elsif byte == 9 then '\\t'
+                  else '\\u00' + HEX_CHARS[byte >> 4].to_s + HEX_CHARS[byte & 0x0f].to_s
+                  end
+        if escaped
+          result << str.byteslice(run_start, index - run_start).to_s if run_start < index
+          result << escaped
+          index += 2 if byte == 226 # the rest of U+2028 or U+2029
+          run_start = index + 1
         end
-        i += 1
+        index += 1
       end
-      result += '"'
+      result << str.byteslice(run_start, index - run_start).to_s if run_start < index
+      result << '"'
       result
     end
 
-    def generate_number(obj)
+    INFINITY = 1.0 / 0
+
+    # mruby/c has neither nan? nor infinite?: NaN is the Float that is not
+    # equal to itself
+    def generate_float(obj)
+      if obj != obj || obj == INFINITY || obj == -INFINITY
+        state = @state
+        unless state && state.allow_nan?
+          raise JSON::GeneratorError.new("#{obj} not allowed in JSON")
+        end
+        return obj != obj ? 'NaN' : (obj > 0 ? 'Infinity' : '-Infinity')
+      end
       obj.to_s
     end
   end
@@ -424,27 +662,29 @@ module JSON
   class Parser
     include JSON::Common
 
-    def initialize(json)
+    def initialize(json, symbolize_names = false)
       @json = json
       @index = 0
+      @symbolize_names = symbolize_names
     end
 
     def parse
       skip_whitespace
-      case @json[@index]
-      when '{'
+      byte = @json.getbyte(@index)
+      case byte
+      when 123 # '{'
         parse_object
-      when '['
+      when 91 # '['
         parse_array
-      when '"'
+      when 34 # '"'
         parse_string
-      when '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'
+      when 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57 # '-', '0'..'9'
         parse_number
-      when 't'
+      when 116 # 't'
         parse_true
-      when 'f'
+      when 102 # 'f'
         parse_false
-      when 'n'
+      when 110 # 'n'
         parse_null
       else
         raise JSON::ParserError.new("Unexpected character at index #{@index}")
@@ -454,21 +694,25 @@ module JSON
     # private
 
     def parse_object
-      result = {} #: Hash[String, untyped]
+      result = {} #: Hash[String | Symbol, untyped]
       @index += 1  # Skip '{'
       skip_whitespace
 
-      unless @json[@index] == '}'
+      unless @json.getbyte(@index) == 125 # '}'
         while true
+          if @json.getbyte(@index) != 34 # '"'
+            raise JSON::ParserError.new("Expected string key at index #{@index}")
+          end
           key = parse_string
+          key = key.to_sym if @symbolize_names
           skip_whitespace
-          expect(':')
+          expect(58) # ':'
           skip_whitespace
           value = parse
           result[key] = value
           skip_whitespace
-          break if @json[@index] == '}'
-          expect(',')
+          break if @json.getbyte(@index) == 125 # '}'
+          expect(44) # ','
           skip_whitespace
         end
       end
@@ -482,13 +726,13 @@ module JSON
       @index += 1  # Skip '['
       skip_whitespace
 
-      unless @json[@index] == ']'
+      unless @json.getbyte(@index) == 93 # ']'
         while true
           value = parse
           result << value
           skip_whitespace
-          break if @json[@index] == ']'
-          expect(',')
+          break if @json.getbyte(@index) == 93 # ']'
+          expect(44) # ','
           skip_whitespace
         end
       end
@@ -497,204 +741,212 @@ module JSON
       result
     end
 
+    # Copies each run of plain bytes with one byteslice, and decodes an escape
+    # sequence where it is met.
     def parse_string
-      @index += 1  # Skip opening quote
+      json = @json
+      index = @index + 1  # Skip opening quote
+      run_start = index
       result = ''
-      while @json[@index] != '"'
-        if @json[@index] == '\\'
-          if snip = @json[@index, 2]
-            result += snip
-            @index += snip.length
-          end
+      while true
+        byte = json.getbyte(index)
+        if byte == 34 # '"'
+          break
+        elsif byte == 92 # '\\'
+          result << json.byteslice(run_start, index - run_start).to_s if run_start < index
+          index = parse_escape(result, index + 1)
+          run_start = index
+        elsif byte
+          # A plain byte. The truth test costs no method search; nil? on
+          # an Integer searched Kernel#nil? for every byte of a string.
+          index += 1
         else
-          if JSON.use_regexp?
-            if md = JSON.string_content_pattern.match(@json, @index)
-              result += md[0] || ""
-              @index = md.end(0)
-            else
-              result += @json[@index].to_s
-              @index += 1
-            end
-          else
-            result += @json[@index].to_s
-            @index += 1
-          end
-        end
-        if @index >= @json.length
           raise JSON::ParserError.new("Unterminated string")
         end
       end
-      @index += 1  # Skip closing quote
-      replace_escape_sequence(result)
-    end
-
-    def replace_escape_sequence(str)
-      result = ''
-      i = 0
-      str_len = str.length
-      while i < str_len
-        char = str[i]
-        if char == '\\'
-          i += 1
-          case str[i]
-          when '"'
-            result += '"'
-          when '\\'
-            result += '\\'
-          when '/'
-            result += '/'
-          when 'b'
-            result += "\b"
-          when 'f'
-            result += "\f"
-          when 'n'
-            result += "\n"
-          when 'r'
-            result += "\r"
-          when 't'
-            result += "\t"
-          when 'u'
-            hex = str[i + 1, 4]
-            if hex && hex.length == 4
-              code = 0
-              hex.each_char do |h|
-                code <<= 4
-                case h
-                when '0'..'9'
-                  code += h.ord - '0'.ord
-                when 'a'..'f'
-                  code += h.ord - 'a'.ord + 10
-                when 'A'..'F'
-                  code += h.ord - 'A'.ord + 10
-                else
-                  raise JSON::ParserError.new("Invalid hex in unicode escape: #{h}")
-                end
-              end
-              result += [code].pack('C*')
-              i += 4
-            else
-              raise JSON::ParserError.new("Incomplete unicode escape sequence")
-            end
-          when nil
-            raise JSON::ParserError.new("Unterminated escape sequence")
-          else
-            raise JSON::ParserError.new("Unknown escape sequence: \\#{str[i]}")
-          end
-        elsif char.nil?
-          raise JSON::ParserError.new("Unterminated string")
+      if run_start < index
+        run = json.byteslice(run_start, index - run_start).to_s
+        # A string with no escape needs no copy of its own
+        if result.empty?
+          result = run
         else
-          result += char
+          result << run
         end
-        i += 1
       end
+      @index = index + 1  # Skip closing quote
       result
     end
 
-    def parse_number
-      if JSON.use_regexp?
-        md = JSON.number_pattern.match(@json, @index)
-        unless md
-          raise JSON::ParserError.new("Invalid number at index #{@index}")
+    # Appends the character an escape sequence stands for to result, and
+    # returns the index just past the sequence. index points past the '\\'.
+    def parse_escape(result, index)
+      case @json.getbyte(index)
+      when 34 # '"'
+        result << '"'
+      when 92 # '\\'
+        result << '\\'
+      when 47 # '/'
+        result << '/'
+      when 98 # 'b'
+        result << "\b"
+      when 102 # 'f'
+        result << "\f"
+      when 110 # 'n'
+        result << "\n"
+      when 114 # 'r'
+        result << "\r"
+      when 116 # 't'
+        result << "\t"
+      when 117 # 'u'
+        code = parse_hex4(index + 1)
+        index += 4
+        # A high surrogate followed by \uDC00-\uDFFF spells one character
+        if 0xD800 <= code && code <= 0xDBFF &&
+            @json.getbyte(index + 1) == 92 && @json.getbyte(index + 2) == 117
+          low = parse_hex4(index + 3)
+          if 0xDC00 <= low && low <= 0xDFFF
+            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+            index += 6
+          end
         end
-        matched = md[0] || ""
-        start = @index
-        @index = md.end(0)
-        is_float = matched.include?('.') || matched.include?('e') || matched.include?('E')
-        if is_float
-          parse_float(start, @index)
-        else
-          parse_integer(start, @index)
-        end
+        result << utf8_encode(code)
+      when nil
+        raise JSON::ParserError.new("Unterminated escape sequence")
       else
-        start = @index
-        is_float = false
-        is_negative = @json[@index] == '-'
-        @index += 1 if is_negative
+        raise JSON::ParserError.new("Unknown escape sequence: \\#{@json.byteslice(index, 1)}")
+      end
+      index + 1
+    end
 
-        # Integer part
-        while @index < @json.length && is_digit?(@json[@index])
-          @index += 1
-        end
-
-        # Fractional part
-        if @index < @json.length && @json[@index] == '.'
-          is_float = true
-          @index += 1
-          while @index < @json.length && is_digit?(@json[@index])
-            @index += 1
-          end
-        end
-
-        # Exponent part
-        if @index < @json.length && (@json[@index] == 'e' || @json[@index] == 'E')
-          is_float = true
-          @index += 1
-          @index += 1 if @index < @json.length && (@json[@index] == '+' || @json[@index] == '-')
-          while @index < @json.length && is_digit?(@json[@index])
-            @index += 1
-          end
-        end
-
-        if is_float
-          parse_float(start, @index)
+    def parse_hex4(index)
+      json = @json
+      code = 0
+      i = 0
+      while i < 4
+        byte = json.getbyte(index + i)
+        if byte.nil?
+          raise JSON::ParserError.new("Incomplete unicode escape sequence")
+        elsif 48 <= byte && byte <= 57 # '0'..'9'
+          code = (code << 4) + byte - 48
+        elsif 97 <= byte && byte <= 102 # 'a'..'f'
+          code = (code << 4) + byte - 87
+        elsif 65 <= byte && byte <= 70 # 'A'..'F'
+          code = (code << 4) + byte - 55
         else
-          parse_integer(start, @index)
+          raise JSON::ParserError.new("Invalid hex in unicode escape: #{json.byteslice(index + i, 1)}")
         end
+        i += 1
+      end
+      code
+    end
+
+    # On mruby, pack('U') gives a UTF-8 text string. pack('C*') gives a
+    # binary one, which makes the string it is appended to binary too, so
+    # an escaped U+3042 would count 3 characters. mruby/c has no 'U' and
+    # no encodings.
+    def utf8_encode(code)
+      return [code].pack('U') unless RUBY_ENGINE == "mruby/c"
+      if code < 0x80
+        [code].pack('C*')
+      elsif code < 0x800
+        [0xC0 | (code >> 6), 0x80 | (code & 0x3F)].pack('C*')
+      elsif code < 0x10000
+        [0xE0 | (code >> 12), 0x80 | ((code >> 6) & 0x3F), 0x80 | (code & 0x3F)].pack('C*')
+      else
+        [0xF0 | (code >> 18), 0x80 | ((code >> 12) & 0x3F),
+         0x80 | ((code >> 6) & 0x3F), 0x80 | (code & 0x3F)].pack('C*')
       end
     end
 
+    def parse_number
+      json = @json
+      start = @index
+      index = start
+      is_float = false
+      index += 1 if json.getbyte(index) == 45 # '-'
+
+      # Integer part
+      index = skip_digits(index)
+
+      # Fractional part
+      if json.getbyte(index) == 46 # '.'
+        is_float = true
+        index = skip_digits(index + 1)
+      end
+
+      # Exponent part
+      byte = json.getbyte(index)
+      if byte == 101 || byte == 69 # 'e', 'E'
+        is_float = true
+        index += 1
+        byte = json.getbyte(index)
+        index += 1 if byte == 43 || byte == 45 # '+', '-'
+        index = skip_digits(index)
+      end
+
+      @index = index
+      if is_float
+        parse_float(start, index)
+      else
+        parse_integer(start, index)
+      end
+    end
+
+    def skip_digits(index)
+      json = @json
+      while true
+        byte = json.getbyte(index)
+        break unless byte && 48 <= byte && byte <= 57 # '0'..'9'
+        index += 1
+      end
+      index
+    end
+
+    # start/end_index are byte offsets
     def parse_integer(start, end_index)
+      json = @json
       result = 0
-      is_negative = @json[start] == '-'
+      is_negative = json.getbyte(start) == 45 # '-'
       start += 1 if is_negative
 
       i = start
       while i < end_index
-        # start/end_index are character indices (consistent with @index and
-        # Regexp match offsets), so index by character here. getbyte takes a
-        # byte offset and would read the wrong byte once a multibyte character
-        # appears earlier in the string.
-        char = @json[i] or raise JSON::ParserError.new("Invalid number format")
-        result = result * 10 + (char.ord - 48) # '0'.ord is 48
+        result = result * 10 + (json.getbyte(i).to_i - 48) # '0'.ord is 48
         i += 1
       end
 
       is_negative ? -result : result
     end
 
+    # start/end_index are byte offsets
     def parse_float(start, end_index)
+      json = @json
       result = 0.0
       decimal_divider = 1.0
       exponent = 0
-      is_negative = @json[start] == '-'
+      is_negative = json.getbyte(start) == 45 # '-'
       exponent_negative = false
       parsing_exponent = false
       start += 1 if is_negative
 
       i = start
       while i < end_index
-        case @json[i]
-        when '0'..'9'
-          # Index by character: start/end_index are character indices, so
-          # getbyte (byte offset) would misread once a multibyte character
-          # appears earlier in the string.
-          byte = @json[i]&.ord or raise "Invalid number format"
+        byte = json.getbyte(i).to_i
+        if 48 <= byte && byte <= 57 # '0'..'9'
           if parsing_exponent
-            exponent = exponent * 10 + (byte - 48) # '0'.ord is 48
+            exponent = exponent * 10 + (byte - 48)
           elsif decimal_divider == 1.0
             result = result * 10 + (byte - 48)
           else
             result += (byte - 48) / decimal_divider
             decimal_divider *= 10
           end
-        when '.'
+        elsif byte == 46 # '.'
           decimal_divider = 10.0
-        when 'e', 'E'
+        elsif byte == 101 || byte == 69 # 'e', 'E'
           parsing_exponent = true
-        when '-'
+        elsif byte == 45 # '-'
           exponent_negative = true if parsing_exponent
-        when '+'
-          # Do nothing for positive exponent
         end
         i += 1
       end
@@ -703,11 +955,62 @@ module JSON
       is_negative ? -result : result
     end
 
-    def is_digit?(char)
-      return false unless char
-      '0' <= char && char <= '9'
-    end
-
   end
 end
 
+# to_json, as the json library defines it: the argument is a State or an
+# option Hash, or nothing. An object is written as its to_s; the classes
+# that JSON has values for are written as those.
+class Object
+  def to_json(state = nil)
+    JSON.generate(to_s, state)
+  end
+end
+
+class Hash
+  def to_json(state = nil)
+    JSON.generate(self, state)
+  end
+end
+
+class Array
+  def to_json(state = nil)
+    JSON.generate(self, state)
+  end
+end
+
+class String
+  def to_json(state = nil)
+    JSON.generate(self, state)
+  end
+end
+
+class Integer
+  def to_json(state = nil)
+    JSON.generate(self, state)
+  end
+end
+
+class Float
+  def to_json(state = nil)
+    JSON.generate(self, state)
+  end
+end
+
+class TrueClass
+  def to_json(state = nil)
+    JSON.generate(self, state)
+  end
+end
+
+class FalseClass
+  def to_json(state = nil)
+    JSON.generate(self, state)
+  end
+end
+
+class NilClass
+  def to_json(state = nil)
+    JSON.generate(self, state)
+  end
+end

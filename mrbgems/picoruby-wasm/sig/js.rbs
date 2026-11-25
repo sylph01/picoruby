@@ -1,5 +1,5 @@
 module JS
-  class Object
+  class Object < BasicObject
     # Global state (consider refactoring)
     $promise_responses: Hash[Integer, untyped]
     $promise_errors: Hash[Integer, untyped]
@@ -20,21 +20,36 @@ module JS
     # native value, which will never match a composite JS::Object anyway.
     def ==: (untyped other) -> bool
 
+    # Ruby protocol predicates defined in C. Their names end in `?`, which
+    # is illegal in a JS identifier, so they never shadow a JS property.
+    # Any other name ending in `?` or `!` raises NoMethodError instead of
+    # being forwarded to JS.
+    def nil?: () -> false
+    def is_a?: (Module klass) -> bool
+    def kind_of?: (Module klass) -> bool
+    def instance_of?: (Class klass) -> bool
+    def respond_to?: (Symbol | String name, ?bool include_private) -> bool
+
     # Explicit Type Conversion Methods (fallbacks for composite objects)
     def to_s: () -> String
     def to_i: () -> Integer
     def to_f: () -> Float
     def to_a: () -> ::Array[untyped]
 
+    # Browser dialogs
+    def confirm: (String message) -> bool
+
     # Event Handling
-    def addEventListener: (String event_type) { (JS::Event event) -> void } -> Integer
+    def addEventListener: (String event_type, ?sync: bool, ?capture: bool, ?once: bool, ?passive: bool?) { (JS::Event event) -> void } -> Integer
     def self.removeEventListener: (Integer callback_id) -> bool
+    def self._dispatch_sync: (Integer callback_id, JS::Event event, bool once) -> void
     def self.register_callback: (String name) { (*untyped args) -> untyped } -> Integer
     def self._spawn_event_consumer: (Integer callback_id, Proc block) -> Integer
     def self._close_event_queue: (Integer callback_id) -> (Task::Queue | nil)
 
     # Async operations
     def fetch: (String url, ?Hash[Symbol, untyped]? options) { (JS::Response response) -> void } -> void
+    def to_binary: () -> String
 
     # Timer operations
     def setTimeout: (Integer delay_ms) { () -> void } -> Integer
@@ -82,6 +97,7 @@ module JS
     def createObjectURL: (JS::Object blob) -> String
     def create_object: () -> JS::Object
     def create_array: () -> JS::Array
+    def new: (*untyped args) -> JS::Object
 
     # localStorage methods
     def setItem: (String key, String value) -> void
@@ -89,13 +105,15 @@ module JS
     def removeItem: (String key) -> void
 
     def _js_remove_event_listener_wrapper: (Integer callback_id) -> bool
+    def _removeEventListener: (Integer callback_id) -> bool
 
     private def method_missing: (Symbol method_name, *untyped args) -> untyped
-    private def _add_event_listener: (Integer callback_id, String event_type) -> nil
+    private def _add_event_listener: (Integer callback_id, String event_type, bool sync, bool capture, bool once, Integer passive) -> nil
     private def self._register_callback: (Integer callback_id, String name) -> nil
-    private def _removeEventListener: (Integer callback_id) -> bool
     private def _fetch_and_suspend: (String url, Integer callback_id) -> nil
     private def _fetch_with_options_and_suspend: (String url, String options_json, Integer callback_id) -> nil
+    private def _to_binary_and_suspend: (Integer callback_id) -> nil
+    private def _raise_pending_promise_error: (Integer callback_id) -> nil
     private def _await_and_suspend: (Integer callback_id) -> nil
     private def _set_timeout: (Integer callback_id, Integer delay_ms) -> Integer
     private def _clear_timeout: (Integer callback_id) -> bool
@@ -128,8 +146,6 @@ module JS
   end
 
   class Response < Object
-    def to_binary: () -> String
-    private def _to_binary_and_suspend: (Integer callback_id) -> nil
   end
 
   class Element < Object

@@ -62,10 +62,6 @@ typedef struct wasm_debug_state {
 
 static wasm_debug_state g_dbg = {0};
 
-/* Get current task from mrb->c via pointer arithmetic */
-#define MRB2TASK(mrb) \
-  ((mrb_task *)((uint8_t *)(mrb)->c - offsetof(mrb_task, c)))
-
 /* Forward declaration - defined in mruby-binding */
 extern const struct RProc *
 mrb_binding_extract_proc(mrb_state *mrb, mrb_value binding);
@@ -106,8 +102,11 @@ debug_eval_code(mrb_state *mrb, const char *code, size_t len)
 static mrb_value
 mrb_binding_irb(mrb_state *mrb, mrb_value self)
 {
-  /* Must be called from task context (not root) */
-  if (mrb->c == mrb->root_c) {
+  /* Must be called from a task, not the root context. While the task runs
+   * a fiber, mrb->c is the fiber's context, so the task is looked up
+   * through mrb_task_running() rather than computed from mrb->c. */
+  mrb_task *t = mrb_task_running(mrb);
+  if (!t) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "binding.irb requires task context");
   }
 
@@ -166,8 +165,6 @@ mrb_binding_irb(mrb_state *mrb, mrb_value self)
    * can access it directly.  The cross-context cxt mismatch is handled
    * in mrb_debug_eval_in_binding by temporarily clearing env->cxt. */
 
-  /* Get current task via pointer arithmetic on mrb->c */
-  mrb_task *t = MRB2TASK(mrb);
   g_dbg.paused_task = t->self;
   mrb_gc_register(mrb, t->self);
 
@@ -358,9 +355,10 @@ const char* mrb_get_component_debug_info(const char* method) {
   global_mrb->exc = NULL;
   mrb_value result = mrb_execute_proc_synchronously(global_mrb, proc_val, 0, NULL);
 
-  // Check for exception
-  if (global_mrb->exc) {
-    mrb_value exc = mrb_obj_value(global_mrb->exc);
+  // Check for exception. An exception the code did not handle comes back
+  // as the result value (mrb->exc is cleared by the synchronous executor).
+  if (global_mrb->exc || mrb_exception_p(result)) {
+    mrb_value exc = global_mrb->exc ? mrb_obj_value(global_mrb->exc) : result;
     global_mrb->exc = NULL;
     mrb_value exc_str = mrb_inspect(global_mrb, exc);
     if (global_mrb->exc) {
@@ -440,9 +438,10 @@ const char* mrb_get_component_state_by_id(int component_id) {
   global_mrb->exc = NULL;
   mrb_value result = mrb_execute_proc_synchronously(global_mrb, proc_val, 0, NULL);
 
-  // Check for exception
-  if (global_mrb->exc) {
-    mrb_value exc = mrb_obj_value(global_mrb->exc);
+  // Check for exception. An exception the code did not handle comes back
+  // as the result value (mrb->exc is cleared by the synchronous executor).
+  if (global_mrb->exc || mrb_exception_p(result)) {
+    mrb_value exc = global_mrb->exc ? mrb_obj_value(global_mrb->exc) : result;
     global_mrb->exc = NULL;
     mrb_value exc_str = mrb_inspect(global_mrb, exc);
     if (global_mrb->exc) {
@@ -519,9 +518,10 @@ const char* mrb_eval_string(const char* code) {
   mrb_value proc_val = mrb_obj_value(proc);
   mrb_value result = mrb_execute_proc_synchronously(global_mrb, proc_val, 0, NULL);
 
-  // Check for exception
-  if (global_mrb->exc) {
-    mrb_value exc = mrb_obj_value(global_mrb->exc);
+  // Check for exception. An exception the code did not handle comes back
+  // as the result value (mrb->exc is cleared by the synchronous executor).
+  if (global_mrb->exc || mrb_exception_p(result)) {
+    mrb_value exc = global_mrb->exc ? mrb_obj_value(global_mrb->exc) : result;
     global_mrb->exc = NULL;
 
     mrb_value exc_str = mrb_inspect(global_mrb, exc);
@@ -1105,7 +1105,7 @@ debug_create_binding(mrb_state *mrb, const mrb_irep *irep,
   /* Store PC offset */
   uint32_t pc_offset = (uint32_t)(pc - irep->iseq);
   mrb_obj_iv_set(mrb, binding, MRB_SYM(pc),
-                 mrb_fixnum_value(pc_offset));
+                 mrb_int_value(mrb, pc_offset));
 
   /* Create lvspace proc wrapping the actual proc.
    * This mirrors binding_wrap_lvspace from mruby-binding. */
@@ -1206,9 +1206,10 @@ wasm_code_fetch_hook(mrb_state *mrb, const mrb_irep *irep,
     mrb_gc_register(mrb, g_dbg.binding);
   }
 
-  /* Get current task and suspend it */
-  if (mrb->c != mrb->root_c) {
-    mrb_task *t = MRB2TASK(mrb);
+  /* Get current task and suspend it; NULL on the root context. mrb->c is
+   * a fiber's context while the task runs a fiber (see binding.irb). */
+  mrb_task *t = mrb_task_running(mrb);
+  if (t) {
     if (mrb_nil_p(g_dbg.paused_task)) {
       g_dbg.paused_task = t->self;
       mrb_gc_register(mrb, t->self);

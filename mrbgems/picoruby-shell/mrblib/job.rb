@@ -32,8 +32,19 @@ class Shell
       return false
     end
 
+    def poll_pending_suspend
+      @sandbox.poll_pending_suspend
+    end
+
     def state
       @sandbox.state
+    end
+
+    def close
+      sandbox = @sandbox
+      return if sandbox.nil?
+      sandbox.close
+      @sandbox = nil
     end
 
     def exec
@@ -44,8 +55,23 @@ class Shell
         i += 1
       end
       trap
-      @sandbox.load_file(@exefile)
+      # A 0-byte executable is a broken install (the system files are
+      # written at boot and a full filesystem leaves empty files behind).
+      # Sandbox#load_file would run it as an empty program and print
+      # nothing, so refuse it here with a message that names the file.
+      size = File.open(@exefile, "r") { |f| f.size }
+      if size == 0
+        raise "#{@exefile}: empty executable"
+      end
+      before = task_ids
+      begin
+        @sandbox.load_file(@exefile)
+      rescue Exception
+        reap(before)
+        raise
+      end
       if error = @sandbox.error
+        reap(before)
         puts "\n#{error.message} (#{error.class})"
       end
       return true
@@ -61,6 +87,44 @@ class Shell
     end
 
     private
+
+    # Terminate tasks the job started but left behind, and ONLY when the
+    # job died: a script killed by e.g. NoMemoryError never reaches the
+    # code that would stop its own tasks, and such an orphan keeps running
+    # with nothing left to stop it -- burning CPU and heap until the shell
+    # itself starves. A job that ends normally keeps its tasks, so a script
+    # can still start a long-lived background worker on purpose.
+    def reap(before)
+      tasks = Task.list
+      i = 0
+      while i < tasks.size
+        t = tasks[i]
+        i += 1
+        # Identity has to go through object_id: mruby/c compares two
+        # objects of the same class as equal, so Array#include? on the
+        # Task objects themselves would treat every task as "seen".
+        next if before.include?(t.object_id)
+        begin
+          t.terminate
+        rescue Exception
+          # a task that already finished is not an error
+        end
+      end
+    rescue Exception
+      # never let cleanup mask the job's own result
+    end
+
+    def task_ids
+      # @type var ids: Array[Integer]
+      ids = []
+      tasks = Task.list
+      i = 0
+      while i < tasks.size
+        ids << tasks[i].object_id
+        i += 1
+      end
+      ids
+    end
 
     def trap
       Signal.trap(:TSTP) do

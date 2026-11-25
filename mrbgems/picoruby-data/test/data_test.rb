@@ -87,6 +87,70 @@ class DataTest < Picotest::Test
     assert_true obj.is_a?(Data)
   end
 
+  def test_is_a_object
+    obj = Data.define(:x).new(1)
+    assert_true obj.is_a?(Object)
+  end
+
+  def test_is_a_own_definition
+    klass = Data.define(:x)
+    obj = klass.new(1)
+    assert_true obj.is_a?(klass)
+  end
+
+  def test_is_a_other_definition
+    klass = Data.define(:x)
+    other = Data.define(:x)
+    obj = klass.new(1)
+    assert_false obj.is_a?(other)
+  end
+
+  def test_is_a_unrelated_object
+    obj = Data.define(:x).new(1)
+    assert_false obj.is_a?(Object.new)
+  end
+
+  def test_is_a_definition_made_after_own_definition_is_released
+    # The test holds no reference to the definition of obj. No definition
+    # made later may match obj, whatever address it gets.
+    obj = instance_of_temporary_definition
+    others = []
+    16.times { others << Data.define(:val) }
+    matched = 0
+    others.each { |other| matched += 1 if obj.is_a?(other) }
+    assert_equal 0, matched
+  end
+
+  # ---- an instance does not need a reference to its definition ----
+
+  def test_instance_outlives_definition_reference
+    obj = instance_of_temporary_definition
+    garbage = []
+    8.times { |i| garbage << Data.define("member_#{i}") }
+    assert_equal 1, obj.val
+    assert_equal [:val], obj.members
+    assert_equal 1, obj.to_h[:val]
+  end
+
+  # ---- methods of the wrong receiver ----
+
+  def test_new_on_instance_raises
+    obj = Data.define(:x).new(1)
+    assert_raise(NoMethodError) { obj.new(1) }
+  end
+
+  def test_define_on_definition_raises
+    klass = Data.define(:x)
+    assert_raise(NoMethodError) { klass.define(:y) }
+  end
+
+  # ---- #inspect ----
+
+  def test_inspect
+    obj = Data.define(:x).new(1)
+    assert_equal "#<data>", obj.inspect
+  end
+
   # ---- multiple independent subclasses ----
 
   def test_two_subclasses_are_independent
@@ -128,6 +192,142 @@ class DataTest < Picotest::Test
     klass = Data.define(:kind)
     obj = klass.new(:foo)
     assert_equal :foo, obj.kind
+  end
+
+  # ---- Data.define argument check ----
+
+  def test_define_with_invalid_member_raises
+    assert_raise(TypeError) { Data.define(:x, 1) }
+  end
+
+  def test_define_keeps_name_of_released_string
+    # No symbol of this name exists before Data.define makes it.
+    name = "runtime_" + "member"
+    klass = Data.define(name)
+    name = nil
+    garbage = []
+    8.times { |i| garbage << "garbage_string_#{i}" }
+    assert_equal "runtime_member", klass.members[0].to_s
+  end
+
+  # ---- returned collections are copies ----
+
+  def test_to_h_returns_copy
+    klass = Data.define(:name)
+    obj = klass.new("Alice")
+    h = obj.to_h
+    h[:name] = "Bob"
+    assert_equal "Alice", obj.name
+    assert_equal "Alice", obj.to_h[:name]
+  end
+
+  def test_class_members_returns_copy
+    klass = Data.define(:x)
+    klass.members << :y
+    assert_equal [:x], klass.members
+    assert_equal 1, klass.new(1).x
+  end
+
+  # ---- reference counting ----
+
+  def test_to_h_remains_valid_after_returned_hashes_are_released
+    klass = Data.define(:name, :score)
+    obj = klass.new("Alice", 99)
+    3.times do
+      h = obj.to_h
+      assert_equal "Alice", h[:name]
+      assert_equal 99, h[:score]
+      h = nil
+    end
+    assert_equal "Alice", obj.name
+    assert_equal 99, obj.score
+  end
+
+  def test_class_members_remain_valid_after_returned_arrays_are_released
+    klass = Data.define(:name, :score)
+    3.times do
+      members = klass.members
+      assert_equal [:name, :score], members
+      members = nil
+    end
+    obj = klass.new("Alice", 99)
+    assert_equal "Alice", obj.name
+    assert_equal 99, obj.score
+  end
+
+  def test_instances_release_members
+    klass = Data.define(:value)
+    before, after = memory_around { discard_instances(klass) }
+    assert_equal before, after
+  end
+
+  def test_returned_collections_release_memory
+    klass = Data.define(:value)
+    obj = klass.new('payload')
+    before, after = memory_around { discard_collections(klass, obj) }
+    assert_equal before, after
+  end
+
+  def test_definitions_release_memory
+    keys = []
+    32.times { |i| keys << "member_#{i}".to_sym }
+    before, after = memory_around { discard_definitions(keys) }
+    assert_equal before, after
+  end
+
+  def instance_of_temporary_definition
+    Data.define(:val).new(1)
+  end
+
+  # The used size before and after one more round of the block, once the
+  # block has run until two rounds in a row leave the same size (at most 5
+  # rounds). The size counts whole allocator blocks, so the heap the
+  # earlier tests left (their order depends on the host Ruby) moves it by
+  # a few bytes on the first rounds even with no leak. A leak grows it
+  # every round and never settles. Both sizes are taken here, in the same
+  # frame, so the block and this method's registers count in both.
+  def memory_around
+    last = nil
+    before = nil
+    round = 0
+    while round < 5
+      yield
+      before = used_memory
+      break if before == last
+      last = before
+      round += 1
+    end
+    yield
+    [before, used_memory]
+  end
+
+  def used_memory
+    require 'picorubyvm'
+    PicoRubyVM.memory_statistics[:used]
+  end
+
+  def discard_instances(klass)
+    100.times do
+      obj = klass.new('payload')
+      obj = nil
+    end
+    nil
+  end
+
+  def discard_collections(klass, obj)
+    100.times do
+      obj.to_h
+      klass.members
+    end
+    nil
+  end
+
+  def discard_definitions(keys)
+    20.times do
+      klass = Data.define(*keys)
+      klass = nil
+    end
+    nil
   end
 
 end

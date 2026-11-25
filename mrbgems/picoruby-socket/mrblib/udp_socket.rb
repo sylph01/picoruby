@@ -2,19 +2,32 @@ class UDPSocket
   # UDPSocket is already defined in C
   # This file adds convenience methods
 
-  # Receive data with blocking behavior
-  # Continuously polls recvfrom_nonblock until data is available
+  if Object.const_defined?(:SocketDNSResolver)
+    def bind(host, port)
+      if host && host != "" && host != "0.0.0.0"
+        host = SocketDNSResolver.resolve_host(host)
+      end
+      __bind_resolved(host, port)
+    end
+
+    def connect(host, port)
+      host = SocketDNSResolver.resolve_host(host)
+      __connect_resolved(host, port)
+    end
+
+    def send(data, flags = 0, host = nil, port = nil)
+      host = SocketDNSResolver.resolve_host(host) if host
+      host ? __send_resolved(data, flags, host, port) : __send_resolved(data, flags)
+    end
+  end
+
+  # Receive data with blocking behavior.
+  # Ctrl-C closes the socket and raises Interrupt; a close from another
+  # task raises IOError.
   def recvfrom(maxlen, flags = 0)
-    Signal.trap(:INT) do
-      self.close
-    end
-    while true
-      result = recvfrom_nonblock(maxlen, flags)
-      break if result
-      sleep_ms 10
-    end
+    result = __wait_interruptible { recvfrom_nonblock(maxlen, flags) }
     # @type var result: [String, Array[String | Integer]]
-    return result
+    result
   end
 
   # Read data from any source (simplified version of recvfrom)

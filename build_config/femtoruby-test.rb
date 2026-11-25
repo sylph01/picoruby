@@ -1,14 +1,19 @@
-MRuby::Build.new do |conf|
+# Test runner for `rake test:gems:femtoruby`. Named, so that it builds
+# under build/femtoruby-test and leaves build/host (rake femtoruby:debug)
+# alone.
+MRuby::Build.new('femtoruby-test') do |conf|
 
   conf.toolchain
 
   conf.cc.defines << "PICORB_PLATFORM_POSIX"
   conf.cc.defines << "PICORB_INT64"
   conf.cc.defines << "MRBC_TICK_UNIT=4"
+  conf.cc.defines << "MRBC_TASK_SCHEDULER_HOOK"  # picoruby-irq event bridge
   conf.cc.defines << "MRBC_TIMESLICE_TICK_COUNT=3"
   conf.cc.defines << "MRBC_USE_STRING_UTF8"
+  conf.cc.defines << "MAX_SYMBOLS_COUNT=2000"
 
-  conf.femtoruby(alloc_libc: true)
+  conf.femtoruby
 
   # Link OpenSSL libraries for socket SSL support
   conf.linker.libraries << 'ssl'

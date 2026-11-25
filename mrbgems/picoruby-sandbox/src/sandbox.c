@@ -13,6 +13,10 @@ typedef struct sandbox_state {
   mrbc_tcb *tcb;
 #endif
   uint8_t *vm_code;
+#if defined(PICORB_VM_MRUBYC)
+  uint8_t *loaded_code; /* compiled here and loaded into the task's VM */
+  bool code_owned;      /* vm_code came from the compiler, not the caller */
+#endif
   pm_options_t *options;
 } SandboxState;
 
@@ -32,8 +36,7 @@ init_options(pm_options_t *options)
   if (!options) {
     return;
   }
-  pm_string_t *encoding = &options->encoding;
-  pm_string_constant_init(encoding, "UTF-8", 5);
+  pm_string_init(&options->encoding, (const uint8_t *)"UTF-8", 5);
 }
 
 #if defined(PICORB_VM_MRUBY)

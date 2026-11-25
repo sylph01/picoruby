@@ -5,6 +5,7 @@ MRuby::GemBox.new do |conf|
   conf.gem core: 'picoruby-base64'
   conf.gem core: 'picoruby-json'
   conf.gem core: 'picoruby-yaml'
+  conf.gem core: 'picoruby-benchmark'
   if vm_mruby?
     conf.gem gemdir: "#{MRUBY_ROOT}/mrbgems/picoruby-mruby/lib/mruby/mrbgems/mruby-binding"
     conf.gem gemdir: "#{MRUBY_ROOT}/mrbgems/picoruby-mruby/lib/mruby/mrbgems/mruby-eval"
@@ -12,10 +13,21 @@ MRuby::GemBox.new do |conf|
     conf.gem core: "picoruby-eval"
   end
   conf.gem core: "picoruby-marshal"
-  conf.gem core: 'picoruby-data'
-  conf.gem core: 'picoruby-logger'
-  conf.gem core: 'picoruby-terminus'
-  conf.gem core: 'picoruby-karmatic_arcade'
+  # Data: mruby's own gem on mruby (members as methods, ==, with, keyword
+  # new), the small one on mruby/c
+  if vm_mrubyc?
+    conf.gem core: 'picoruby-data'
+  else
+    conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-data"
+  end
+  unless wasm?
+    # Not useful on WASM. terminus and karmatic_arcade also pull in
+    # picoruby-bdffont, so excluding them here keeps it out of WASM too.
+    # Microcontroller (mruby/c, mruby) and POSIX builds keep these.
+    conf.gem core: 'picoruby-logger'
+    conf.gem core: 'picoruby-terminus'
+    conf.gem core: 'picoruby-karmatic_arcade'
+  end
   if vm_mrubyc?
     conf.gem core: "picoruby-pack"
     conf.gem core: "picoruby-numeric-ext"
@@ -27,6 +39,9 @@ MRuby::GemBox.new do |conf|
     conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-numeric-ext"
     conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-kernel-ext"
     conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-string-ext"
+    # String#force_encoding: a binary result (Base64.decode64) can be read
+    # as UTF-8 again
+    conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-encoding"
     conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-array-ext"
     conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-hash-ext"
     conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-sprintf"
@@ -35,8 +50,16 @@ MRuby::GemBox.new do |conf|
     conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-error"
     conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-math"
     conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-pack"
+    # Enumerator (external iteration on mruby-fiber) and Enumerator::Lazy.
+    # Their core: dependencies would be looked up in this mrbgems/, so
+    # fiber and enum-ext are named here first.
+    conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-fiber"
+    conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-enum-ext"
+    conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-enumerator"
+    conf.gem gemdir: "picoruby-mruby/lib/mruby/mrbgems/mruby-enum-lazy"
   end
   unless wasm?
-    conf.gem core: "picoruby-regexp_light"
+    # WASM has its own Regexp over the JavaScript RegExp (picoruby-wasm)
+    conf.gem core: "picoruby-regexp"
   end
 end

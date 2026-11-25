@@ -2,6 +2,9 @@
 #include <string.h>
 #include <stdint.h>
 #include "picoruby.h"
+#ifdef PICO_CYW43_ARCH_POLL
+#include "c_task_queue.h"
+#endif
 
 typedef struct {
   picorb_ssl_socket_t *ptr;
@@ -12,7 +15,7 @@ static void
 mrbc_ssl_socket_free(mrbc_value *self)
 {
   ssl_socket_wrapper_t *wrapper = (ssl_socket_wrapper_t *)self->instance->data;
-  if (wrapper->ptr && !SSLSocket_closed(wrapper->vm, wrapper->ptr)) {
+  if (wrapper->ptr) {
     SSLSocket_close(wrapper->vm, wrapper->ptr);
     wrapper->ptr = NULL;
   }
@@ -113,8 +116,18 @@ c_ssl_socket_new(mrbc_vm *vm, mrbc_value *v, int argc)
   }
 
   /* Store references for GC protection */
-  mrbc_instance_setiv(&instance, mrbc_str_to_symid("@tcp_socket"), &tcp_socket_obj);
-  mrbc_instance_setiv(&instance, mrbc_str_to_symid("@ssl_context"), &ssl_context_obj);
+  mrbc_instance_setiv(&instance, mrbc_str_to_symid("tcp_socket"), &tcp_socket_obj);
+  mrbc_instance_setiv(&instance, mrbc_str_to_symid("ssl_context"), &ssl_context_obj);
+
+#ifdef PICO_CYW43_ARCH_POLL
+  if (!picorb_socket_attach_event_queue(vm, &instance,
+                                        SSLSocket_event_socket(wrapper->ptr))) {
+    SSLSocket_close(vm, wrapper->ptr);
+    wrapper->ptr = NULL;
+    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "failed to allocate event queue");
+    return;
+  }
+#endif
 
   SET_RETURN(instance);
 }
@@ -155,6 +168,7 @@ c_ssl_socket_open(mrbc_vm *vm, mrbc_value *v, int argc)
   /* Create instance with wrapper structure */
   mrbc_value instance = mrbc_instance_new(vm, v->cls, sizeof(ssl_socket_wrapper_t));
   ssl_socket_wrapper_t *wrapper = (ssl_socket_wrapper_t *)instance.instance->data;
+  wrapper->vm = vm;
 
   /* Create SSL socket */
   wrapper->ptr = SSLSocket_create(vm, ctx_wrapper->ptr);
@@ -178,18 +192,39 @@ c_ssl_socket_open(mrbc_vm *vm, mrbc_value *v, int argc)
     return;
   }
 
-  /* Perform SSL handshake */
-  if (!SSLSocket_connect(vm, wrapper->ptr)) {
+#ifdef PICO_CYW43_ARCH_POLL
+  mrbc_instance_setiv(&instance, mrbc_str_to_symid("ssl_context"), &ssl_context_obj);
+  if (!picorb_socket_attach_event_queue(vm, &instance,
+                                        SSLSocket_event_socket(wrapper->ptr))) {
     SSLSocket_close(vm, wrapper->ptr);
     wrapper->ptr = NULL;
+    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "failed to allocate event queue");
+    return;
+  }
+  SET_RETURN(instance);
+#else
+  /* Perform SSL handshake */
+  if (!SSLSocket_connect(vm, wrapper->ptr)) {
+#if !defined(PICORB_PLATFORM_POSIX) && !defined(PICORB_PLATFORM_ESP32)
+    const char *net_error = Net_get_last_error();
+#endif
+    SSLSocket_close(vm, wrapper->ptr);
+    wrapper->ptr = NULL;
+#if !defined(PICORB_PLATFORM_POSIX) && !defined(PICORB_PLATFORM_ESP32)
+    if (net_error && net_error[0]) {
+      mrbc_raise(vm, MRBC_CLASS(RuntimeError), net_error);
+      return;
+    }
+#endif
     mrbc_raise(vm, MRBC_CLASS(RuntimeError), "SSL connection failed");
     return;
   }
 
   /* Store reference for GC protection */
-  mrbc_instance_setiv(&instance, mrbc_str_to_symid("@ssl_context"), &ssl_context_obj);
+  mrbc_instance_setiv(&instance, mrbc_str_to_symid("ssl_context"), &ssl_context_obj);
 
   SET_RETURN(instance);
+#endif
 }
 
 /*
@@ -210,12 +245,73 @@ c_ssl_socket_connect(mrbc_vm *vm, mrbc_value *v, int argc)
     return;
   }
 
+  /* SSLSocket.open already connected; connect is then a no-op */
+  if (!SSLSocket_closed(vm, wrapper->ptr)) {
+    return;
+  }
+
   /* Perform SSL handshake */
   if (!SSLSocket_connect(vm, wrapper->ptr)) {
+#if !defined(PICORB_PLATFORM_POSIX) && !defined(PICORB_PLATFORM_ESP32)
+    const char *net_error = Net_get_last_error();
+    if (net_error && net_error[0]) {
+      mrbc_raise(vm, MRBC_CLASS(RuntimeError), net_error);
+      return;
+    }
+#endif
     mrbc_raise(vm, MRBC_CLASS(RuntimeError), "SSL handshake failed");
     return;
   }
 }
+
+#ifdef PICO_CYW43_ARCH_POLL
+static void
+c_ssl_socket_set_connect_hostname(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  if (argc != 1 || GET_ARG(1).tt != MRBC_TT_STRING) {
+    mrbc_raise(vm, MRBC_CLASS(ArgumentError), "hostname is required");
+    return;
+  }
+
+  ssl_socket_wrapper_t *wrapper = (ssl_socket_wrapper_t *)v[0].instance->data;
+  if (!wrapper->ptr || !SSLSocket_set_connect_hostname(
+        vm, wrapper->ptr, (const char *)GET_ARG(1).string->data)) {
+    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "failed to set connect hostname");
+    return;
+  }
+
+  SET_TRUE_RETURN();
+}
+
+static void
+c_ssl_socket_connection_state(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  ssl_socket_wrapper_t *wrapper = (ssl_socket_wrapper_t *)v[0].instance->data;
+  SET_INT_RETURN(SSLSocket_connection_state(vm, wrapper->ptr));
+}
+
+static void
+c_ssl_socket_finish_connect(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  ssl_socket_wrapper_t *wrapper = (ssl_socket_wrapper_t *)v[0].instance->data;
+  if (wrapper->ptr && SSLSocket_finish_connect(vm, wrapper->ptr)) {
+    SET_TRUE_RETURN();
+  } else {
+    SET_FALSE_RETURN();
+  }
+}
+
+static void
+c_ssl_socket_error_message(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  const char *message = Net_get_last_error();
+  if (message && message[0]) {
+    SET_RETURN(mrbc_string_new_cstr(vm, message));
+  } else {
+    SET_NIL_RETURN();
+  }
+}
+#endif
 
 /*
  * ssl_socket.send(data, flags) -> Integer
@@ -256,7 +352,6 @@ c_ssl_socket_send(mrbc_vm *vm, mrbc_value *v, int argc)
     return;
   }
 
-  mrbc_incref(&v[0]);
   SET_INT_RETURN(sent);
 }
 
@@ -320,7 +415,6 @@ c_ssl_socket_readpartial(mrbc_vm *vm, mrbc_value *v, int argc)
 
   mrbc_value ret = mrbc_string_new(vm, buffer, received);
   if (buffer != stack_buf) picorb_free(vm, buffer);
-  mrbc_incref(&v[0]);
   SET_RETURN(ret);
 }
 
@@ -384,7 +478,6 @@ c_ssl_socket_read_nonblock(mrbc_vm *vm, mrbc_value *v, int argc)
 
   mrbc_value ret = mrbc_string_new(vm, buffer, received);
   if (buffer != stack_buf) picorb_free(vm, buffer);
-  mrbc_incref(&v[0]);
   SET_RETURN(ret);
 }
 
@@ -762,9 +855,12 @@ c_ssl_context_set_key_file(mrbc_vm *vm, mrbc_value *v, int argc)
 #endif
 }
 
-/* ssl_context.set_ca_pem(str) -- store pointer to String buffer; keeps String alive via ivar */
+/* Common body of set_ca_pem/set_cert_pem/set_key_pem -- store pointer to
+ * String buffer; ivar keeps it alive */
 static void
-c_ssl_context_set_ca_pem(mrbc_vm *vm, mrbc_value *v, int argc)
+c_ssl_context_set_pem(mrbc_vm *vm, mrbc_value *v, int argc, const char *ivar_name,
+                      bool (*setter)(picorb_state *, picorb_ssl_context_t *, const void *, size_t),
+                      const char *error_message)
 {
   if (argc != 1) {
     mrbc_raise(vm, MRBC_CLASS(ArgumentError), "wrong number of arguments");
@@ -783,76 +879,35 @@ c_ssl_context_set_ca_pem(mrbc_vm *vm, mrbc_value *v, int argc)
     return;
   }
 
-  mrbc_instance_setiv(&v[0], mrbc_str_to_symid("@ca_pem"), &str);
+  mrbc_instance_setiv(&v[0], mrbc_str_to_symid(ivar_name), &str);
 
-  if (!SSLContext_set_ca(vm, wrapper->ptr, (const void *)str.string->data, (size_t)str.string->size)) {
-    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "failed to set CA certificate");
+  if (!setter(vm, wrapper->ptr, (const void *)str.string->data, (size_t)str.string->size)) {
+    mrbc_raise(vm, MRBC_CLASS(RuntimeError), error_message);
     return;
   }
 
   SET_NIL_RETURN();
+}
+
+/* ssl_context.set_ca_pem(str) */
+static void
+c_ssl_context_set_ca_pem(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  c_ssl_context_set_pem(vm, v, argc, "ca_pem", SSLContext_set_ca, "failed to set CA certificate");
 }
 
 /* ssl_context.set_cert_pem(str) */
 static void
 c_ssl_context_set_cert_pem(mrbc_vm *vm, mrbc_value *v, int argc)
 {
-  if (argc != 1) {
-    mrbc_raise(vm, MRBC_CLASS(ArgumentError), "wrong number of arguments");
-    return;
-  }
-
-  ssl_context_wrapper_t *wrapper = (ssl_context_wrapper_t *)v[0].instance->data;
-  if (!wrapper->ptr) {
-    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "SSL context is not initialized");
-    return;
-  }
-
-  mrbc_value str = GET_ARG(1);
-  if (str.tt != MRBC_TT_STRING) {
-    mrbc_raise(vm, MRBC_CLASS(TypeError), "argument must be a String");
-    return;
-  }
-
-  mrbc_instance_setiv(&v[0], mrbc_str_to_symid("@cert_pem"), &str);
-
-  if (!SSLContext_set_cert(vm, wrapper->ptr, (const void *)str.string->data, (size_t)str.string->size)) {
-    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "failed to set certificate");
-    return;
-  }
-
-  SET_NIL_RETURN();
+  c_ssl_context_set_pem(vm, v, argc, "cert_pem", SSLContext_set_cert, "failed to set certificate");
 }
 
 /* ssl_context.set_key_pem(str) */
 static void
 c_ssl_context_set_key_pem(mrbc_vm *vm, mrbc_value *v, int argc)
 {
-  if (argc != 1) {
-    mrbc_raise(vm, MRBC_CLASS(ArgumentError), "wrong number of arguments");
-    return;
-  }
-
-  ssl_context_wrapper_t *wrapper = (ssl_context_wrapper_t *)v[0].instance->data;
-  if (!wrapper->ptr) {
-    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "SSL context is not initialized");
-    return;
-  }
-
-  mrbc_value str = GET_ARG(1);
-  if (str.tt != MRBC_TT_STRING) {
-    mrbc_raise(vm, MRBC_CLASS(TypeError), "argument must be a String");
-    return;
-  }
-
-  mrbc_instance_setiv(&v[0], mrbc_str_to_symid("@key_pem"), &str);
-
-  if (!SSLContext_set_key(vm, wrapper->ptr, (const void *)str.string->data, (size_t)str.string->size)) {
-    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "failed to set key");
-    return;
-  }
-
-  SET_NIL_RETURN();
+  c_ssl_context_set_pem(vm, v, argc, "key_pem", SSLContext_set_key, "failed to set key");
 }
 
 /* ssl_context.set_key(addr, size) */
@@ -970,10 +1025,20 @@ ssl_socket_init(mrbc_vm *vm, mrbc_class *class_BasicSocket)
   mrbc_define_destructor(class_SSLSocket, mrbc_ssl_socket_free);
 
   mrbc_define_method(vm, class_SSLSocket, "new", c_ssl_socket_new);
+#ifdef PICO_CYW43_ARCH_POLL
+  mrbc_define_method(vm, class_SSLSocket, "__set_connect_hostname", c_ssl_socket_set_connect_hostname);
+  mrbc_define_method(vm, class_SSLSocket, "__open_poll", c_ssl_socket_open);
+  mrbc_define_method(vm, class_SSLSocket, "__connect_poll", c_ssl_socket_connect);
+  mrbc_define_method(vm, class_SSLSocket, "__connection_state", c_ssl_socket_connection_state);
+  mrbc_define_method(vm, class_SSLSocket, "__finish_connect", c_ssl_socket_finish_connect);
+  mrbc_define_method(vm, class_SSLSocket, "__error_message", c_ssl_socket_error_message);
+  mrbc_define_method(vm, class_SSLSocket, "__readpartial_poll", c_ssl_socket_readpartial);
+#else
   mrbc_define_method(vm, class_SSLSocket, "open", c_ssl_socket_open);
   mrbc_define_method(vm, class_SSLSocket, "connect", c_ssl_socket_connect);
-  mrbc_define_method(vm, class_SSLSocket, "send", c_ssl_socket_send);
   mrbc_define_method(vm, class_SSLSocket, "readpartial", c_ssl_socket_readpartial);
+#endif
+  mrbc_define_method(vm, class_SSLSocket, "send", c_ssl_socket_send);
   mrbc_define_method(vm, class_SSLSocket, "read_nonblock", c_ssl_socket_read_nonblock);
   mrbc_define_method(vm, class_SSLSocket, "close", c_ssl_socket_close);
   mrbc_define_method(vm, class_SSLSocket, "closed?", c_ssl_socket_closed_q);

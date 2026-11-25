@@ -13,6 +13,19 @@ MRuby::Gem::Specification.new('picoruby-machine') do |spec|
     spec.linker.flags << '-pthread'
   end
 
+  defines = build.cc.defines + spec.cc.defines
+  use_estalloc = defines.include?("PICORB_ALLOC_ESTALLOC") &&
+                 (build.picoruby? || (build.femtoruby? && defines.include?("MRBC_ALLOC_LIBC")))
+
+  if use_estalloc
+    align = defines.find { _1.start_with?("PICORB_ALLOC_ALIGN=") }.then do |define|
+      define&.split("=")&.last || 4
+    end
+    spec.cc.defines << "ESTALLOC_ALIGNMENT=#{align}" unless spec.cc.defines.any? { _1.start_with?("ESTALLOC_ALIGNMENT=") }
+    spec.cc.defines << "ESTALLOC_DEBUG=1" if defines.any? { _1.start_with?("PICORB_DEBUG") }
+    spec.cc.include_paths << "#{dir}/lib/estalloc"
+  end
+
   if build.gems.map(&:name).include?('picoruby-mruby')
     # Workaround:
     #   Locate mruby-io at the top of gem_init.c
@@ -20,9 +33,5 @@ MRuby::Gem::Specification.new('picoruby-machine') do |spec|
     if build.posix?
       spec.add_dependency 'mruby-io'
     end
-    # This gem implements mruby-task's HAL (hal.h aliases picorb_hal_* to
-    # mrb_hal_task_*); depend on it so task_hal.h — the contract being
-    # implemented, including mrb_task_switch_reason — is on the include path.
-    spec.add_dependency 'mruby-task', gemdir: "#{MRUBY_ROOT}/mrbgems/picoruby-mruby/lib/mruby/mrbgems/mruby-task"
   end
 end

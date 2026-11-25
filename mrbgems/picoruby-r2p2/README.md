@@ -33,12 +33,17 @@ You may need to look for a fine configuration.
 
 Most problems on the terminal emulator would come from CR/LF handling and escape sequence timing issue.
 
-### Dual CDC USB ports for debug output
+### USB CDC ports
 
-R2P2 uses dual CDC (Communications Device Class) USB ports to separate standard output and debug output:
+R2P2 uses three CDC (Communications Device Class) USB ports:
 
 - **CDC 0** (in Linux, typically `/dev/ttyACM0`): Main terminal for shell interaction and application stdout
 - **CDC 1** (e.g. `/dev/ttyACM1`): Debug output (stderr) for system messages and debug prints
+- **CDC 2** (e.g. `/dev/ttyACM2`): Raw MIDI byte stream output for WebSerial
+
+The third interface changes the composite USB product ID from older two-CDC
+firmware. The host operating system may enumerate all ports again after a
+firmware update.
 
 Debug output is only enabled in debug builds.
 
@@ -82,11 +87,7 @@ From the picoruby root directory:
 bundle install
 rake r2p2:setup
 cd mrbgems/picoruby-r2p2/lib/pico-sdk && \
-  git checkout 2.2.0 && \
-  git submodule update --init --recursive && \
-  cd -
-cd mrbgems/picoruby-r2p2/lib/pico-extras && \
-  git checkout sdk-2.2.0 && \
+  git checkout 2.3.0 && \
   git submodule update --init --recursive && \
   cd -
 ```
@@ -115,6 +116,29 @@ rake r2p2:picoruby:pico2:debug
 rake r2p2:picoruby:pico2_w:prod
 ```
 
+R2P2 routes libc `malloc`/`free` to Estalloc, so LwIP and mbedTLS share
+the Ruby heap.
+
+### RAM layout
+
+The Ruby heap has no fixed size. At boot, `ports/rp2040/main.c` gives
+Estalloc all the RAM between the end of `.bss` and the top of general RAM,
+minus a small reserve for the newlib heap. Static data that a build links
+in shrinks the heap by itself. The boot log shows the result:
+
+```
+Heap size: 386 KB (0x2001a510-0x2007b000), newlib reserve 4 KB
+```
+
+The core 0 stack is placed by the linker script. On RP2040 it lives in
+scratch RAM. On RP2350 it lives in a `STACK` region above the heap, which
+`cmake/CMakeLists.txt` sizes per build mode. Core 1 uses `SCRATCH_X`.
+
+The newlib heap is a strip at the top of RAM that `_sbrk` in `main.c`
+hands out. The reserve is 4 KB by default. Set `R2P2_NEWLIB_HEAP_RESERVE`
+(bytes) to change it. A `malloc` that does not fit the strip returns NULL
+instead of writing into the Ruby heap.
+
 The output `.uf2` file is generated in:
 ```
 build/r2p2/{vm}/{board}/{mode}/R2P2-{VM}-{BOARD}-{VERSION}-{DATE}-{REV}.uf2
@@ -129,11 +153,10 @@ rake r2p2:picoruby:pico2:clean
 
 ### Using an external pico-sdk
 
-If you already have pico-sdk and pico-extras installed elsewhere, set the environment variables before building:
+If you already have pico-sdk installed elsewhere, set the environment variable before building:
 
 ```sh
 export PICO_SDK_PATH=/path/to/pico-sdk
-export PICO_EXTRAS_PATH=/path/to/pico-extras
 rake r2p2:femtoruby:pico:debug
 ```
 
@@ -156,10 +179,8 @@ picoruby-r2p2/
   cmake/
     CMakeLists.txt         # CMake build configuration
     pico_sdk_import.cmake
-    pico_extras_import.cmake
   lib/
     pico-sdk/              # git submodule
-    pico-extras/           # git submodule
     rp2040js/              # git submodule (emulator)
 ```
 

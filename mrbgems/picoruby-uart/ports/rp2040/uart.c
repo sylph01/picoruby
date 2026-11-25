@@ -16,24 +16,39 @@
     } \
   } while (0)
 
-static RingBuffer *rx_buffers[2];
+/* The IRQ handler is installed once per unit; see UART_open(). */
+static bool producer_started[2];
+
+static void
+drain_rx_fifo(uart_inst_t *hw, int unit_num)
+{
+  RingBuffer *rx = UART_unit_rx(unit_num);
+  bool stored = false;
+
+  while (uart_is_readable(hw)) {
+    uint8_t ch = uart_getc(hw);
+    /* Drain the FIFO even with no ring, or the IRQ never deasserts. */
+    if (rx && UART_pushBufferAt(rx, ch, time_us_32())) {
+      stored = true;
+    }
+  }
+  /* Signal once for the whole burst, and only once something is
+     actually there to read: a dropped byte is nothing new to drain. */
+  if (stored) {
+    UART_signal_rx(unit_num);
+  }
+}
 
 static void
 on_uart0_rx(void)
 {
-  while (uart_is_readable(uart0)) {
-    uint8_t ch = uart_getc(uart0);
-    UART_pushBuffer(rx_buffers[0], ch);
-  }
+  drain_rx_fifo(uart0, PICORB_UART_RP2040_UART0);
 }
 
 static void
 on_uart1_rx(void)
 {
-  while (uart_is_readable(uart1)) {
-    uint8_t ch = uart_getc(uart1);
-    UART_pushBuffer(rx_buffers[1], ch);
-  }
+  drain_rx_fifo(uart1, PICORB_UART_RP2040_UART1);
 }
 
 int
@@ -48,28 +63,108 @@ UART_unit_name_to_unit_num(const char *name)
   }
 }
 
-void
-UART_init(int unit_num, uint32_t txd_pin, uint32_t rxd_pin, RingBuffer *ring_buffer)
-{
-  uint irq = UART0_IRQ;
-  uart_inst_t *unit = NULL;
-  UNIT_SELECT();
-  uart_init(unit, DEFAULT_BAUDRATE);
+/*
+ * RP2040 GPIO function-select table (valid for RP2350 QFN-60 as well).
+ * Each array lists the GPIOs usable as the given UART signal, terminated by -1.
+ */
+static const int8_t uart0_tx_pins[] = {0, 12, 16, 28, -1};
+static const int8_t uart1_tx_pins[] = {4, 8, 20, 24, -1};
+static const int8_t uart0_rx_pins[] = {1, 13, 17, 29, -1};
+static const int8_t uart1_rx_pins[] = {5, 9, 21, 25, -1};
 
+/* Return the unit that owns pin for the given signal, or -1 if none. */
+static int
+pin_to_unit(const int8_t *unit0_pins, const int8_t *unit1_pins, int pin)
+{
+  int i = 0;
+  while (unit0_pins[i] != -1) {
+    if (unit0_pins[i] == pin) {
+      return PICORB_UART_RP2040_UART0;
+    }
+    i++;
+  }
+  i = 0;
+  while (unit1_pins[i] != -1) {
+    if (unit1_pins[i] == pin) {
+      return PICORB_UART_RP2040_UART1;
+    }
+    i++;
+  }
+  return -1;
+}
+
+int
+UART_unit_num_from_pins(const char *unit_name, int txd_pin, int rxd_pin)
+{
+  int candidate = -1;
+  if (0 <= txd_pin) {
+    int u = pin_to_unit(uart0_tx_pins, uart1_tx_pins, txd_pin);
+    if (u < 0) {
+      return UART_ERROR_UNIT_MISMATCH;
+    }
+    candidate = u;
+  }
+  if (0 <= rxd_pin) {
+    int u = pin_to_unit(uart0_rx_pins, uart1_rx_pins, rxd_pin);
+    if (u < 0) {
+      return UART_ERROR_UNIT_MISMATCH;
+    }
+    if (0 <= candidate && candidate != u) {
+      return UART_ERROR_UNIT_MISMATCH;
+    }
+    candidate = u;
+  }
+  if (unit_name && unit_name[0] != '\0') {
+    int name_unit = UART_unit_name_to_unit_num(unit_name);
+    if (name_unit < 0) {
+      return UART_ERROR_INVALID_UNIT;
+    }
+    if (0 <= candidate && candidate != name_unit) {
+      return UART_ERROR_UNIT_MISMATCH;
+    }
+    return name_unit;
+  }
+  if (candidate < 0) {
+    return UART_ERROR_UNDETERMINED;
+  }
+  return candidate;
+}
+
+void
+UART_open(int unit_num, uint32_t txd_pin, uint32_t rxd_pin)
+{
+  uart_inst_t *unit = NULL;
+
+  if (unit_num < 0 || 2 <= unit_num) {
+    return;
+  }
+  UNIT_SELECT();
+
+  /* uart_init() resets the UART block, which clears IMSC and so turns
+     the RX interrupt back off. It must therefore run only where the
+     interrupt is (re-)armed straight afterwards -- doing it on every
+     open would leave a reopened unit with a producer that never fires.
+     Baudrate and format are not lost either way: UART#initialize sets
+     them right after this returns. */
+  if (!producer_started[unit_num]) {
+    uint irq;
+
+    uart_init(unit, DEFAULT_BAUDRATE);
+    if (unit_num == PICORB_UART_RP2040_UART0) {
+      irq = UART0_IRQ;
+      irq_set_exclusive_handler(irq, on_uart0_rx);
+    } else {
+      irq = UART1_IRQ;
+      irq_set_exclusive_handler(irq, on_uart1_rx);
+    }
+    irq_set_enabled(irq, true);
+    uart_set_irq_enables(unit, true, false);
+    producer_started[unit_num] = true;
+  }
+
+  /* Pins are per open, so a second UART.new can move them. */
   gpio_set_function(txd_pin, GPIO_FUNC_UART);
   gpio_set_function(rxd_pin, GPIO_FUNC_UART);
-
-  if (unit_num == PICORB_UART_RP2040_UART0) {
-    irq = UART0_IRQ;
-    irq_set_exclusive_handler(irq, on_uart0_rx);
-    rx_buffers[0] = ring_buffer;
-  } else if (unit_num == PICORB_UART_RP2040_UART1) {
-    irq = UART1_IRQ;
-    irq_set_exclusive_handler(irq, on_uart1_rx);
-    rx_buffers[1] = ring_buffer;
-  }
-  irq_set_enabled(irq, true);
-  uart_set_irq_enables(unit, true, false);
 }
 
 uint32_t

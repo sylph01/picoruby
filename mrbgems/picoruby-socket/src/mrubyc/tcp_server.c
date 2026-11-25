@@ -2,6 +2,18 @@
 #include <string.h>
 #include <stdint.h>
 #include "picoruby.h"
+#ifdef PICO_CYW43_ARCH_POLL
+#include "c_task_queue.h"
+
+void
+TCPServer_notify_accepted(picorb_tcp_server_t *server)
+{
+  void *queue_ptr = TCPServer_event_queue(server);
+  bool pending = TCPServer_event_pending(server);
+  picorb_task_queue_notify(TCPServer_vm(server), queue_ptr, &pending);
+  TCPServer_set_event_pending(server, pending);
+}
+#endif
 
 /* Wrapper structure for storing TCP server pointer in instance->data */
 typedef struct {
@@ -71,22 +83,30 @@ c_tcp_server_new(mrbc_vm *vm, mrbc_value *v, int argc)
     return;
   }
 
-  /* Note: host parameter is currently ignored in embedded implementation */
-  /* All interfaces are bound regardless of host parameter */
-  (void)host;
-
   /* Create instance with wrapper structure */
   mrbc_value instance = mrbc_instance_new(vm, v->cls, sizeof(tcp_server_wrapper_t));
   tcp_server_wrapper_t *wrapper = (tcp_server_wrapper_t *)instance.instance->data;
   wrapper->vm = vm;
 
   /* Create TCP server and store pointer */
-  wrapper->ptr = TCPServer_create(vm, port, backlog);
+  wrapper->ptr = TCPServer_create(vm, host, port, backlog);
   if (!wrapper->ptr) {
-    mrbc_raise(vm, MRBC_CLASS(RuntimeError),
-               "failed to create TCP server (port may be in TIME_WAIT state, wait ~2 minutes and retry)");
+    mrbc_raisef(vm, MRBC_CLASS(RuntimeError),
+                "failed to create TCP server on %s:%d (the host may not resolve, or the port be in use or in TIME_WAIT state)",
+                host ? host : "*", port);
     return;
   }
+
+#ifdef PICO_CYW43_ARCH_POLL
+  void *queue_ptr = NULL;
+  if (!picorb_task_queue_attach(vm, &instance, &queue_ptr)) {
+    TCPServer_close(vm, wrapper->ptr);
+    wrapper->ptr = NULL;
+    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "failed to allocate event queue");
+    return;
+  }
+  TCPServer_set_event_queue(wrapper->ptr, vm, queue_ptr);
+#endif
 
   SET_RETURN(instance);
 }
@@ -121,11 +141,19 @@ c_tcp_server_accept_nonblock(mrbc_vm *vm, mrbc_value *v, int argc)
    * Store the pointer directly to preserve LwIP callback arg.
    */
   mrbc_class *class_TCPSocket = mrbc_get_class_by_name("TCPSocket");
-  mrbc_value client_obj = mrbc_instance_new(vm, class_TCPSocket, sizeof(picorb_socket_t *));
-  picorb_socket_t **sock_ptr = (picorb_socket_t **)client_obj.instance->data;
-  *sock_ptr = client;
+  mrbc_value client_obj = mrbc_instance_new(vm, class_TCPSocket, sizeof(socket_wrapper_t));
+  socket_wrapper_t *client_wrapper = (socket_wrapper_t *)client_obj.instance->data;
+  client_wrapper->ptr = client;
+  client_wrapper->vm = vm;
 
-  mrbc_incref(&v[0]);
+#ifdef PICO_CYW43_ARCH_POLL
+  if (!picorb_socket_attach_event_queue(vm, &client_obj, client)) {
+    mrbc_decref(&client_obj);
+    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "failed to allocate event queue");
+    return;
+  }
+#endif
+
   SET_RETURN(client_obj);
 }
 
@@ -154,9 +182,28 @@ c_tcp_server_close(mrbc_vm *vm, mrbc_value *v, int argc)
   /* Clear the pointer */
   wrapper->ptr = NULL;
 
-  mrbc_incref(&v[0]);
   SET_NIL_RETURN();
 }
+
+/*
+ * server.closed? -> true or false
+ */
+static void
+c_tcp_server_closed_q(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  if (argc != 0) {
+    mrbc_raise(vm, MRBC_CLASS(ArgumentError), "wrong number of arguments");
+    return;
+  }
+
+  tcp_server_wrapper_t *wrapper = (tcp_server_wrapper_t *)v[0].instance->data;
+  if (wrapper->ptr) {
+    SET_FALSE_RETURN();
+  } else {
+    SET_TRUE_RETURN();
+  }
+}
+
 static void
 mrbc_tcp_server_free(mrbc_value *self)
 {
@@ -175,4 +222,5 @@ tcp_server_init(mrbc_vm *vm, mrbc_class *class_BasicSocket)
   mrbc_define_method(vm, class_TCPServer, "new", c_tcp_server_new);
   mrbc_define_method(vm, class_TCPServer, "accept_nonblock", c_tcp_server_accept_nonblock);
   mrbc_define_method(vm, class_TCPServer, "close", c_tcp_server_close);
+  mrbc_define_method(vm, class_TCPServer, "closed?", c_tcp_server_closed_q);
 }

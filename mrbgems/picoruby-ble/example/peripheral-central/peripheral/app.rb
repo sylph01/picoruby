@@ -8,8 +8,6 @@ class DemoPeripheral < BLE
   BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS = 0x03
   BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME = 0x09
   # for GATT
-  BTSTACK_EVENT_STATE = 0x60
-  HCI_EVENT_DISCONNECTION_COMPLETE = 0x05
   ATT_EVENT_CAN_SEND_NOW = 0xB7
   ATT_EVENT_MTU_EXCHANGE_COMPLETE = 0xB5
   GATT_CHARACTERISTIC_USER_DESCRIPTION = 0x2901
@@ -57,7 +55,7 @@ class DemoPeripheral < BLE
 
   def heartbeat_callback
     @counter += 1
-    temperature = ((27 - (@adc.read * 3.3 / (1<<12) - 0.706) / 0.001721) * 100).to_i
+    temperature = ((27 - (@adc.read - 0.706) / 0.001721) * 100).to_i
     push_read_value(@temperature_handle, Utils.int16_to_little_endian(temperature))
     if @counter == 10
       if @notification_enabled
@@ -76,9 +74,9 @@ class DemoPeripheral < BLE
   end
 
   def packet_callback(event_packet)
-    case event_packet[0]&.ord # event type
+    case event_packet.getbyte(0) # event type
     when BTSTACK_EVENT_STATE
-      return unless event_packet[2]&.ord ==  BLE::HCI_STATE_WORKING
+      return unless event_packet.getbyte(2) ==  BLE::HCI_STATE_WORKING
       @led_on = false
       debug_puts "Peripheral is up and running on: `#{Utils.bd_addr_to_str(gap_local_bd_addr)}`"
       advertise(@adv_data)

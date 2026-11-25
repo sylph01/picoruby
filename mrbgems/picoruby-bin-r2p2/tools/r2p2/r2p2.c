@@ -152,6 +152,7 @@ main(int argc, char **argv)
 
   init_posix();
 
+  PICORB_ESTALLOC_MRUBYC_INIT(heap_pool, HEAP_SIZE);
   mrbc_init(heap_pool, HEAP_SIZE);
   mrbc_tcb *tcb = mrbc_create_task(app, 0);
   mrbc_vm *vm = &tcb->vm;
@@ -194,13 +195,18 @@ main(int argc, char **argv)
   init_posix();
 
   int ret = 0;
-#if 1
+#if defined(PICORB_ALLOC_ESTALLOC)
   mrb_state *mrb = mrb_open_with_custom_alloc(heap_pool, HEAP_SIZE);
 #else
   mrb_state *mrb = mrb_open();
 #endif
-  if (mrb == NULL) {
+  if (MRB_OPEN_FAILURE(mrb)) {
+    /* NULL: the heap or the state allocation failed. mrb->exc: a gem
+       init raised and every gem after it is uninitialized, so the
+       first symptom would be a require that answers false. */
     fprintf(stderr, "mrb_open failed\n");
+    mrb_print_error(mrb); /* handles NULL */
+    mrb_close(mrb);       /* handles NULL */
     return 1;
   }
   global_mrb = mrb;

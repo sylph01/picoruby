@@ -1,4 +1,5 @@
 require 'socket'
+require 'uri'
 
 module Net
   # --------------------------------------------------------------------------
@@ -69,7 +70,7 @@ module Net
 
     # Finish HTTP session
     def finish
-      if @socket && !@socket.closed?
+      if @socket
         @socket.close
       end
       @socket = nil

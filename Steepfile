@@ -9,7 +9,10 @@ target :mrbgems do
   Dir.glob("**/sig/").each do |dir|
     # Exclude vendor/ because gems installed there (e.g. on GHA) have sig/ dirs
     # that cause duplicate RBS declaration errors.
-    unless dir.include?("lib/prism") || dir.include?("build/repos") || dir.include?(MRUBYC_SIG) || dir.include?("task-ext") || dir.include?("-prk-") || dir.include?("vendor/")
+    # build/ holds the RBS the picoruby-aot generator gathers per gem
+    # (build/aot-analyze/sig, build/<target>/aot-workspace/sig): copies of
+    # these same files. The Spinel submodule carries RBS of its own.
+    unless dir.include?("lib/prism") || dir.start_with?("build/") || dir.include?(MRUBYC_SIG) || dir.include?("task-ext") || dir.include?("vendor/") || dir.include?("picoruby-aot/lib/spinel/")
       signature dir
     end
   end
@@ -22,7 +25,6 @@ target :mrbgems do
   ]).each { |dir| check dir }
 
   # Skip checking String as #each_char and #each_byte raise error
-  ignore "mrbgems/picoruby-net/mrblib/ntp.rb"
   ignore "mrbgems/picoruby-picotest/mrblib/picotest/runner.rb"
   ignore "mrbgems/picoruby-mrubyc/lib/mrubyc/mrblib/array.rb"
   ignore "mrbgems/picoruby-mrubyc/lib/mrubyc/mrblib/range.rb"
@@ -31,10 +33,7 @@ target :mrbgems do
   ignore "mrbgems/picoruby-mruby/lib/mruby"
   ignore "mrblib"
   ignore "build"
-  ignore "mrbgems/picoruby-prk-*/mrblib/*.rb"
 
-  # TODO: Fix after removal of picoruby-net
-  ignore "mrbgems/picoruby-shell/shell_executables/wifi_connect.rb"
   # Task class sig is excluded from signature loading (task-ext)
   ignore "mrbgems/picoruby-shell/shell_executables/taskstat.rb"
   # We need to figure out how to manage shell commands

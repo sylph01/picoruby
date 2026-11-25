@@ -116,7 +116,6 @@ Use ROM-based certificates with physical memory addresses:
 
 ```ruby
 require 'socket'
-require 'fat'  # picoruby-filesystem-fat
 
 # Open CA certificate file from flash
 file = FAT::File.new("/flash/ca-bundle.crt", "r")
@@ -338,7 +337,6 @@ MIT License - see LICENSE file for details
 
 - `picoruby-net-http` - Net::HTTP implementation (Phase 4)
 - `picoruby-mbedtls` - TLS/SSL support (Phase 5)
-- `picoruby-net` - Legacy network implementation (deprecated)
 
 ## Design Documents
 

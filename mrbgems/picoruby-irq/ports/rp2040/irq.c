@@ -4,6 +4,7 @@
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "pico/time.h"
+#include "hardware/sync.h"
 
 #include "../../include/irq.h"
 
@@ -57,6 +58,12 @@ gpio_irq_callback(uint gpio, uint32_t events)
         event_queue[queue_tail].irq_id = i + 1;  /* IRQ ID is 1-based */
         event_queue[queue_tail].event_type = events;
         queue_tail = next_tail;
+#if defined(PICORB_IRQ_EVENT_BRIDGE)
+        /* Publish after the event is visible in the queue, so a task
+           woken by the token always finds it. Dropped events (queue
+           full) do not signal: there is nothing new to drain. */
+        IRQ_signal_from_isr(IRQ_SRC_GPIO, 1);
+#endif
       }
       break;
     }
@@ -114,6 +121,17 @@ IRQ_unregister_gpio(int irq_id)
   /* Disable GPIO IRQ */
   gpio_set_irq_enabled(irq_handlers[slot].pin, irq_handlers[slot].event_mask, false);
 
+  /* The slot, and so the ID, is handed to the next registration. Events
+     still queued for this ID would reach that registration, so turn
+     them into ID 0, which no registration has; IRQ.process skips them. */
+  uint32_t status = save_and_disable_interrupts();
+  for (int i = queue_head; i != queue_tail; i = (i + 1) & (IRQ_EVENT_QUEUE_SIZE - 1)) {
+    if (event_queue[i].irq_id == irq_id) {
+      event_queue[i].irq_id = 0;
+    }
+  }
+  restore_interrupts(status);
+
   /* Clear handler */
   memset(&irq_handlers[slot], 0, sizeof(mrb_irq_handler_t));
 
@@ -145,3 +163,93 @@ IRQ_init(void)
   queue_tail = 0;
   next_irq_id = 1;
 }
+
+/* Machine.sleep with a GPIO wake source hands the shared IO_BANK0 IRQ
+ * and the per-core GPIO callback to pico_low_power for the duration.
+ * These hooks, called by picoruby-machine's rp2040 port (declared
+ * weak there, so a build without this gem still links), take this
+ * gem's registrations offline and rebuild them afterwards. The SDK
+ * NULLs the callback and disables the wake pin's events on its way
+ * out, so resume must re-register both. gpio_set_irq_enabled() acks
+ * stale latched events on enable: EDGE events that fired during the
+ * sleep are deliberately discarded, while a LEVEL condition still
+ * asserted at resume fires again immediately -- level is condition,
+ * not history. */
+
+void
+picorb_irq_gpio_suspend(void)
+{
+  for (int i = 0; i < MAX_IRQ_HANDLERS; i++) {
+    if (irq_handlers[i].enabled) {
+      gpio_set_irq_enabled(irq_handlers[i].pin, irq_handlers[i].event_mask, false);
+    }
+  }
+}
+
+void
+picorb_irq_gpio_resume(void)
+{
+  for (int i = 0; i < MAX_IRQ_HANDLERS; i++) {
+    if (irq_handlers[i].enabled) {
+      gpio_set_irq_enabled_with_callback(irq_handlers[i].pin,
+          irq_handlers[i].event_mask, true, &gpio_irq_callback);
+    }
+  }
+}
+
+#if defined(PICORB_IRQ_EVENT_BRIDGE)
+
+/*
+ * Atomic primitives for the event bridge.
+ *
+ * Cortex-M0+ has no LDREX/STREX, so C11 atomics would lower to
+ * libatomic calls; a short interrupt-save critical section is both
+ * cheaper and valid in ISR and task context alike. This masks
+ * interrupts on the CURRENT core only: producers (ISRs) and the VM
+ * are expected to live on core 0, as PicoRuby runs today.
+ */
+
+uint32_t
+IRQ_hal_atomic_load_u32(const volatile uint32_t *p)
+{
+  uint32_t v;
+  uint32_t state = save_and_disable_interrupts();
+  v = *p;
+  restore_interrupts(state);
+  return v;
+}
+
+uint32_t
+IRQ_hal_atomic_or_u32(volatile uint32_t *p, uint32_t bits)
+{
+  uint32_t old;
+  uint32_t state = save_and_disable_interrupts();
+  old = *p;
+  *p = old | bits;
+  restore_interrupts(state);
+  return old;
+}
+
+uint32_t
+IRQ_hal_atomic_and_u32(volatile uint32_t *p, uint32_t mask)
+{
+  uint32_t old;
+  uint32_t state = save_and_disable_interrupts();
+  old = *p;
+  *p = old & mask;
+  restore_interrupts(state);
+  return old;
+}
+
+uint32_t
+IRQ_hal_atomic_exchange_u32(volatile uint32_t *p, uint32_t v)
+{
+  uint32_t old;
+  uint32_t state = save_and_disable_interrupts();
+  old = *p;
+  *p = v;
+  restore_interrupts(state);
+  return old;
+}
+
+#endif /* PICORB_IRQ_EVENT_BRIDGE */

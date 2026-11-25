@@ -38,6 +38,7 @@ async function main() {
   // Dynamically import the WASM module
   const wasmModulePath = resolve(WASM_DIR, 'picoruby.js');
   let Module;
+  globalThis.__picotestDone = false;
   try {
     const createModule = (await import(wasmModulePath)).default;
     Module = await createModule({
@@ -73,6 +74,14 @@ async function main() {
   let exitCode = 0;
   let idleCount = 0;
   const MAX_IDLE = 100;  // Exit after N consecutive idle cycles
+  // Hard wall-clock cap. The only reliable completion signal is the Ruby
+  // script reaching its end and setting __picotestDone; the idle fallback does
+  // not fire while scheduler-driven GC keeps reporting pending. If a test
+  // suspends (sleep_ms / await) and never resumes, nothing else bounds the run,
+  // so a single stuck test would block the reader (IO.popen) for hours. This
+  // turns that into a fast, reported failure. Override via env for slow hosts.
+  const MAX_WALL_MS = Number(process.env.PICORB_WASM_TEST_TIMEOUT_MS || 120000);
+  const startedAt = Date.now();
   const runStepStatus = Module._mrb_run_step_status
     ? () => Module.ccall('mrb_run_step_status', 'number', [], [])
     : () => {
@@ -84,6 +93,15 @@ async function main() {
     : () => 0;
 
   while (true) {
+    if (Date.now() - startedAt > MAX_WALL_MS) {
+      process.stderr.write(
+        `wasm-runner: timed out after ${MAX_WALL_MS}ms without completion ` +
+        `signal for ${scriptPath} (a test likely suspended and never resumed).\n`
+      );
+      exitCode = 1;
+      break;
+    }
+
     const status = runStepStatus();
     if (status < 0) {
       exitCode = 1;
@@ -92,6 +110,10 @@ async function main() {
 
     // Tick the VM
     Module.ccall('mrb_tick_wasm', null, [], []);
+
+    if (globalThis.__picotestDone === true) {
+      break;
+    }
 
     if (status === 0 && gcSchedulerPending() !== 1) {
       idleCount++;

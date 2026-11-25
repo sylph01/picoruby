@@ -23,15 +23,28 @@ gpio = GPIO.new(17, GPIO::IN|GPIO::PULL_UP)  # GPIO pin
 irq_instance = gpio.irq(GPIO::EDGE_FALL, capture: "My IRQ") do |peripheral, event_type, capture|
   puts "#{capture} -- Button pressed! Event: #{event_type}"
 end
+```
 
-# Process IRQ events in main loop
+On PicoRuby (the mruby runtime), one call then delivers events to
+every registered handler, with no polling. Delivery through
+`IRQ.start` runs in a hidden dispatcher task; do not also poll with
+`IRQ.process`, which runs handlers on whichever task calls it:
+
+```ruby
+IRQ.start
+```
+
+On FemtoRuby (mruby/c), `IRQ.start` is not available yet; poll
+instead:
+
+```ruby
 loop do
   count = IRQ.process  # Process up to 5 events
   sleep_ms(10)
 end
 ```
 
-For `capture`, see [example/irq_gpio.rb](example/irq_gpio.rb)
+For `capture`, see [example/irq_gpio_femtoruby.rb](example/irq_gpio_femtoruby.rb)
 
 ### IRQ with Debouncing
 
@@ -83,6 +96,16 @@ puts irq_instance.enabled?  # => true
 irq_instance.unregister
 ```
 
+A GPIO pin holds one registration per event. Registering the pin again
+for an event it is already registered for replaces the previous
+registration, whose `unregister` then returns `false`. The new
+registration replaces the whole of an earlier one that shares even one
+event with it. Thus `EDGE_FALL` over `EDGE_FALL | EDGE_RISE` leaves no
+registration for `EDGE_RISE`. Registrations that share no event, such as
+`EDGE_FALL` and `EDGE_RISE`, are kept. This is also what lets a script
+that is run again from the R2P2 shell take its pins back from the
+earlier run.
+
 ### Manual Event Processing
 
 ```ruby
@@ -90,6 +113,127 @@ irq_instance.unregister
 processed_count = IRQ.process(10)  # Process up to 10 events
 puts "Processed #{processed_count} events"
 ```
+
+## Event delivery: IRQ.start / IRQ.stop
+
+`IRQ.process` above is polling: something has to keep asking. On
+PicoRuby (the mruby runtime), `IRQ.start` inverts that -- register
+handlers on the peripherals you care about, flip the one switch, and
+they are called when their events arrive:
+
+```ruby
+gpio.irq(GPIO::EDGE_FALL) { |peri, ev| puts "pressed" }
+
+uart.irq(UART::RX_RECEIVE) do |u, ev|
+  while line = u.gets
+    handle(line)
+  end
+end
+
+IRQ.start   # from here on, both handlers fire without any loop
+```
+
+`IRQ.stop` releases everything and lets a finished program exit: the
+scheduler runs until no task is left waiting, so while delivery is
+started the VM stays alive to serve interrupts, and after `IRQ.stop`
+nothing lingers to hold the program open. Registrations survive a
+stop; the next `IRQ.start` picks them up again, and events that
+arrived in between are delivered then, coalesced. Registration order
+does not matter either: a handler registered after `IRQ.start` joins
+delivery immediately. Both calls are idempotent.
+
+Three rules:
+
+1. **Handlers run in a hidden dispatcher task**, not in the task that
+   registered them. Anything they touch is shared state against the
+   rest of the program. It is one task for every source, though, so no
+   two handlers ever run at the same time, and state shared between
+   handlers needs no locking. The flip side: a slow handler delays
+   every other handler's delivery -- delays, not loses; see rule 3.
+2. **A raising handler does not stop delivery.** The exception is
+   reported and delivery continues, for every peripheral.
+3. **One call may stand for a burst.** Events are coalesced at the
+   interrupt level, so a handler drains its peripheral -- reads until
+   empty -- rather than assuming one call means one event.
+
+`IRQ.start` refuses (with `ArgumentError`) a source that is already
+bound by hand through the queue-level API below -- it will not steal
+it. FemtoRuby (mruby/c) raises `NotImplementedError` for now: it
+cannot create the dispatcher task from a block. There, poll with
+`IRQ.process`, or use the queue-level API.
+
+### For driver authors
+
+Any peripheral gem can plug into this without touching IRQ internals.
+The protocol is one method and one include:
+
+```ruby
+class MySensor
+  include IRQ                 # provides #irq registration
+
+  def event_source_id         # the bridge source this device signals
+    IRQ_SRC_MYSENSOR
+  end
+end
+```
+
+The gem's interrupt handler signals event bits through
+`IRQ_signal_from_isr(source, bits)`; the bits ARE the event-type mask
+that `MySensor#irq(mask) { |peri, event_type, capture| }` filters on,
+so new event kinds are new bits, with no API change. See picoruby-uart
+(`UART::RX_RECEIVE`) for a worked example.
+
+### The queue-level API
+
+An interrupt handler cannot enter the VM, so it only stages work: it ORs
+event bits into a *source* and marks that source ready. At every
+scheduler entry, before the ready queue is read, PicoRuby turns each
+ready source into one token in the queue you bound to it. A task blocked
+on that queue becomes runnable in the same scheduler iteration.
+
+```ruby
+q = Task::Queue.new
+IRQ.bind(IRQ::SOURCE::GPIO, q)
+
+Task.new do
+  while source = q.pop
+    IRQ.take(source)   # required: this is what allows the next token
+    # One token can stand for any number of interrupts, so drain rather
+    # than assume it means exactly one event.
+    while 0 < IRQ.process
+    end
+  end
+end
+```
+
+Source ids are compile-time constants, never allocated and never reused.
+GPIO uses one source for the whole subsystem: the token only says "the
+GPIO event queue is worth looking at", and `IRQ.process` is still what
+dispatches events to their handlers.
+
+### Contract
+
+1. **Tokens are edge-latched, coalesced notifications** -- one token per
+   "something happened since you last took the bits", not one per
+   interrupt. A burst of interrupts produces a single token whose bits
+   are ORed together, so the queue can never grow without bound.
+2. **Consumers must tolerate spurious tokens.** `IRQ.take` may return 0;
+   treat that as "nothing to do" rather than an error, and drain the
+   underlying peripheral until it reports empty rather than assuming one
+   token means exactly one event.
+3. **Late binding works, but coalesced.** Bits signalled while nothing
+   was bound are not lost: `IRQ.bind` re-asserts the source, and the
+   accumulated bits arrive on the next scheduler entry as one token.
+4. **Rebinding or unbinding a source with an undelivered token raises.**
+   Take the bits first. Rebinding the same queue is always a no-op.
+
+`IRQ.simulate(source, bits)` drives the bridge exactly as an interrupt
+handler would, for tests and for bringing a consumer up on a host build.
+Note that on a host build there are no GPIO interrupts to bind to.
+
+The bridge is available on both runtimes. A build configured without a
+task scheduler does not define these methods, and pays nothing for
+them.
 
 ## Constants
 
@@ -105,9 +249,11 @@ Event types can be combined using bitwise OR:
 gpio.irq(GPIO::EDGE_FALL | GPIO::EDGE_RISE) { |gpio, event| ... }
 ```
 
-## Example: Button with LED
+## Examples
 
-See [example/irq_gpio.rb](example/irq_gpio.rb)
+- PicoRuby, button with LED (IRQ.start): [example/irq_gpio_picoruby.rb](example/irq_gpio_picoruby.rb)
+- PicoRuby, GPIO and UART on one dispatcher: [example/irq_combined_picoruby.rb](example/irq_combined_picoruby.rb)
+- FemtoRuby, button with LED (IRQ.process polling): [example/irq_gpio_femtoruby.rb](example/irq_gpio_femtoruby.rb)
 
 ## License
 

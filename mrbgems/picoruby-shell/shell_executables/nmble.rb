@@ -92,7 +92,7 @@ class WifiConfigPeripheral < BLE
       "country_code" => @country,
       "wifi" => {
         "ssid" => @ssid,
-        "encoded_password" => Base64.encode64(encrypt_password(@password)),
+        "encoded_password" => Base64.strict_encode64(encrypt_password(@password)),
         "auto_connect" => true,
         "watchdog" => (@watchdog == 'y')
       }
@@ -118,9 +118,9 @@ class WifiConfigPeripheral < BLE
 
   def packet_callback(event_packet)
     puts "packet_callback"
-    case event_packet[0]&.ord # event type
+    case event_packet.getbyte(0) # event type
     when BTSTACK_EVENT_STATE
-      return unless event_packet[2]&.ord == BLE::HCI_STATE_WORKING
+      return unless event_packet.getbyte(2) == BLE::HCI_STATE_WORKING
       debug_puts "Peripheral is running on: `#{BLE::Utils.bd_addr_to_str(gap_local_bd_addr)}`"
       advertise(@adv_data)
     when HCI_EVENT_DISCONNECTION_COMPLETE

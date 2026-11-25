@@ -3,8 +3,16 @@ $_signal_self_manage: bool
 module Machine
   def self.delay_ms: (Integer ms) -> Integer
   def self.busy_wait_ms: (Integer ms) -> Integer
-  def self.sleep: (Integer | Float sec) -> Integer
-  def self.deep_sleep: (Integer gpio_pin, bool edge, bool high) -> 0
+  # Any object that knows its pin number can be a wake source; GPIO
+  # satisfies this structurally. respond_to? is declared because RBS
+  # interfaces do not inherit Object's methods and the wrapper
+  # feature-tests its source argument.
+  interface _SleepGpioSource
+    def pin: () -> Integer
+    def respond_to?: (Symbol) -> bool
+  end
+
+  def self.sleep: (deep: bool, source: _SleepGpioSource | :timer, **untyped opt) -> void
   def self.unique_id: () -> String
   def self.read_memory: (Integer address, Integer size) -> String
   def self.tud_task: () -> void
@@ -13,20 +21,23 @@ module Machine
   def self.posix?: () -> bool
   def self.set_hwclock: (Integer tv_sec) -> Integer
   def self.get_hwclock: () -> [Integer, Integer]
-  def self.exit: (?Integer status) -> void
+  def self.exit: (?Integer status) -> bot
   def self.debug_puts: (String str) -> nil
   def self.uptime_us: () -> Integer
   def self.board_millis: () -> Integer
   def self.uptime_formatted: () -> String
   def self.reboot: (?Integer wait_ms) -> nil
   def self.check_signal: () -> void
+  def self.poll_signal: () -> Symbol?
+  def self.__trap_sigint: (bool on) -> bool
+  def self.__sigint_pending?: () -> bool
   def self.signal_self_manage: () -> void
   def self.pop_signal_self_manage: () -> bool
   def self.wifi_available?: () -> bool
   def self.mcu_name: () -> String
   def self._stdin_getc: () -> (String | nil)
   def self._stdin_gets: () -> (String | nil)
-  def self.poll_signal: () -> (Symbol | nil)
   private def self._reboot: () -> nil
+  private def self._sleep_timer: (bool deep, Integer ms) -> void
+  private def self._sleep_gpio: (bool deep, Integer pin, bool edge, bool high) -> void
 end
-

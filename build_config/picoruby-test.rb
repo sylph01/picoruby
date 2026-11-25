@@ -1,11 +1,13 @@
-MRuby::Build.new do |conf|
+# Test runner for `rake test:gems:picoruby`. Named, so that it builds under
+# build/picoruby-test and leaves build/host (rake picoruby:debug) alone:
+# the twin builds this binary with AOT, and a shared build/host handed
+# that binary to the next host build and measurement.
+MRuby::Build.new('picoruby-test') do |conf|
   conf.toolchain :gcc
 
   conf.cc.defines << "PICORB_PLATFORM_POSIX"
   conf.cc.defines << "MRB_TICK_UNIT=4"
   conf.cc.defines << "MRB_TIMESLICE_TICK_COUNT=3"
-  conf.cc.defines << "PICORB_ALLOC_ALIGN=8"
-  conf.cc.defines << "PICORB_ALLOC_ESTALLOC"
   conf.cc.defines << "PICORB_DEBUG"
   conf.cc.defines << "MRB_INT64"
   conf.cc.defines << "MRB_NO_BOXING"

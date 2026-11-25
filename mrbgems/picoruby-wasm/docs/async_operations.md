@@ -3,6 +3,7 @@
 | Pattern | Use Case | Blocks Task? | Repeatable? | Cancelable? |
 |---------|----------|-------------|-------------|-------------|
 | `addEventListener` | DOM events | No | Yes | Yes |
+| `addEventListener(sync: true)` | DOM events needing `preventDefault` or user activation | Runs inline | Yes | Yes |
 | `setTimeout` | Delayed execution | No | No | Yes |
 | `await` / `then` | Any JS Promise | Yes | No | No |
 
@@ -12,12 +13,20 @@ When a task blocks, other Ruby tasks continue running. The JavaScript event loop
 
 ```ruby
 callback_id = button.addEventListener('click') do |event|
-  puts event[:clientX].to_i
+  puts event[:clientX]  #=> Integer
 end
 
 # Remove when done
 JS::Object.removeEventListener(callback_id)
 ```
+
+The block runs as a separate task, after the browser has finished dispatching the
+event. When the handler must run *during* dispatch — to call `preventDefault`, or to
+reach an API gated on transient user activation — pass `sync: true`; see
+[callback.md](callback.md#synchronous-listeners) for the constraints that come with it.
+
+`capture:`, `once:` and `passive:` are also accepted and map to the DOM listener
+options.
 
 ## Timers
 
@@ -34,7 +43,7 @@ Debounce pattern:
 $timer = nil
 input.addEventListener('input') do |e|
   JS.global.clearTimeout($timer) if $timer
-  $timer = JS.global.setTimeout(300) { search(e.target[:value].to_s) }
+  $timer = JS.global.setTimeout(300) { search(e.target[:value]) }
 end
 ```
 
@@ -73,7 +82,7 @@ end
 
 ```ruby
 JS.global.fetch('https://api.example.com/data') do |response|
-  puts response[:status].to_i
+  puts response[:status]  #=> Integer
 end
 
 # With options

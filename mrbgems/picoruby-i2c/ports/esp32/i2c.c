@@ -1,5 +1,7 @@
 #include <string.h>
 #include "driver/i2c_master.h"
+#include "esp_rom_gpio.h"
+#include "soc/i2c_periph.h"
 
 #include "../../include/i2c.h"
 
@@ -8,10 +10,48 @@ typedef struct {
   i2c_master_bus_handle_t bus_handle;
   bool initialized;
   uint32_t frequency;
+  int8_t sda_pin;
+  int8_t scl_pin;
+  // A write without STOP (the outputs of I2C#read) is held here and sent
+  // with the read that follows as one transaction, so that the read starts
+  // with a repeated start as it does on RP2040. Many devices take a STOP
+  // between the register address and the read as the end of the access.
+  uint8_t pending[16];
+  size_t pending_len;
+  uint8_t pending_addr;
 } i2c_bus_context_t;
 
 // Context for each I2C port (ESP32 has a maximum of 2 ports)
-static i2c_bus_context_t i2c_contexts[2] = {0};
+static i2c_bus_context_t i2c_contexts[2] = {
+  [0] = { .sda_pin = -1, .scl_pin = -1 },
+  [1] = { .sda_pin = -1, .scl_pin = -1 },
+};
+
+// Pins are routed only once when the bus is created. Drivers that share them—
+// for example, the I2C touch controller in the display library—reset them
+// to point toward their own unit for each transaction, so that a single pad
+// transmits signals from only one peripheral at a time. Afterward, neither SDA nor SCL
+// is driven, and the state is not restored.
+// This is because the error path resets the state machine, but the pin routing is not reset.
+// However, this applies only to routing. The electrical configuration is not removed, and
+// gpio_set_direction(), when passing through a glitch on an active bus,
+// will hand the pad over to a normal GPIO. Two register writes are required per pin,
+// but if the pin is not shared, this results in a no-operation.
+static void
+i2c_reclaim_pins(int unit_num)
+{
+  int8_t sda_pin = i2c_contexts[unit_num].sda_pin;
+  int8_t scl_pin = i2c_contexts[unit_num].scl_pin;
+
+  if (sda_pin < 0 || scl_pin < 0) {
+    return;
+  }
+
+  esp_rom_gpio_connect_out_signal(sda_pin, i2c_periph_signal[unit_num].sda_out_sig, false, false);
+  esp_rom_gpio_connect_in_signal(sda_pin, i2c_periph_signal[unit_num].sda_in_sig, false);
+  esp_rom_gpio_connect_out_signal(scl_pin, i2c_periph_signal[unit_num].scl_out_sig, false, false);
+  esp_rom_gpio_connect_in_signal(scl_pin, i2c_periph_signal[unit_num].scl_in_sig, false);
+}
 
 int
 I2C_read_timeout_us(int unit_num, uint8_t addr, uint8_t* dst, size_t len, bool nostop, uint32_t timeout_us)
@@ -19,6 +59,17 @@ I2C_read_timeout_us(int unit_num, uint8_t addr, uint8_t* dst, size_t len, bool n
   if (!i2c_contexts[unit_num].initialized) {
     return I2C_ERROR_INVALID_UNIT;
   }
+
+  i2c_bus_context_t *ctx = &i2c_contexts[unit_num];
+  size_t pending_len = ctx->pending_len;
+  ctx->pending_len = 0;
+  if (0 < pending_len && ctx->pending_addr != addr) {
+    // The held write was for another device: send it on its own, with STOP.
+    I2C_write_timeout_us(unit_num, ctx->pending_addr, ctx->pending, pending_len, false, timeout_us);
+    pending_len = 0;
+  }
+
+  i2c_reclaim_pins(unit_num);
 
   i2c_device_config_t dev_cfg = {
     .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -38,7 +89,11 @@ I2C_read_timeout_us(int unit_num, uint8_t addr, uint8_t* dst, size_t len, bool n
     timeout_ms = 10;
   }
 
-  err = i2c_master_receive(dev_handle, dst, len, timeout_ms);
+  if (0 < pending_len) {
+    err = i2c_master_transmit_receive(dev_handle, ctx->pending, pending_len, dst, len, timeout_ms);
+  } else {
+    err = i2c_master_receive(dev_handle, dst, len, timeout_ms);
+  }
 
   i2c_master_bus_rm_device(dev_handle);
 
@@ -55,6 +110,18 @@ I2C_write_timeout_us(int unit_num, uint8_t addr, uint8_t* src, size_t len, bool 
   if (!i2c_contexts[unit_num].initialized) {
     return I2C_ERROR_INVALID_UNIT;
   }
+
+  i2c_bus_context_t *ctx = &i2c_contexts[unit_num];
+  ctx->pending_len = 0;
+  if (nostop && len <= sizeof(ctx->pending)) {
+    // Held until the next read. A longer write goes out with STOP as before.
+    memcpy(ctx->pending, src, len);
+    ctx->pending_len = len;
+    ctx->pending_addr = addr;
+    return len;
+  }
+
+  i2c_reclaim_pins(unit_num);
 
   i2c_device_config_t dev_cfg = {
     .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -120,7 +187,10 @@ I2C_gpio_init(int unit_num, uint32_t frequency, int8_t sda_pin, int8_t scl_pin)
   }
 
   i2c_contexts[unit_num].initialized = true;
+  i2c_contexts[unit_num].pending_len = 0;
   i2c_contexts[unit_num].frequency = frequency;
+  i2c_contexts[unit_num].sda_pin = sda_pin;
+  i2c_contexts[unit_num].scl_pin = scl_pin;
 
   return I2C_ERROR_NONE;
 }

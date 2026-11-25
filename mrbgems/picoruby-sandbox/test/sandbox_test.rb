@@ -30,6 +30,221 @@ class SandboxTest < Picotest::Test
     assert_equal "/myscript.rb", sandbox.result
   end
 
+  def test_load_file_inline_returns_the_value
+    skip "run_inline is on the mruby VM only" if femtoruby?
+    stub(File).open { FileDouble.new("__FILE__") }
+    sandbox = Sandbox.new
+    assert_equal "/myscript.rb", sandbox.load_file("/myscript.rb", inline: true)
+    sandbox.terminate
+  end
+
+  def test_run_inline_returns_the_value
+    skip "run_inline is on the mruby VM only" if femtoruby?
+    sandbox = Sandbox.new
+    sandbox.compile("1 + 2")
+    assert_equal 3, sandbox.run_inline
+    sandbox.terminate
+  end
+
+  def test_run_inline_raises_the_code_s_exception
+    skip "run_inline is on the mruby VM only" if femtoruby?
+    sandbox = Sandbox.new
+    sandbox.compile("raise ArgumentError, 'from the code'")
+    assert_raise(ArgumentError) { sandbox.run_inline }
+    sandbox.terminate
+  end
+
+  def test_run_inline_defines_methods_on_object_with_main_as_self
+    skip "run_inline is on the mruby VM only" if femtoruby?
+    sandbox = Sandbox.new
+    sandbox.compile("$sandbox_test_inline_self = self\ndef sandbox_test_inline_m; :inline; end")
+    sandbox.run_inline
+    assert_equal "main", $sandbox_test_inline_self.to_s
+    assert_equal :inline, Object.new.sandbox_test_inline_m
+    Object.send(:remove_method, :sandbox_test_inline_m)
+    sandbox.terminate
+  end
+
+  # A frame the VM entered through a C function (here Array#sort's block)
+  # cannot be switched away from, so the sandbox task would never run and
+  # wait would never return. run_inline needs no task switch.
+  def test_run_inline_from_a_frame_entered_through_c
+    skip "run_inline is on the mruby VM only" if femtoruby?
+    sandbox = Sandbox.new
+    values = []
+    [2, 1].sort do |a, b|
+      sandbox.compile("10 + 1")
+      values << sandbox.run_inline
+      a <=> b
+    end
+    assert_equal 11, values[0]
+    sandbox.terminate
+  end
+
+  def test_load_file_returns_without_running_an_empty_file
+    stub(File).open { FileDouble.new("") }
+    sandbox = Sandbox.new
+    assert_nil sandbox.load_file("/empty.rb")
+    assert_nil sandbox.error
+    # The task was never run. On the mruby VM the host process does not
+    # exit while such a task exists, so release it explicitly.
+    sandbox.terminate
+  end
+
+  def test_stop_is_idempotent_after_task_finishes
+    sandbox = Sandbox.new
+    sandbox.compile(":done")
+    sandbox.execute
+    sandbox.wait(timeout: nil)
+
+    assert_equal false, sandbox.stop
+    assert_equal false, sandbox.stop
+  end
+
+  # Poll until the sandbox task reaches the state, or give up after 2 sec.
+  def wait_for_state(sandbox, state)
+    n = 0
+    while sandbox.state != state
+      sleep_ms 5
+      n += 5
+      return false if 2000 < n
+    end
+    true
+  end
+
+  def test_suspend_and_resume_a_running_task
+    sandbox = Sandbox.new
+    assert sandbox.compile "sleep_ms 50; :done"
+    sandbox.execute
+    sandbox.suspend
+    assert_equal :SUSPENDED, sandbox.state
+    assert_equal true, sandbox.resume
+    assert wait_for_state(sandbox, :DORMANT)
+    assert_equal :done, sandbox.result
+  end
+
+  # Job control (Ctrl-Z, fg) must not resume a task that suspended itself:
+  # the event the task waits for resumes it. A resume from outside would
+  # run the task before the event.
+  def test_resume_does_not_resume_a_task_that_suspended_itself
+    skip "the helper task needs Task.new" if femtoruby?
+    $sandbox_test_log = []
+    sandbox = Sandbox.new
+    assert sandbox.compile <<~RUBY
+      me = Task.current
+      Task.new { sleep_ms 100; $sandbox_test_log << :event; me.resume }
+      me.suspend
+      $sandbox_test_log << :after
+      :done
+    RUBY
+    sandbox.execute
+    assert wait_for_state(sandbox, :SUSPENDED)
+    sandbox.suspend
+    assert_equal false, sandbox.resume
+    sleep_ms 20
+    assert_equal :SUSPENDED, sandbox.state
+    assert_equal [], $sandbox_test_log
+    assert wait_for_state(sandbox, :DORMANT)
+    assert_equal [:event, :after], $sandbox_test_log
+    assert_equal :done, sandbox.result
+  ensure
+    $sandbox_test_log = nil
+  end
+
+  # A task that suspends itself waits for an event. JS::Promise#await on
+  # wasm works this way: the task resumes when the Promise settles. wait
+  # must keep waiting until the task finishes (issue #545: require returned
+  # before the rest of the file ran).
+  def test_wait_keeps_waiting_while_the_task_suspends_itself
+    skip "the helper task needs Task.new" if femtoruby?
+    sandbox = Sandbox.new
+    assert sandbox.compile <<~RUBY
+      me = Task.current
+      Task.new { sleep_ms 20; me.resume }
+      me.suspend
+      :resumed
+    RUBY
+    sandbox.execute
+    assert_equal true, sandbox.wait(timeout: 2000)
+    assert_equal :DORMANT, sandbox.state
+    assert_equal :resumed, sandbox.result
+  end
+
+  # Sandbox#suspend is the job control path (Ctrl-Z in the shell). The
+  # task is not waiting for anything, so wait returns.
+  def test_wait_returns_when_the_sandbox_is_suspended_from_outside
+    skip "the helper task needs Task.new" if femtoruby?
+    sandbox = Sandbox.new
+    assert sandbox.compile "sleep_ms 10_000; :never"
+    sandbox.execute
+    # wait clears @suspended on entry. The helper sleeps long enough that
+    # this task reaches wait first, even through a GC pause (20 to 40 ms).
+    Task.new { sleep_ms 200; sandbox.suspend }
+    assert_equal true, sandbox.wait(timeout: 2000)
+    assert_equal :SUSPENDED, sandbox.state
+    sandbox.terminate
+  end
+
+  # Polls until poll_pending_suspend suspends the task.
+  def poll_until_suspended(sandbox)
+    n = 0
+    until sandbox.poll_pending_suspend
+      sleep_ms 1
+      n += 1
+      return false if 2000 < n
+    end
+    true
+  end
+
+  # Ctrl-Z on a task that suspended itself leaves the suspend pending.
+  # When the event resumes the task, the poll suspends it again and the
+  # task stays suspended until resume (fg).
+  def test_pending_suspend_catches_the_task_after_the_event
+    skip "the helper task needs Task.new" if femtoruby?
+    sandbox = Sandbox.new
+    assert sandbox.compile <<~RUBY
+      me = Task.current
+      Task.new { sleep_ms 50; me.resume }
+      me.suspend
+      sleep_ms 300
+      :done
+    RUBY
+    sandbox.execute
+    assert wait_for_state(sandbox, :SUSPENDED)
+    sandbox.suspend
+    # Before the event the poll has nothing to do.
+    assert_equal false, sandbox.poll_pending_suspend
+    assert_equal :SUSPENDED, sandbox.state
+    assert poll_until_suspended(sandbox)
+    assert_equal :SUSPENDED, sandbox.state
+    sleep_ms 400
+    assert_equal :SUSPENDED, sandbox.state
+    assert_equal true, sandbox.resume
+    assert wait_for_state(sandbox, :DORMANT)
+    assert_equal :done, sandbox.result
+  end
+
+  # resume (fg) before the event drops the pending suspend: the task
+  # waits for its event and then runs to the end.
+  def test_resume_before_the_event_drops_the_pending_suspend
+    skip "the helper task needs Task.new" if femtoruby?
+    sandbox = Sandbox.new
+    assert sandbox.compile <<~RUBY
+      me = Task.current
+      Task.new { sleep_ms 50; me.resume }
+      me.suspend
+      :done
+    RUBY
+    sandbox.execute
+    assert wait_for_state(sandbox, :SUSPENDED)
+    sandbox.suspend
+    assert_equal false, sandbox.resume
+    assert wait_for_state(sandbox, :DORMANT)
+    assert_equal false, sandbox.poll_pending_suspend
+    assert_equal :DORMANT, sandbox.state
+    assert_equal :done, sandbox.result
+  end
+
   # Regression test for sandbox re-running the previous script
   # when its task was suspended inside a method call.
   def test_execute_runs_new_script_after_suspend_in_method
@@ -43,7 +258,8 @@ class SandboxTest < Picotest::Test
       :old
     RUBY
     sandbox.execute
-    sandbox.wait(timeout: nil)
+    # Nothing resumes this task, so wait would not return. Poll instead.
+    assert wait_for_state(sandbox, :SUSPENDED)
 
     assert sandbox.compile <<~RUBY
       :new
@@ -52,5 +268,220 @@ class SandboxTest < Picotest::Test
     sandbox.wait(timeout: nil)
 
     assert_equal :new, sandbox.result
+  end
+
+  # Run a line the way Shell#run_irb wraps it and return Sandbox#result.
+  def irb_eval(sandbox, script)
+    sandbox.compile("begin; _ = (#{script}); rescue Exception => _; _; end", filename: "(irb)")
+    sandbox.execute
+    sandbox.wait(timeout: nil)
+    sandbox.suspend
+    sandbox.result
+  end
+
+  # On mruby/c, Sandbox#result reads the register the compiler recorded.
+  # The irb wrapper must leave the rescued exception in that register.
+  def test_irb_wrapper_result_is_the_rescued_exception
+    sandbox = Sandbox.new
+    sandbox.compile("_ = nil")
+    sandbox.execute
+    sandbox.wait(timeout: nil)
+    sandbox.suspend
+
+    assert_equal 3, irb_eval(sandbox, "x = 3")
+    assert_equal 3, irb_eval(sandbox, "x")
+    assert_equal NoMethodError, irb_eval(sandbox, "undefined_name_for_test").class
+    assert_equal NoMethodError, irb_eval(sandbox, "nil.undefined_name_for_test").class
+    assert_equal RuntimeError, irb_eval(sandbox, "raise 'x'").class
+    assert_equal NameError, irb_eval(sandbox, "UndefinedConstForTest").class
+    # `_` holds the result of the line before.
+    assert_equal NameError, irb_eval(sandbox, "_").class
+    sandbox.close
+  end
+
+  # On mruby/c, the sandbox frees the code of a line when the next line
+  # replaces it. What the line made must not point into that code.
+  def test_values_outlive_the_line_that_made_them
+    sandbox = Sandbox.new
+    irb_eval(sandbox, "$sandbox_test_str = 'made by a line'")
+    irb_eval(sandbox, "$sandbox_test_sym = :sandbox_test_fresh_symbol")
+    irb_eval(sandbox, "def sandbox_test_method; :from_method; end")
+    irb_eval(sandbox, "$sandbox_test_proc = Proc.new { :from_proc }")
+    5.times { irb_eval(sandbox, "'filler' + 1.to_s") }
+
+    assert_equal "made by a line", irb_eval(sandbox, "$sandbox_test_str")
+    assert_equal "sandbox_test_fresh_symbol", irb_eval(sandbox, "$sandbox_test_sym.to_s")
+    assert_equal :from_method, irb_eval(sandbox, "sandbox_test_method")
+    assert_equal :from_proc, irb_eval(sandbox, "$sandbox_test_proc.call")
+    sandbox.close
+  ensure
+    $sandbox_test_str = nil
+    $sandbox_test_sym = nil
+    $sandbox_test_proc = nil
+  end
+
+  def test_execute_runs_the_same_code_again
+    $sandbox_test_count = 0
+    sandbox = Sandbox.new
+    assert sandbox.compile("$sandbox_test_count += 1")
+    3.times do
+      sandbox.execute
+      sandbox.wait(timeout: nil)
+      sandbox.suspend
+    end
+    assert_equal 3, $sandbox_test_count
+    assert_equal 4, irb_eval(sandbox, "$sandbox_test_count + 1")
+    sandbox.close
+  ensure
+    $sandbox_test_count = nil
+  end
+
+  def used_memory
+    require 'picorubyvm'
+    PicoRubyVM.memory_statistics[:used]
+  end
+
+  # The lines of the heap tests have no symbol and no irb wrapper. mruby/c
+  # copies the name of every symbol of the code on each load and keeps the
+  # copy, and the wrapper alone has two symbols.
+  def eval_plain(sandbox, script)
+    sandbox.compile(script)
+    sandbox.execute
+    sandbox.wait(timeout: nil)
+    sandbox.suspend
+    sandbox.result
+  end
+
+  def eval_lines(sandbox, n)
+    n.times do
+      eval_plain(sandbox, "'a string result'")
+      eval_plain(sandbox, "[1, 'two', 3.0]")
+    end
+    nil
+  end
+
+  # A line without a method, a block or a class body leaves nothing behind
+  # once the next line has replaced it.
+  def test_lines_do_not_grow_the_heap
+    skip "mruby/c frees the code of each line" unless femtoruby?
+    sandbox = Sandbox.new
+    eval_lines(sandbox, 3)
+    before = used_memory
+    eval_lines(sandbox, 50)
+    after = used_memory
+    # 100 lines. One line that is not released costs more than 100 bytes.
+    assert_in_delta 0, after - before, 1000
+    sandbox.close
+  end
+
+  def open_and_close(n, use)
+    n.times do
+      sandbox = Sandbox.new
+      if use
+        eval_plain(sandbox, "x = 'a string result'")
+        # Compiled and never executed.
+        sandbox.compile("'not executed'")
+      end
+      sandbox.close
+    end
+    nil
+  end
+
+  def heap_growth_of_sandboxes(use)
+    open_and_close(3, use)
+    before = used_memory
+    open_and_close(30, use)
+    used_memory - before
+  end
+
+  # close releases the last line, the code that was never executed and the
+  # names of the local variables. A sandbox that ran nothing is the
+  # baseline: the task itself is not the subject of this test.
+  def test_close_releases_what_the_sandbox_compiled
+    skip "mruby/c frees the code of each line" unless femtoruby?
+    unused = heap_growth_of_sandboxes(false)
+    used = heap_growth_of_sandboxes(true)
+    # 30 sandboxes. One that is not released costs more than 100 bytes.
+    assert_in_delta 0, used - unused, 1000
+  end
+
+  def test_close_removes_task_from_scheduler
+    dormant_count = Task.stat[:dormant][:count] if picoruby?
+    sandbox = Sandbox.new
+    sandbox.compile(":done")
+    sandbox.execute
+    sandbox.wait(timeout: nil)
+
+    assert_equal dormant_count + 1, Task.stat[:dormant][:count] if picoruby?
+    assert_nil sandbox.close
+    assert_equal dormant_count, Task.stat[:dormant][:count] if picoruby?
+    assert_nil sandbox.close
+  end
+
+  def test_close_releases_task_for_gc
+    unless picoruby? && Object.const_defined?(:ObjectSpace)
+      skip "requires mruby GC and ObjectSpace"
+    end
+
+    # ObjectSpace.each_object runs a full GC before it counts.
+    before = ObjectSpace.each_object(Task) { |_task| }
+
+    # Removing tasks from the scheduler must also let their Ruby wrappers
+    # be collected. Do not retain a sandbox or task in a local variable.
+    30.times do
+      Sandbox.new.close
+    end
+
+    after = ObjectSpace.each_object(Task) { |_task| }
+    assert_equal before, after
+  end
+
+  # A script of symbol literals that no other code uses, and the names it
+  # should give back.
+  def symbol_gc_script(tag, count)
+    names = []
+    i = 0
+    while i < count
+      names << "sandbox_symbol_gc_#{tag}_#{i}"
+      i += 1
+    end
+    ["[" + names.map { |n| ":#{n}" }.join(", ") + "]", names]
+  end
+
+  def test_compile_keeps_the_names_through_symbol_gc
+    skip "symbol GC is on the mruby VM only" if femtoruby?
+    # Every symbol these compiles make is new and interned while the
+    # compiler hands the code over, so the symbol GC that the dynamic
+    # symbol limit (4096) starts runs inside one of them.
+    round = 0
+    while round < 20
+      script, names = symbol_gc_script("c#{round}", 300)
+      sandbox = Sandbox.new
+      sandbox.compile(script)
+      sandbox.execute
+      sandbox.wait(timeout: nil)
+      assert_equal names, sandbox.result.map(&:to_s)
+      # close, not terminate: a dormant task stays in the scheduler and keeps
+      # its names alive, so the rounds would run out of symbols
+      sandbox.close
+      round += 1
+    end
+  end
+
+  def test_compiled_code_keeps_its_names_until_execute
+    skip "symbol GC is on the mruby VM only" if femtoruby?
+    sandbox = Sandbox.new
+    script, names = symbol_gc_script("e", 300)
+    sandbox.compile(script)
+    # past the dynamic symbol limit (4096), so symbol GC runs before execute
+    i = 0
+    while i < 5000
+      "sandbox_symbol_gc_filler_#{i}".to_sym
+      i += 1
+    end
+    sandbox.execute
+    sandbox.wait(timeout: nil)
+    assert_equal names, sandbox.result.map(&:to_s)
+    sandbox.close
   end
 end

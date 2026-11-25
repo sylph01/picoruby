@@ -4,7 +4,6 @@ R2P2_GEM_DIR = "#{MRUBY_ROOT}/mrbgems/picoruby-r2p2"
 load "#{R2P2_GEM_DIR}/r2p2_config.rb"
 
 ENV["PICO_SDK_PATH"] ||= "#{R2P2_GEM_DIR}/lib/pico-sdk"
-ENV["PICO_EXTRAS_PATH"] ||= "#{R2P2_GEM_DIR}/lib/pico-extras"
 
 # TZ builds use a dedicated `-tz` build config when one exists; both
 # pico2 and pico2_w have one (they drop picoruby-psg — core-1 launch is
@@ -177,7 +176,6 @@ namespace :r2p2 do
   task :setup do
     FileUtils.cd MRUBY_ROOT do
       sh "git submodule update --init --recursive mrbgems/picoruby-r2p2/lib/pico-sdk"
-      sh "git submodule update --init --recursive mrbgems/picoruby-r2p2/lib/pico-extras"
       sh "git submodule update --init mrbgems/picoruby-r2p2/lib/rp2040js"
     end
   end
@@ -195,22 +193,10 @@ namespace :r2p2 do
         MSG
       end
     end
-    FileUtils.cd ENV['PICO_EXTRAS_PATH'] do
-      if `git describe --tags --exact-match`.chomp != PICO_EXTRAS_TAG
-        raise <<~MSG
-          pico-extras #{PICO_EXTRAS_TAG} is not checked out!\n
-          Tips for dealing with:\n
-          cd #{ENV['PICO_EXTRAS_PATH']} && \\
-            git fetch origin --tags && \\
-            git checkout #{PICO_EXTRAS_TAG} && \\
-            git submodule update --recursive\n
-        MSG
-      end
-    end
   end
 
   task :check_pico_sdk_path do
-    %w(PICO_SDK_PATH PICO_EXTRAS_PATH).each do |env|
+    %w(PICO_SDK_PATH).each do |env|
       unless ENV[env]
         raise <<~MSG
           Environment variable `#{env}` does not exist!
@@ -240,8 +226,12 @@ namespace :r2p2 do
               dir = r2p2_build_dir(vm, board, mode)
               FileUtils.mkdir_p dir
               config = r2p2_mruby_config(vm, board)
-              config_name = r2p2_mruby_config_name(vm, board)
-              mruby_build_path = "#{MRUBY_ROOT}/build/#{config_name}"
+              # PICORB_DEBUG changes the compile flags of the whole
+              # library, so debug and prod must not share a build
+              # directory (the build_config appends the same suffix).
+              # Under R2P2_TRUSTZONE the name is the `-tz` config's.
+              lib_name = "#{r2p2_mruby_config_name(vm, board)}#{mode == 'debug' ? '-debug' : ''}"
+              mruby_build_path = "#{MRUBY_ROOT}/build/#{lib_name}"
               FileUtils.cd MRUBY_ROOT do
                 sh "MRUBY_CONFIG=#{config} PICORB_BOARD=#{board} #{mode=='debug' ? 'PICORB_DEBUG=1' : ''} rake"
               end
@@ -251,7 +241,7 @@ namespace :r2p2 do
                 -D EXTRA_LIBRARY_PATH=#{mruby_build_path}/lib \
                 -D EXTRA_INCLUDE_DIR=#{mruby_build_path}/include \
                 -D PICO_CYW43_SUPPORTED=1 \
-                -D MRUBY_CONFIG=#{config_name} \
+                -D MRUBY_CONFIG=#{lib_name} \
                 #{r2p2_def_picorb_vm(vm)} \
                 #{r2p2_def_r2p2_name(vm, board)} \
                 #{r2p2_def_board(board)} \
@@ -271,6 +261,7 @@ namespace :r2p2 do
               config = r2p2_mruby_config(vm, board)
               if File.exist?(config)
                 sh "MRUBY_CONFIG=#{config} rake clean"
+                sh "MRUBY_CONFIG=#{config} PICORB_DEBUG=1 rake clean"
               end
             end
             %w[debug prod].each do |mode|
@@ -281,5 +272,20 @@ namespace :r2p2 do
         end
       end
     end
+  end
+end
+
+# A cross build borrows its `mrbc` from a generated build named for the defines
+# it needs (build/mrbc/int32, ...), which installs nothing. Link it into the
+# cross build's own bin/ so that a consumer outside rake finds the compiler
+# matching the target by the build name alone. R2P2's CMake is the consumer
+# today, but every cross build gets the link.
+MRuby.each_target do |build|
+  next if !build.borrows_mrbc? || build.gems["mruby-bin-mrbc"]
+  src = build.mrbcfile
+  dst = build.exefile("#{build.build_dir}/bin/mrbc")
+  build.products << build.define_installer_outline(src, dst) do
+    File.unlink(dst) rescue nil
+    File.symlink(src.relative_path_from(File.dirname(dst)), dst)
   end
 end

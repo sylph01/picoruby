@@ -78,6 +78,12 @@ class BLE
   def initialize(role, profile_data = nil)
     @role = role
     @debug = false
+    @event_queue = Task::Queue.new
+    # Value stores accessed from the C layer (BTstack callbacks).
+    # They live as instance variables so the GC can reclaim them
+    # together with this instance.
+    @write_values = {}
+    @read_values = {}
     unless CYW43.init
       puts "Failed to initialize CYW43"
       return # raising an exception here may cause a crash
@@ -114,28 +120,34 @@ class BLE
     @led&.write(@led&.low? ? 1 : 0)
   end
 
-  POLLING_UNIT_MS = 100
-
   def start(timeout_ms = nil, stop_state = :no_stop)
     if timeout_ms
       debug_puts "Starting for #{timeout_ms} ms"
     else
       debug_puts "Starting with infinite loop. Ctrl-C for stop"
     end
+    started_at = Machine.board_millis
     total_timeout_ms = 0
+    @event_queue.clear
+    _event_queue_cleared
     hci_power_control(HCI_POWER_ON)
     while true
+      total_timeout_ms = Machine.board_millis - started_at
       break if timeout_ms && timeout_ms <= total_timeout_ms
       if @state == stop_state
         puts "Stopped by state: #{stop_state}"
         break
       end
-      packet = pop_packet
-      packet_callback(packet) if packet
-      heartbeat_callback if pop_heartbeat
-      sleep_ms POLLING_UNIT_MS
-      total_timeout_ms += POLLING_UNIT_MS
+      wait_ms = timeout_ms ? timeout_ms - total_timeout_ms : nil
+      event = @event_queue.pop(timeout_ms: wait_ms)
+      _event_popped if event
+      if event.is_a?(String)
+        packet_callback(event)
+      elsif event
+        heartbeat_callback
+      end
     end
+    total_timeout_ms = Machine.board_millis - started_at
     return total_timeout_ms
   ensure
     hci_power_control(HCI_POWER_OFF)
@@ -149,4 +161,3 @@ class BLE
   end
 
 end
-

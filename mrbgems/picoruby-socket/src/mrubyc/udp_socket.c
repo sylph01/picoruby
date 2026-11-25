@@ -2,6 +2,9 @@
 #include <string.h>
 #include <stdint.h>
 #include "picoruby.h"
+#ifdef PICO_CYW43_ARCH_POLL
+#include "c_task_queue.h"
+#endif
 
 /*
  * Helper function to get socket pointer from instance->data.
@@ -43,6 +46,15 @@ c_udp_socket_new(mrbc_vm *vm, mrbc_value *v, int argc)
   socket_wrapper_t *wrapper = (socket_wrapper_t *)instance.instance->data;
   wrapper->ptr = sock;
   wrapper->vm = vm;
+
+#ifdef PICO_CYW43_ARCH_POLL
+  if (!picorb_socket_attach_event_queue(vm, &instance, sock)) {
+    UDPSocket_close(vm, sock);
+    picorb_free(vm, sock);
+    mrbc_raise(vm, MRBC_CLASS(RuntimeError), "failed to allocate event queue");
+    return;
+  }
+#endif
 
   SET_RETURN(instance);
 }
@@ -95,7 +107,6 @@ c_udp_socket_bind(mrbc_vm *vm, mrbc_value *v, int argc)
     return;
   }
 
-  mrbc_incref(&v[0]);
   SET_NIL_RETURN();
 }
 
@@ -147,7 +158,6 @@ c_udp_socket_connect(mrbc_vm *vm, mrbc_value *v, int argc)
     return;
   }
 
-  mrbc_incref(&v[0]);
   SET_NIL_RETURN();
 }
 
@@ -213,7 +223,6 @@ c_udp_socket_send(mrbc_vm *vm, mrbc_value *v, int argc)
     return;
   }
 
-  mrbc_incref(&v[0]);
   SET_INT_RETURN(sent);
 }
 
@@ -269,6 +278,9 @@ c_udp_socket_recvfrom_nonblock(mrbc_vm *vm, mrbc_value *v, int argc)
 
   /* If no data available (non-blocking socket), return nil */
   if (received == 0) {
+#ifdef PICO_CYW43_ARCH_POLL
+    sock->event_pending = false;
+#endif
     picorb_free(vm, buffer);
     SET_NIL_RETURN();
     return;
@@ -300,7 +312,6 @@ c_udp_socket_recvfrom_nonblock(mrbc_vm *vm, mrbc_value *v, int argc)
   mrbc_incref(&addr_info);
   mrbc_array_set(&result, 1, &addr_info);
 
-  mrbc_incref(&v[0]);
   SET_RETURN(result);
 }
 
@@ -326,7 +337,6 @@ c_udp_socket_close(mrbc_vm *vm, mrbc_value *v, int argc)
   /* Close socket */
   UDPSocket_close(vm, sock);
 
-  mrbc_incref(&v[0]);
   SET_NIL_RETURN();
 }
 
@@ -350,7 +360,6 @@ c_udp_socket_closed_q(mrbc_vm *vm, mrbc_value *v, int argc)
 
   /* Check if socket is closed */
   bool is_closed = UDPSocket_closed(vm, sock);
-  mrbc_incref(&v[0]);
   if (is_closed) {
     SET_TRUE_RETURN();
   } else {
@@ -365,9 +374,15 @@ udp_socket_init(mrbc_vm *vm, mrbc_class *class_BasicSocket)
   mrbc_define_destructor(class_UDPSocket, mrbc_socket_free);
 
   mrbc_define_method(vm, class_UDPSocket, "new", c_udp_socket_new);
+#ifdef PICO_CYW43_ARCH_POLL
+  mrbc_define_method(vm, class_UDPSocket, "__bind_resolved", c_udp_socket_bind);
+  mrbc_define_method(vm, class_UDPSocket, "__connect_resolved", c_udp_socket_connect);
+  mrbc_define_method(vm, class_UDPSocket, "__send_resolved", c_udp_socket_send);
+#else
   mrbc_define_method(vm, class_UDPSocket, "bind", c_udp_socket_bind);
   mrbc_define_method(vm, class_UDPSocket, "connect", c_udp_socket_connect);
   mrbc_define_method(vm, class_UDPSocket, "send", c_udp_socket_send);
+#endif
   mrbc_define_method(vm, class_UDPSocket, "recvfrom_nonblock", c_udp_socket_recvfrom_nonblock);
   mrbc_define_method(vm, class_UDPSocket, "close", c_udp_socket_close);
   mrbc_define_method(vm, class_UDPSocket, "closed?", c_udp_socket_closed_q);

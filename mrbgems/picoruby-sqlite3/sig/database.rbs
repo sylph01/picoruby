@@ -1,22 +1,63 @@
 class SQLite3
   class Database
+    include SQLite3::Pragmas
+
     type sqlite3_row_t = Hash[String, String] | Array[String]
 
+    # ":memory:" as filename opens a private in-memory database (CRuby
+    # sqlite3 compatible): no file, no snapshot name, nothing restored or
+    # persisted, one independent database per handle.
     def initialize: (String filename, ?results_as_hash: bool) ?{ (SQLite3::Database) -> void } -> void
     def self.open: (String filename) ?{ (SQLite3::Database) -> void } -> SQLite3::Database
-    private def self._open: (String filename) -> SQLite3::Database
+    private def self._open: (VFS::driver_t driver, String path) -> SQLite3::Database
+    private def self._open_memory: () -> SQLite3::Database
+    private def self._open_file: (String path) -> SQLite3::Database
+    private def self._unlink_file: (String path) -> bool
 
     attr_accessor results_as_hash: bool
 
     def close: () -> void
     def closed?: () -> bool
-    def execute: (String sql, ?Array[sqlite3_var_t] bind_vars) -> Array[Array[sqlite3_var_t] | Hash[String, sqlite3_var_t]]
-               | (String sql, ?Array[sqlite3_var_t] bind_vars) { (Array[sqlite3_var_t])        -> Array[sqlite3_var_t]        } -> nil
-               | (String sql, ?Array[sqlite3_var_t] bind_vars) { (Hash[String, sqlite3_var_t]) -> Hash[String, sqlite3_var_t] } -> nil
+    def execute: (String sql, ?Array[sqlite3_bind_t] bind_vars) -> Array[Array[sqlite3_var_t] | Hash[String, sqlite3_var_t]]
+               | (String sql, ?Array[sqlite3_bind_t] bind_vars) { (Array[sqlite3_var_t])        -> Array[sqlite3_var_t]        } -> nil
+               | (String sql, ?Array[sqlite3_bind_t] bind_vars) { (Hash[String, sqlite3_var_t]) -> Hash[String, sqlite3_var_t] } -> nil
                 # FIXME: this is a hack to work around the fact that we can't
-               | (String sql, ?Array[sqlite3_var_t] bind_vars) { (untyped) -> untyped } -> nil
+               | (String sql, ?Array[sqlite3_bind_t] bind_vars) { (untyped) -> untyped } -> nil
     def prepare: (String sql) { (SQLite3::Statement) -> untyped } -> nil
                | (String sql) -> SQLite3::Statement
+
+    def query: (String sql, ?Array[sqlite3_bind_t] bind_vars) -> SQLite3::ResultSet
+             | (String sql, ?Array[sqlite3_bind_t] bind_vars) { (SQLite3::ResultSet) -> untyped } -> untyped
+    def get_first_row: (String sql, ?Array[sqlite3_bind_t] bind_vars) -> (Array[sqlite3_var_t] | Hash[String, sqlite3_var_t])?
+    def get_first_value: (String sql, ?Array[sqlite3_bind_t] bind_vars) -> sqlite3_var_t
+
+    def execute_batch: (String sql) -> nil
+    def last_insert_row_id: () -> Integer
+    def changes: () -> Integer
+    def total_changes: () -> Integer
+
+    def transaction: (?Symbol mode) -> bool
+                   | (?Symbol mode) { (SQLite3::Database) -> untyped } -> untyped
+    def commit: () -> bool
+    def rollback: () -> bool
+    def transaction_active?: () -> bool
+
+    def backup: (SQLite3::Database dst, ?srcname: String, ?dstname: String) -> bool
+
+    def readonly?: () -> bool
+    def filename: () -> String?
+
+    # picoruby.wasm only: in-memory database + IndexedDB snapshot persistence.
+    STORE_NAME: String
+    @db_name: String?
+    def serialize: () -> String
+    def deserialize: (String bytes) -> SQLite3::Database
+    def persist: () -> bool
+    # Called with an explicit receiver (from .new / instance methods), so these
+    # stay public even though they are internal.
+    def _restore_from_store: (String name) -> SQLite3::Database
+    def self.__store: () -> untyped
+    private def __close_without_persist: () -> void
   end
 end
 

@@ -30,16 +30,21 @@ module JS
     # Spawn a long-lived consumer task that drains one Task::Queue per callback.
     # The C dispatcher pushes events into the queue; the consumer calls the block.
     def self._spawn_event_consumer(callback_id, block)
-      q = Task::Queue.new
+      # `::` is required throughout JS::Object: it descends from BasicObject,
+      # so a bare constant is not looked up in Object.
+      q = ::Task::Queue.new
       EVENT_QUEUES[callback_id] = q
       CALLBACKS[callback_id]    = block
-      EVENT_TASKS[callback_id]  = Task.new(name: "js-cb-#{callback_id}") do
-        loop do
+      EVENT_TASKS[callback_id]  = ::Task.new(name: "js-cb-#{callback_id}") do
+        while true
           ev = q.pop
           break if ev.nil?
           begin
             block.call(ev)
-          rescue => e
+          rescue ::StandardError => e
+            # A bare `rescue` names StandardError, which this scope (under
+            # BasicObject) cannot resolve: the callback's error would turn
+            # into a NameError that ends the task.
             $stderr.puts "Callback #{callback_id}: #{e.class}: #{e.message}"
           end
         end
@@ -55,11 +60,35 @@ module JS
       q&.close
     end
 
-    def addEventListener(event_type, &block)
+    # sync: true runs the block on the JS event dispatch stack, so
+    # preventDefault / stopPropagation and APIs gated on transient user
+    # activation work. In exchange the block must not suspend: fetch, await and
+    # blocking Task::Queue#pop raise inside it. Spawning is still fine
+    # (Task.new, setTimeout, registering an async listener).
+    # capture / once / passive map to the DOM listener options; passive is
+    # left to the browser default unless given explicitly.
+    def addEventListener(event_type, sync: false, capture: false, once: false, passive: nil, &block)
       callback_id = block.object_id
-      _add_event_listener(callback_id, event_type)
-      JS::Object._spawn_event_consumer(callback_id, block)
+      if sync
+        ::JS::Object::CALLBACKS[callback_id] = block
+      else
+        ::JS::Object._spawn_event_consumer(callback_id, block)
+      end
+      _add_event_listener(callback_id, event_type, sync, capture, once,
+                          passive.nil? ? -1 : (passive ? 1 : 0))
       callback_id
+    end
+
+    # Called from C (call_ruby_callback_sync_event) for sync: true listeners.
+    def self._dispatch_sync(callback_id, event, once)
+      block = CALLBACKS[callback_id]
+      CALLBACKS.delete(callback_id) if once
+      return unless block
+      begin
+        block.call(event)
+      rescue ::StandardError => e
+        $stderr.puts "Callback #{callback_id}: #{e.class}: #{e.message}"
+      end
     end
 
     def self.register_callback(name, &block)
@@ -71,38 +100,51 @@ module JS
 
     def self.removeEventListener(callback_id)
       return false unless callback_id
+      # A sync listener has no consumer task to clean up after it, and a
+      # once-listener that already fired makes the JS call return false, so
+      # drop the block unconditionally.
+      CALLBACKS.delete(callback_id)
       begin
-        result = JS.global._js_remove_event_listener_wrapper(callback_id)
+        # _removeEventListener is the C path; it works in Node too, unlike
+        # the window-only _js_remove_event_listener_wrapper helper.
+        result = ::JS.global._removeEventListener(callback_id)
         _close_event_queue(callback_id) if result
         result
-      rescue
+      rescue ::StandardError
         _close_event_queue(callback_id)
         false
       end
     end
 
+    # Raise the pending error stored by the C promise-error resume path for
+    # callback_id, if any, cleaning up both global hashes first.
+    def _raise_pending_promise_error(callback_id)
+      return unless $promise_errors.key?(callback_id)
+      message = $promise_errors[callback_id]
+      $promise_errors.delete(callback_id)
+      $promise_responses.delete(callback_id)
+      # Kernel.raise: self is a JS object (BasicObject), Kernel#raise is absent
+      ::Kernel.raise message
+    end
+
     def fetch(url, options = nil, &block)
-      raise ArgumentError, "JS::Object#fetch requires a block: use `fetch(url) { |resp| ... }`" unless block
+      # Kernel.raise: self is a JS object (BasicObject), Kernel#raise is absent
+      ::Kernel.raise ::ArgumentError, "JS::Object#fetch requires a block: use `fetch(url) { |resp| ... }`" unless block
       callback_id = block.object_id
       if options
-        options_json = JSON.generate(options)
+        options_json = ::JSON.generate(options)
         _fetch_with_options_and_suspend(url, options_json, callback_id)
       else
         _fetch_and_suspend(url, callback_id)
       end
-      if $promise_errors.key?(callback_id)
-        message = $promise_errors[callback_id]
-        $promise_errors.delete(callback_id)
-        $promise_responses.delete(callback_id)
-        raise message
-      end
+      _raise_pending_promise_error(callback_id)
       block.call($promise_responses[callback_id])
       $promise_responses.delete(callback_id)
     end
 
     def setTimeout(delay_ms, &block)
       callback_id = block.object_id
-      JS::Object._spawn_event_consumer(callback_id, block)
+      ::JS::Object._spawn_event_consumer(callback_id, block)
       _set_timeout(callback_id, delay_ms)
       callback_id
     end
@@ -110,8 +152,20 @@ module JS
     def clearTimeout(callback_id)
       return false unless callback_id
       success = _clear_timeout(callback_id)
-      JS::Object._close_event_queue(callback_id) if success
+      ::JS::Object._close_event_queue(callback_id) if success
       success
+    end
+
+    # Read Blob, File, Response, or another object implementing arrayBuffer()
+    # as a binary Ruby String without UTF-8 conversion.
+    def to_binary
+      # __id__: BasicObject has no object_id
+      callback_id = self.__id__
+      _to_binary_and_suspend(callback_id)
+      _raise_pending_promise_error(callback_id)
+      result = $promise_responses[callback_id]
+      $promise_responses.delete(callback_id)
+      result.to_s
     end
 
   end
@@ -120,7 +174,7 @@ module JS
   # class based on the JS runtime type of the wrapped value.
 
   class Array < Object
-    include Enumerable
+    include ::Enumerable
 
     # Iterate over the wrapped JS array, yielding each element converted via
     # js_ref_to_ruby_value (primitives become Ruby native values).
@@ -148,15 +202,6 @@ module JS
   end
 
   class Response < Object
-    # Read the response body as a binary String. Suspends the current Ruby
-    # task until the underlying ArrayBuffer is materialized.
-    def to_binary
-      callback_id = self.object_id
-      _to_binary_and_suspend(callback_id)
-      result = $promise_responses[callback_id]
-      $promise_responses.delete(callback_id)
-      result.to_s
-    end
   end
 
   class Event < Object
@@ -173,14 +218,10 @@ module JS
     # resolves and returns the resolved value (auto-converted to a Ruby
     # native value if it is a primitive, otherwise wrapped as JS::Object).
     def await
-      callback_id = self.object_id
+      # __id__: BasicObject has no object_id
+      callback_id = self.__id__
       _await_and_suspend(callback_id)
-      if $promise_errors.key?(callback_id)
-        message = $promise_errors[callback_id]
-        $promise_errors.delete(callback_id)
-        $promise_responses.delete(callback_id)
-        raise message
-      end
+      _raise_pending_promise_error(callback_id)
       result = $promise_responses[callback_id]
       $promise_responses.delete(callback_id)
       result
@@ -216,8 +257,12 @@ module JS
     # @return [JS::Object] JS object
     def self.hash_to_js_object(hash)
       js_obj = JS.global.create_object
-      hash.each do |key, val|
-        js_obj[key.to_s.to_sym] = to_js(val)
+      keys = hash.keys
+      i = 0
+      while i < keys.size
+        key = keys[i]
+        js_obj[key.to_s.to_sym] = to_js(hash[key])
+        i += 1
       end
       js_obj
     end
@@ -227,7 +272,11 @@ module JS
     # @return [JS::Object] JS array
     def self.array_to_js_array(array)
       js_array = JS.global.create_array
-      array.each { |item| js_array.push(to_js(item)) }
+      i = 0
+      while i < array.size
+        js_array.push(to_js(array[i]))
+        i += 1
+      end
       js_array
     end
   end

@@ -3,10 +3,16 @@ cmake_minimum_required(VERSION 3.22)
 #set(CMAKE_VERBOSE_MAKEFILE ON)
 
 include(pico_sdk_import.cmake)
-include(pico_extras_import.cmake)
 
 # Initialize the SDK
 pico_sdk_init()
+
+# libc allocation is routed to Estalloc (picoruby-machine/ports/rp2040/
+# heap_wrap.c via --wrap below). Drop the pico-sdk malloc wrappers so their
+# __wrap_* symbols do not compete with ours.
+if(TARGET pico_malloc)
+  set_target_properties(pico_malloc PROPERTIES INTERFACE_SOURCES "")
+endif()
 
 execute_process (COMMAND date +%Y%m%d OUTPUT_VARIABLE CMAKE_BUILDDATE OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process (COMMAND git rev-parse --short HEAD OUTPUT_VARIABLE CMAKE_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE WORKING_DIRECTORY ${PICORUBY_ROOT})
@@ -55,38 +61,24 @@ if(USE_WIFI)
     ${PICO_SDK_PATH}/src/rp2_common/pico_mbedtls/pico_mbedtls.c
   )
   list(APPEND SOURCE_FILES ${ADD_WIFI_SOURCE_FILES})
-  if(PICO_BOARD STREQUAL "pico2_w")
-    file(GLOB REMOVE_WIFI_SRCS CONFIGURE_DEPENDS
-      ${PICORUBY_ROOT}/mrbgems/picoruby-filesystem-fat/ports/rp2040/*.c
-      ${PICORUBY_ROOT}/mrbgems/picoruby-net/ports/rp2040/*.c
-    )
-  else()
-    # pico_w uses picoruby-socket instead of picoruby-net to avoid function conflicts
-    file(GLOB REMOVE_WIFI_SRCS CONFIGURE_DEPENDS
-      ${PICORUBY_ROOT}/mrbgems/picoruby-filesystem-fat/ports/rp2040/*.c
-      ${PICORUBY_ROOT}/mrbgems/picoruby-net/ports/rp2040/*.c
-    )
-  endif()
   if(R2P2_TRUSTZONE)
     # TZ is WiFi-only (no Bluetooth, see tz/docs/WIFI-UNDER-TZ-HANDOFF.md
     # watch-out #5): the r2p2-picoruby-pico2_w-tz build config drops the
     # BLE gems from libmruby, so the BLE port .c (which needs btstack
     # headers we no longer pull in) must not be compiled either.
-    file(GLOB REMOVE_BLE_SRCS CONFIGURE_DEPENDS
+    file(GLOB REMOVE_WIFI_SRCS CONFIGURE_DEPENDS
       ${PICORUBY_ROOT}/mrbgems/picoruby-ble/ports/rp2040/*.c
     )
-    list(APPEND REMOVE_WIFI_SRCS ${REMOVE_BLE_SRCS})
   endif()
-else()
-  # picoruby-mbedtls stays IN for non-WiFi builds: the pico2 build config
-  # now includes the gem (NS session crypto under TrustZone, see
-  # tz/README.md), whose src/*.c inside libmruby.a reference the MbedTLS_*
-  # port symbols, and whose entropy module needs the SDK's
-  # mbedtls_hardware_poll (pico_mbedtls.c). Under TZ that glue's
-  # get_rand_64() call is --wrap'ed by tz/ns/rand_ns.c onto
-  # sg_random_bytes — the wrap comment lists it as a known caller. The
-  # port objects must see the SAME mbedtls config the gem's rake-side
-  # library objects were built with — context structs are sized by it.
+elseif(R2P2_TRUSTZONE)
+  # Non-WiFi TZ build (pico2): picoruby-mbedtls stays IN. The
+  # r2p2-picoruby-pico2-tz build config includes the gem (NS session
+  # crypto, see tz/README.md), whose src/*.c inside libmruby.a reference
+  # the MbedTLS_* port symbols, and whose entropy module needs the SDK's
+  # mbedtls_hardware_poll (pico_mbedtls.c). That glue's get_rand_64() call
+  # is --wrap'ed by tz/ns/rand_ns.c onto sg_random_bytes. The port objects
+  # must see the SAME mbedtls config the gem's rake-side library objects
+  # were built with -- context structs are sized by it.
   add_compile_definitions(
     MBEDTLS_CONFIG_FILE="${PICORUBY_ROOT}/mrbgems/picoruby-mbedtls/include/mbedtls_config.h"
   )
@@ -95,11 +87,17 @@ else()
   )
   list(APPEND SOURCE_FILES ${ADD_MBEDTLS_GLUE})
   file(GLOB REMOVE_WIFI_SRCS CONFIGURE_DEPENDS
-      ${PICORUBY_ROOT}/mrbgems/picoruby-filesystem-fat/ports/rp2040/*.c
     ${PICORUBY_ROOT}/mrbgems/picoruby-cyw43/ports/rp2040/*.c
-    ${PICORUBY_ROOT}/mrbgems/picoruby-net/ports/rp2040/*.c
     ${PICORUBY_ROOT}/mrbgems/picoruby-socket/ports/rp2040/*.c
     ${PICORUBY_ROOT}/mrbgems/picoruby-ble/ports/rp2040/*.c
+  )
+else()
+  file(GLOB REMOVE_WIFI_SRCS CONFIGURE_DEPENDS
+    ${PICORUBY_ROOT}/mrbgems/picoruby-cyw43/ports/rp2040/*.c
+    ${PICORUBY_ROOT}/mrbgems/picoruby-socket/ports/rp2040/*.c
+    ${PICORUBY_ROOT}/mrbgems/picoruby-ble/ports/rp2040/*.c
+    ${PICORUBY_ROOT}/mrbgems/picoruby-mbedtls/ports/**/*.c
+    ${PICO_SDK_PATH}/src/rp2_common/pico_mbedtls/pico_mbedtls.c
   )
 endif()
 
@@ -155,7 +153,7 @@ endif()
 # Core1 is used for PSG audio processing but doesn't access flash during BTStack operations
 add_compile_definitions(PICO_FLASH_ASSUME_CORE1_SAFE=1)
 
-set(PICORBC ${PICORUBY_ROOT}/bin/mrbc)
+set(PICORBC ${PICORUBY_ROOT}/build/${MRUBY_CONFIG}/bin/mrbc)
 
 add_custom_target(mrbdir ALL
   COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/mrb
@@ -189,24 +187,51 @@ if(NOT R2P2_TRUSTZONE)
 endif()
 
 target_link_options(${PROJECT_NAME} PRIVATE -Wl,--gc-sections)
+target_link_options(${PROJECT_NAME} PRIVATE
+  -Wl,--wrap=malloc
+  -Wl,--wrap=calloc
+  -Wl,--wrap=realloc
+  -Wl,--wrap=free
+  -Wl,--wrap=malloc_usable_size
+)
 
-# RP2040: 4KB stack fits in SCRATCH_Y, use SDK default linker script
-# RP2350: 8KB stack needs RAM, use custom linker script
+# RP2040 keeps both stacks in scratch RAM. RP2350 needs more than the combined
+# scratch banks provide for Prism in debug builds, so core 0 uses regular RAM.
 if(PICO_BOARD STREQUAL "pico" OR PICO_BOARD STREQUAL "pico_w")
   set(PICORB_STACK_SIZE 0x1000) # 4KB
+  set(PICORB_CORE1_STACK_SIZE 0x0800) # 2KB (in SCRATCH_X)
 elseif(PICO_BOARD STREQUAL "pico2" OR PICO_BOARD STREQUAL "pico2_w")
-  set(PICORB_STACK_SIZE 0x2000) # 8KB
-  # The TZ build uses its own NS linker script (set in ns_build.cmake);
-  # skip the default one here.
+  if(PICORB_DEBUG)
+    set(PICORB_STACK_SIZE 0x6000) # 24KB
+    set(PICORB_RAM_LENGTH_KB 488)
+    set(PICORB_STACK_ORIGIN 0x2007a000)
+    set(PICORB_STACK_LENGTH_KB 24)
+  else()
+    set(PICORB_STACK_SIZE 0x4000) # 16KB
+    set(PICORB_RAM_LENGTH_KB 496)
+    set(PICORB_STACK_ORIGIN 0x2007c000)
+    set(PICORB_STACK_LENGTH_KB 16)
+  endif()
+  set(PICORB_CORE1_STACK_SIZE 0x0800) # 2KB (in SCRATCH_X)
+  # The TZ build uses its own NS linker script (set in tz/ns/ns_build.cmake)
+  # and takes only PICORB_STACK_SIZE / PICORB_CORE1_STACK_SIZE from here.
   if(NOT R2P2_TRUSTZONE)
-    pico_set_linker_script(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/memmap_rp2350.ld)
+    configure_file(
+      ${CMAKE_CURRENT_LIST_DIR}/memmap_rp2350.ld.in
+      ${CMAKE_CURRENT_BINARY_DIR}/memmap_rp2350.ld
+      @ONLY
+    )
+    pico_set_linker_script(${PROJECT_NAME} ${CMAKE_CURRENT_BINARY_DIR}/memmap_rp2350.ld)
   endif()
 endif()
 
+# The newlib heap is not the crt0 .heap dummy section: ports/rp2040/main.c
+# overrides _sbrk and carves it out of the top of RAM, and the Ruby heap
+# takes all RAM between the end of .bss and that strip. So the dummy is 0.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
   PICO_STACK_SIZE=${PICORB_STACK_SIZE}
-  PICO_CORE1_STACK_SIZE=0x0800 # 2KB (in SCRATCH_X)
-  PICO_HEAP_SIZE=0x0400        # 1KB
+  PICO_CORE1_STACK_SIZE=${PICORB_CORE1_STACK_SIZE}
+  PICO_HEAP_SIZE=0
 )
 
 option(PICORUBY_PSG_MCP4922_DMA "Use DMA for PSG MCP4922 output" ON)
@@ -250,9 +275,9 @@ if(NOT R2P2_TRUSTZONE)
   target_link_libraries(${PROJECT_NAME} PRIVATE pico_bootsel_via_double_reset)
 endif()
 
-# Sleep functionality for both RP2040 and RP2350
+# Sleep functionality for both RP2040 and RP2350 (Machine.sleep).
 target_link_libraries(${PROJECT_NAME} PRIVATE
-  hardware_sleep
+  pico_low_power
 )
 
 # RTC only for RP2040
@@ -263,22 +288,14 @@ if(PICO_BOARD STREQUAL "pico" OR PICO_BOARD STREQUAL "pico_w")
 endif()
 
 if(USE_WIFI)
-  if(R2P2_TRUSTZONE)
-    # Poll mode under TrustZone (tz/docs/WIFI-UNDER-TZ-HANDOFF.md §2):
-    # threadsafe_background drives cyw43 from a dynamically claimed spare
-    # NVIC user IRQ, which would silently never fire NS unless pinned and
-    # ITNS-routed. Poll mode needs no user IRQ and fits the cooperative
-    # single-caller model; the net/socket gems already compile with
-    # PICO_CYW43_ARCH_POLL=1 and call cyw43_arch_poll() in their wait
-    # loops, and picorb_hal_idle_cpu polls from the VM idle hook. No
-    # Bluetooth: btstack is not linked (BLE gems are out of the TZ config).
+  # these are used only in WiFi build
+  target_link_libraries(${PROJECT_NAME} PRIVATE
+    pico_cyw43_arch_lwip_poll
+  )
+  if(NOT R2P2_TRUSTZONE)
+    # No Bluetooth under TrustZone: the -tz build config drops the BLE gems,
+    # so btstack is not linked (tz/docs/WIFI-UNDER-TZ-HANDOFF.md watch-out #5).
     target_link_libraries(${PROJECT_NAME} PRIVATE
-      pico_cyw43_arch_lwip_poll
-    )
-  else()
-    # these are used only in WiFi build
-    target_link_libraries(${PROJECT_NAME} PRIVATE
-      pico_cyw43_arch_lwip_threadsafe_background
       pico_btstack_ble
       pico_btstack_cyw43
     )
@@ -289,21 +306,37 @@ if(USE_WIFI)
 endif()
 
 add_compile_definitions(PICORB_ALLOC_ESTALLOC=1)
+add_compile_definitions(PICORB_ALLOC_ALIGN=8)
 
 if(PICORB_VM_MRUBY)
   add_compile_definitions(PICORB_VM_MRUBY=1)
-  add_compile_definitions(MRB_INT64=1)
-  add_compile_definitions(MRB_NO_BOXING=1)
+  # Must match build_config/r2p2-picoruby-*.rb: these fix sizeof(mrb_value)
+  # and the mrb_state layout that the port sources share with libmruby. A
+  # mismatch boots into a HardFault in the first mrb_* call from main().
+  add_compile_definitions(MRB_INT32=1)
+  add_compile_definitions(MRB_WORD_BOXING=1)
   add_compile_definitions(MRB_32BIT=1)
   add_compile_definitions(MRB_UTF8_STRING=1)
+  # Match the mruby core build (mruby-task adds this via spec.build.defines) so
+  # this CMake side sees the full mrb_state, including its task member, and can
+  # include <task.h>. The task field is last in mrb_state, so exposing it does
+  # not shift any earlier field offsets.
+  add_compile_definitions(MRB_USE_TASK_SCHEDULER=1)
+  # Same reason: mrb_state carries c_stack_limit behind this macro (after the
+  # task member), and main.c calls mrb_c_stack_limit_set, which is a no-op
+  # macro without it.
+  add_compile_definitions(MRB_USE_C_STACK_CHECK=1)
   target_include_directories(${PROJECT_NAME} PRIVATE
     ${PICORUBY_ROOT}/mrbgems/picoruby-mruby/lib/mruby/include
-    # picoruby-machine's hal.h implements mruby-task's HAL contract
-    # (task_hal.h, mrb_task_switch_reason)
     ${PICORUBY_ROOT}/mrbgems/picoruby-mruby/lib/mruby/mrbgems/mruby-task/include
   )
 elseif(PICORB_VM_MRUBYC)
   add_compile_definitions(PICORB_VM_MRUBYC=1)
+  add_compile_definitions(MRBC_ALLOC_LIBC=1)
+  # Must match the build_config: ports compiled here share headers with
+  # the gem sources compiled by rake, and the IRQ event bridge is
+  # conditioned on this.
+  add_compile_definitions(MRBC_TASK_SCHEDULER_HOOK=1)
   target_include_directories(${PROJECT_NAME} PRIVATE
     ${PICORUBY_ROOT}/mrbgems/picoruby-mrubyc/lib/mrubyc/src
   )
@@ -313,8 +346,12 @@ target_include_directories(${PROJECT_NAME} PRIVATE
   ${CMAKE_BINARY_DIR}/mrb
   ${R2P2_GEM_DIR}/include
   ${PICORUBY_ROOT}/include
-  ${PICORUBY_ROOT}/mrbgems/mruby-compiler/lib/prism/include
   ${PICORUBY_ROOT}/mrbgems/mruby-compiler/include
+  # Prism's generated headers are written under build_root, not the submodule;
+  # before the submodule's include directory, which may hold older generated
+  # headers of its own.
+  ${PICORUBY_ROOT}/build/prism/include
+  ${PICORUBY_ROOT}/mrbgems/mruby-compiler/lib/prism/include
   ${PICORUBY_ROOT}/build/${MRUBY_CONFIG}/include
   ${PICORUBY_ROOT}/mrbgems/picoruby-socket/include
 
@@ -327,7 +364,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE
   ${PICORUBY_ROOT}/mrbgems/picoruby-mbedtls/include
   ${PICORUBY_ROOT}/mrbgems/picoruby-mbedtls/lib/mbedtls/include
   ${PICORUBY_ROOT}/mrbgems/picoruby-mbedtls/lib/mbedtls/library
-  ${PICORUBY_ROOT}/mrbgems/picoruby-net/include
   ${EXTRA_INCLUDE_DIR}
 )
 

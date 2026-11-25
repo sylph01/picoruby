@@ -11,9 +11,12 @@ PicoRuby.wasm uses a task suspension model instead of Emscripten's ASYNCIFY:
 
 - Ruby tasks cooperatively yield to the JavaScript event loop, which pumps the
   mruby-task single-step scheduler from a small `setTimeout`-driven batch loop
-- Scheduler-driven GC is supported by the single-step scheduler, but it is not
-  enabled by default in PicoRuby.wasm
+- Scheduler-driven GC is enabled by default so GC work is driven from scheduler
+  idle points rather than latency-sensitive allocation paths
 - Async operations (setTimeout, fetch, addEventListener) suspend the current task, cleanly exiting the `setjmp` scope
+- `addEventListener(..., sync: true)` opts out of that: the block runs on the JavaScript
+  dispatch stack so `preventDefault` and user-activation-gated APIs work, at the cost of
+  not being able to suspend
 - When the Promise resolves, the task resumes on a fresh C stack with a new `setjmp`
 - Ruby exceptions therefore work correctly across async boundaries without ASYNCIFY overhead
 
@@ -37,17 +40,17 @@ See [docs/architecture.md](docs/architecture.md) for the full design including i
 
 ```bash
 # Debug build
-rake wasm:debug
+rake wasm:build_debug
 
 # Production build
-rake wasm:prod
+rake wasm:build_prod
 
 # Clean build artifacts
 rake wasm:clean
 
 # Start local dev server
 rake wasm:server
-# Open http://localhost:8080/www/
+# Open http://localhost:8080
 ```
 
 ## Testing
@@ -55,9 +58,9 @@ rake wasm:server
 Run the exception-handling test suite after any change to async/task/exception code:
 
 ```bash
-rake wasm:debug
+rake wasm:build_debug
 rake wasm:server
-# Open http://localhost:8080/www/test_index.html
+# Open http://localhost:8080/longjmp/index.html
 ```
 
 All tests must pass. If any test fails, an async/exception boundary invariant has been broken.

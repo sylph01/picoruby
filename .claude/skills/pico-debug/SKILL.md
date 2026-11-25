@@ -1,0 +1,248 @@
+---
+name: pico-debug
+description: >-
+  Start an on-device GDB debugging session for r2p2 PicoRuby/FemtoRuby firmware
+  on a real Raspberry Pi Pico (RP2040 / RP2350) over SWD, driving openocd and
+  gdb inside tmux panes. Use when the user wants to debug on real hardware
+  (jikki / on-device), e.g. "pico2 wo debug build de debug shite",
+  "gdb de jikki debug", or mentions openocd / gdb-pico / SWD together with a
+  board name (pico, pico_w, pico2, pico2_w).
+---
+
+# pico-debug: on-device GDB debugging for r2p2 firmware
+
+Drive an SWD debug session on real Pico hardware: build the requested r2p2
+firmware, then work in the openocd and gdb panes the owner opened. The owner
+starts openocd and gdb; this agent never does (constraint 0 below).
+
+## Board / runtime / chip mapping
+
+The rake target is `r2p2:<runtime>:<board>:<variant>`.
+
+| board    | chip   | openocd alias    | runtime that supports it |
+|----------|--------|------------------|--------------------------|
+| pico     | RP2040 | `openocd-rp2040` | femtoruby only           |
+| pico_w   | RP2040 | `openocd-rp2040` | femtoruby only           |
+| pico2    | RP2350 | `openocd-rp2350` | picoruby (default) or femtoruby |
+| pico2_w  | RP2350 | `openocd-rp2350` | picoruby (default) or femtoruby |
+
+Rules:
+- Chip and openocd alias are fully inferable from the board name. Never ask.
+- `runtime` defaults to **picoruby** for pico2/pico2_w. `pico`/`pico_w` force
+  **femtoruby** (picoruby has no RP2040 target). If the user explicitly says
+  "femtoruby", honor it.
+- `variant` defaults to **debug**. If the user asks for **prod**, confirm once
+  before building (prod is optimized: limited stepping and variable inspection).
+- Build output dir: `build/r2p2/<runtime>/<board>/<variant>/`, and the ELF is
+  the newest `*.elf` there (dated + hashed filename).
+
+## Environment constraints (MUST read before any step)
+
+0. **The owner starts openocd and gdb. Never start them yourself.** When no
+   pane runs `gdb-multiarch` (or no pane runs `openocd`), stop and ask the
+   owner to bring them up in panes of their choice, then wait. Do not launch
+   `openocd`, `gdb-multiarch` or `gdb-pico` from this agent, in a new tmux
+   window or otherwise, and do not flash the board by any other route
+   (`openocd ... program`, picotool) in their place. This agent only drives
+   a gdb session the owner opened, with `send-keys` and `capture-pane`.
+1. **tmux socket is blocked by the sandbox.** Every `tmux` command
+   (`list-panes`, `send-keys`, `capture-pane`, `split-window`) fails with
+   "Operation not permitted" unless run with `dangerouslyDisableSandbox: true`.
+   The build (`rake ...`) and file reads run fine inside the sandbox.
+2. **The debug commands are shell aliases / functions**, defined in
+   `~/.bash_aliases`:
+   - `openocd-rp2040`, `openocd-rp2350` -> aliases
+   - `gdb-pico` -> bash function (`gdb-multiarch -ex "target extended-remote
+     localhost:3333" $*`)
+   Aliases/functions expand ONLY in an interactive login shell, so they are
+   NOT callable from this agent's non-interactive shell. Always run them by
+   `tmux send-keys` into an interactive bash pane. Never call them directly.
+3. **Identify your own pane** via `$TMUX_PANE` (e.g. `%3`) so you never send
+   keystrokes to yourself. Get it with a normal (sandboxed) `echo $TMUX_PANE`.
+4. **Address panes by stable pane id** (`%1`, `%4`, ...), not by index. Indexes
+   shift; ids are stable within a session. Resolve a user-stated "pane 1" to its
+   id via `list-panes` before sending keys.
+5. **Detecting running processes**: `#{pane_current_command}` shows the live
+   command, e.g. `openocd`, `gdb-multiarch`, `claude`, `bash`, `nnn`, `vim`.
+   A "free" pane for openocd must have `cmd=bash` (a pane running `nnn`/`vim`/an
+   editor is NOT free).
+
+## Parameters to gather
+
+- **board** (required): pico | pico_w | pico2 | pico2_w.
+- **variant** (default debug): debug | prod. If prod, confirm once.
+- **runtime**: inferred (picoruby for pico2*, femtoruby for pico*); overridable.
+- **gdb pane** (required, user-specified): the visible pane where gdb attaches.
+  If the user did not say which pane, list candidate panes and ask.
+
+The openocd pane is the one the owner started it in (see step 1); find it
+by `cmd=openocd` in the pane list.
+
+## Procedure
+
+All `tmux` calls below require `dangerouslyDisableSandbox: true`.
+
+### 0. Resolve panes
+
+```bash
+echo "self=$TMUX_PANE"
+tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} id=#{pane_id} active=#{pane_active} cmd=#{pane_current_command}'
+```
+
+- Map the user's stated gdb pane (e.g. "pane 1") to its pane id. Confirm it is
+  not `$TMUX_PANE` and not already running gdb/openocd.
+- Note the window that gdb pane lives in.
+
+### 1. Ensure openocd is running for the correct chip
+
+Scan the pane list for `cmd=openocd`.
+- If one is running: capture it and verify it targets the requested chip
+  (`rp2350.cm0` / `rp2040`), and that it prints
+  `Listening on port 3333 for gdb connections`. If it targets the wrong chip,
+  ask the owner to stop it (a second openocd will fail: ports 3333/4444/6666
+  already in use).
+- If none is running: ask the owner to start it (`openocd-rp2350` or
+  `openocd-rp2040` in a pane of their choice) and wait. See constraint 0.
+
+### 2. Verify the openocd pane the owner started
+
+```bash
+tmux capture-pane -p -t <openocd_pane_id>
+```
+
+Verify the capture contains BOTH:
+- `Examination succeed` (the chip was detected over SWD), and
+- `Listening on port 3333 for gdb connections`.
+
+If instead you see no CMSIS-DAP device / "unable to find" / open errors, the
+probe or board is not connected or not in debug mode: report and stop.
+
+### 3. Build the firmware (sandboxed, no override needed)
+
+```bash
+rake r2p2:<runtime>:<board>:<variant> 2>&1 | tail -40
+```
+
+Confirm it ends with `Built target ...`. On failure, surface the error and stop.
+
+### 4. Resolve the ELF (absolute path)
+
+```bash
+ls -t build/r2p2/<runtime>/<board>/<variant>/*.elf | head -1
+```
+
+Prepend `/home/hasumi/work/picoruby/` if the path is relative; the gdb pane's
+cwd may differ, so always pass gdb an absolute path.
+
+### 5. Verify the gdb session the owner opened
+
+The owner runs `gdb-pico <ABS_ELF_PATH>` in their pane (give them the path
+from step 4). If no pane runs `gdb-multiarch`, ask and wait (constraint 0).
+
+```bash
+tmux capture-pane -p -t <gdb_pane_id> | tail -30
+```
+
+Verify the capture shows `Remote debugging using localhost:3333` and a `(gdb)`
+prompt. The target is now halted; the owner drives it from that pane
+(`bt`, `c`, `b <fn>`, `si`, ...), and this agent may send commands into it
+with `send-keys` when asked.
+
+**RP2350: restore CPACR before the first `c` after a connect.** On the
+first gdb connection openocd probes the flash by running bootrom code on
+core 0 (`RP2350 rev 2, QSPI Flash ...` in the openocd pane). The probe
+leaves CPACR (0xE000ED88) at 0xC000: only the RCP is enabled, and the GPIO
+coprocessor, the DCP and the FPU that the SDK runtime init turned on are
+off. If the firmware is simply continued, the first GPIO coprocessor
+instruction (the cyw43 driver's `gpio_put` in `cyw43_arch_poll`) HardFaults
+with CFSR = 0x80000 (NOCP) and the USB serial goes silent. `monitor flash
+probe 0` does the same. A plain halt/`c` does not. Check and restore:
+
+```bash
+tmux send-keys -t <gdb_pane_id> "p/x *(unsigned int*)0xe000ed88" Enter   # 0xc000 = cleared
+tmux send-keys -t <gdb_pane_id> "set *(unsigned int*)0xe000ed88 = 0xf0c303" Enter
+tmux send-keys -t <gdb_pane_id> "c" Enter
+```
+
+`monitor reset init` + `c` also restores it (runtime init runs again), and
+the `load` + `run` path in step 7 is not affected. RP2040 has no CPACR.
+
+### 6. Report
+
+Give a compact status table: openocd pane + chip, build target + result, gdb
+pane + attach status, and the ELF path. Tell the user gdb is interactive in
+their pane.
+
+### 7. Reflash and restart from an open gdb session
+
+Use this when the firmware was rebuilt and gdb is already attached.
+
+```bash
+tmux send-keys -t <gdb_pane_id> C-c; sleep 2            # halt the target
+tmux send-keys -t <gdb_pane_id> "file <ABS_ELF_PATH>" Enter; sleep 2   # only if the ELF name changed
+tmux send-keys -t <gdb_pane_id> "y" Enter; sleep 1      # answers "change the file?"
+tmux send-keys -t <gdb_pane_id> "load" Enter; sleep 30  # about 2.4 MB at 110 KB/s
+tmux capture-pane -p -t <gdb_pane_id> | tail -3         # wait for "Transfer rate:"
+tmux send-keys -t <gdb_pane_id> "run" Enter; sleep 3
+tmux capture-pane -p -t <gdb_pane_id> | tail -2         # wait for "Start it from the beginning? (y or n)"
+tmux send-keys -t <gdb_pane_id> "y" Enter; sleep 8
+```
+
+Send each answer only after its prompt is on screen. An answer sent before
+the prompt is discarded, and gdb then waits at the prompt with the target
+halted. The symptom is a USB serial port that does not answer. Send `C-c`
+(gdb prints `Quit`), then send `run` and `y` again with the waits above.
+
+After `run`, the USB CDC device re-enumerates. Wait for a new timestamp on
+`/dev/ttyACM0` (`ls -la /dev/ttyACM0`) and about 10 s for the shell to boot
+before you open the serial port.
+
+**Shell executables are cached in the flash file system.** At boot, R2P2
+copies `shell_executables/*.rb` into `/bin` only when `/etc/ruby-description`
+on the board differs from `RUBY_DESCRIPTION` of the firmware. That string
+holds the build date and the commit, so a rebuild on the same day from the
+same commit does not refresh `/bin`, and the board runs the old script. The
+C code and mrblib are in the firmware image and do change. Before the
+restart, delete the marker over the serial console:
+
+```
+rm /etc/ruby-description
+```
+
+Then do the `run` and `y` steps. The next boot rewrites `/bin`.
+
+## Troubleshooting
+
+- **"Operation not permitted" on any tmux call**: you forgot
+  `dangerouslyDisableSandbox: true`.
+- **openocd exits immediately / "Address already in use"**: a previous openocd
+  still holds 3333/4444/6666. Reuse it (step 1) or stop the old one.
+- **`gdb-pico: command not found` in the pane**: that pane's shell did not load
+  `~/.bash_aliases` (not a login/interactive shell). Use a normal interactive
+  bash pane, or source it first.
+- **gdb says "Connection refused"**: openocd is not up yet or died; recheck
+  step 2's capture.
+- **prod build, values optimized out / can't step**: expected. Offer to rebuild
+  as debug.
+- **Serial port opens but the shell does not answer**: gdb is waiting at a
+  `(y or n)` prompt with the target halted. See step 7.
+- **A rebuilt shell executable still runs the old version**: the flash file
+  system cache. Delete `/etc/ruby-description` on the board and restart. See
+  step 7.
+- **RP2350 HardFaults right after `c` following a gdb connect or `monitor
+  flash probe 0`** (`hardfault_handler_c`, CFSR 0x80000 NOCP, PC in
+  `gpioc_bit_out_put`): the flash probe cleared CPACR. Restore it or reset.
+  See step 5.
+- **mbedTLS debug output is not on the console**: with PICORB_DEBUG the
+  rp2040 port logs mbedTLS at level 3 through `debug_printf`, which goes to
+  stderr = the second CDC interface (`...-if02`, usually ttyACM5), not the
+  shell console (`-if00`). Open that port without `stty` (its tcsetattr
+  blocks) and read it alongside the console.
+
+## Cleanup (only when the user asks to end the session)
+
+- In the gdb pane: send `quit` then `y`.
+- In the openocd pane: send `C-c` (Ctrl-C) to stop openocd.
+Leave the panes themselves as they were (do not kill user panes you did not
+create; a pane you created via split-window may be closed with
+`tmux kill-pane -t <id>`).

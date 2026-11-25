@@ -4,8 +4,8 @@
 [submodule "mrbgems/picoruby-mruby/lib/mruby"]
 	path = mrbgems/picoruby-mruby/lib/mruby
 	url = https://github.com/mruby/mruby.git
-[submodule "mrbgems/picoruby-mruby/lib/estalloc"]
-	path = mrbgems/picoruby-mruby/lib/estalloc
+[submodule "mrbgems/picoruby-machine/lib/estalloc"]
+	path = mrbgems/picoruby-machine/lib/estalloc
 	url = https://github.com/picoruby/estalloc
 [submodule "mrbgems/mruby-compiler2"]
 	path = mrbgems/mruby-compiler
@@ -17,9 +17,6 @@
 	path = mrbgems/picoruby-r2p2/lib/pico-sdk
 	url = https://github.com/raspberrypi/pico-sdk.git
 	ignore = dirty
-[submodule "mrbgems/picoruby-r2p2/lib/pico-extras"]
-	path = mrbgems/picoruby-r2p2/lib/pico-extras
-	url = https://github.com/raspberrypi/pico-extras.git
 [submodule "mrbgems/picoruby-r2p2/lib/rp2040js"]
 	path = mrbgems/picoruby-r2p2/lib/rp2040js
 	url = https://github.com/wokwi/rp2040js.git
@@ -32,3 +29,7 @@
 [submodule "mrbgems/picoruby-funicular"]
 	path = mrbgems/picoruby-funicular
 	url = https://github.com/picoruby/funicular
+[submodule "mrbgems/picoruby-aot/lib/spinel"]
+	path = mrbgems/picoruby-aot/lib/spinel
+	url = https://github.com/matz/spinel
+	shallow = true

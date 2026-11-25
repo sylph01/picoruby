@@ -26,7 +26,7 @@ JavaScript Event Loop (setTimeout-driven host loop)
 
 The host loop may call `mrb_run_step_status()` multiple times per JavaScript callback, bounded by the configured time budget, so PicoRuby does not depend on a browser frame callback for progress. The older `mrb_run_step()` export remains as a compatibility wrapper.
 
-`mrb_task_run_once()` also integrates with `GC.scheduler_driven`: when no Ruby task is ready, it advances one scheduler-driven GC step if GC work is pending. PicoRuby.wasm does not enable `GC.scheduler_driven` by default, but the host loop distinguishes progress from true idle so an application that enables it can keep GC moving without busy-pumping the VM while idle.
+`mrb_task_run_once()` also integrates with `GC.scheduler_driven`: when no Ruby task is ready, it advances one scheduler-driven GC step if GC work is pending. PicoRuby.wasm enables `GC.scheduler_driven` during VM initialization so allocation-synchronous GC work does not land on latency-sensitive JavaScript callback paths. The host loop distinguishes progress from true idle so GC can keep moving without busy-pumping the VM while idle.
 
 Each Ruby task is a separate execution context with its own:
 - Call stack (stored in heap via `mrb_context`)
@@ -111,7 +111,7 @@ This design ensures that **ASYNCIFY=1 is not required**, avoiding the 50%+ code 
 
 - **Cost**: 50%+ increase in WASM file size, runtime performance overhead
 - **Unnecessary**: Our task suspension model already handles async boundaries correctly
-- **Verified**: Comprehensive test suite (see `demo/www/test_*.html`) validates exception safety in:
+- **Verified**: Comprehensive test suite (see `demo/www/longjmp/`) validates exception safety in:
   - Nested async operations (3 levels deep)
   - Multiple concurrent tasks
   - ensure clauses
@@ -188,13 +188,39 @@ mrb->c = &tcb->c;  // Switch context
 // Never share mrb_context between tasks
 ```
 
-### 5. Test Exception Handling After Changes
+### 5. Never Suspend Inside a Synchronous Listener
+
+`addEventListener(..., sync: true)` runs the Ruby block from
+`call_ruby_callback_sync_event()` (`src/mruby/js.c`), on the JavaScript event
+dispatch stack. There is no task to suspend there, so the dispatch takes
+`mrb->task.scheduler_lock` for its duration, turning every asynchronous Task API
+(`mrb_suspend_task`, blocking `Task::Queue#pop`, ...) into a clean `RuntimeError`.
+
+```c
+// CORRECT - call the block on the current context, catching any longjmp
+mrb->task.scheduler_lock++;
+mrb_value r = mrb_protect_error(mrb, sync_dispatch_body, &args, &error);
+mrb->task.scheduler_lock--;
+
+// WRONG - DO NOT DO THIS
+mrb_funcall(mrb, block, "call", 1, event);  // an exception longjmps into the JS frame
+```
+
+Two entry situations, both handled by the above:
+
+- **Between host loop steps**: `execute_task()` has restored `mrb->c` to the root
+  context and `mrb->jmp` is `NULL`. `mrb_protect_error` installs the jmpbuf.
+- **Re-entrant** (Ruby called `element.click` / `dispatchEvent`): `mrb->c` is the
+  running task's context with a `cci > 0` frame below, which is the ordinary
+  `mrb_yield` re-entrancy the VM already handles.
+
+### 6. Test Exception Handling After Changes
 
 After any modification to task scheduling, async operations, or exception handling:
 
-1. Build: `rake wasm:clean && rake wasm:debug`
+1. Build: `rake wasm:clean && rake wasm:build_debug`
 2. Run test server: `rake wasm:server`
-3. Open: http://localhost:8080/test_index.html
+3. Open: http://localhost:8080/longjmp/index.html
 4. **Run ALL tests** and verify each one passes
 5. Check browser console for errors
 
@@ -211,8 +237,7 @@ picoruby-wasm/
 │       └── wasm.c           # WASM initialization, main loop
 ├── demo/
 │   └── www/
-│       ├── test_index.html  # Exception handling test suite
-│       ├── test_*.html      # Individual test cases
+│       ├── longjmp/         # Exception handling test suite (index.html + cases)
 │       └── *.html           # Usage examples
 └── npm/                     # NPM package for distribution
 ```
@@ -225,6 +250,7 @@ picoruby-wasm/
   - `js_add_event_listener()`: DOM event handling
   - `js_set_timeout()`: Timer scheduling
   - `call_ruby_callback()`: Generic callback invocation
+  - `call_ruby_callback_sync_event()`: Synchronous listener dispatch (`sync: true`)
 
 - **`../../picoruby-mruby/src/task.c`**
   - `mrb_suspend_task()`: Suspends task, exits setjmp scope
@@ -238,19 +264,19 @@ picoruby-wasm/
 
 ### Exception Handling Test Suite
 
-Located in `demo/www/`, the test suite validates async exception safety:
+Located in `demo/www/longjmp/`, the test suite validates async exception safety.
+`longjmp/index.html` links to every case below:
 
 | Test | Purpose |
 |------|---------|
-| `raise_rescue.html` | Basic async exception handling |
-| `test_nested_async.html` | 3-level nested async with exception |
-| `test_multi_task.html` | Multiple independent tasks |
-| `test_ensure.html` | ensure clause execution |
-| `test_reraise.html` | Exception re-raising |
-| `test_deep_recursion.html` | Deep call stack + async |
-| `test_custom_exception.html` | Custom exception classes |
-| `test_promise_chain.html` | Chained Promise callbacks |
-| `test_stress.html` | 100 parallel tasks |
+| `nested_async.html` | 3-level nested async with exception |
+| `multi_task.html` | Multiple independent tasks |
+| `ensure.html` | ensure clause execution |
+| `reraise.html` | Exception re-raising |
+| `deep_recursion.html` | Deep call stack + async |
+| `custom_exception.html` | Custom exception classes |
+| `promise_chain.html` | Chained Promise callbacks |
+| `stress.html` | 100 parallel tasks |
 
 **All tests must pass** to ensure async boundary safety.
 
@@ -261,7 +287,7 @@ cd lib/picoruby/mrbgems/picoruby-wasm
 rake
 cd demo
 python3 -m http.server 8080
-# Open http://localhost:8080/www/test_index.html
+# Open http://localhost:8080/www/longjmp/index.html
 ```
 
 ## Build Configuration
@@ -301,7 +327,7 @@ JavaScript object references are stored in `globalThis.picorubyRefs` array:
 const newRefId = globalThis.picorubyRefs.push(element) - 1;
 ```
 
-**Current Limitation**: References are never removed, leading to potential memory leaks in long-running applications. See Future Considerations section in main README.
+**Current Limitation**: References are never removed, leading to potential memory leaks in long-running applications. The one exception is synchronous listener dispatch: the event's reference has a bounded lifetime (the DOM makes the event inert once dispatch returns), so `js_add_event_listener` releases it right after the handler returns.
 
 ### Task Contexts
 

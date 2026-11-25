@@ -10,8 +10,11 @@ MRuby::Gem::Specification.new('picoruby-socket') do |spec|
   unless build.posix?
     spec.add_dependency 'picoruby-mbedtls'  # SSL/TLS support for non-POSIX platforms
   end
-  spec.add_conflict 'picoruby-net'
   spec.add_dependency 'picoruby-machine'
+  spec.add_dependency 'picoruby-metaprog' if build.femtoruby?
+  if build.picoruby? && !build.posix? && !build.platform?(:esp32)
+    spec.add_dependency 'mruby-task'
+  end
 
   # Add include directory
   spec.cc.include_paths << "#{dir}/include"
@@ -21,6 +24,13 @@ MRuby::Gem::Specification.new('picoruby-socket') do |spec|
     mbedtls_dir = "#{MRUBY_ROOT}/mrbgems/picoruby-mbedtls/lib/mbedtls"
     if File.directory?(mbedtls_dir)
       spec.cc.include_paths << "#{mbedtls_dir}/include"
+      # Use the same config as picoruby-mbedtls. Without this, TUs in this
+      # gem see the default mbedtls_config.h and disagree with libmbedtls
+      # about struct layouts (e.g. mbedtls_ssl_config embedded by value in
+      # altcp_tls_mbedtls.c).
+      spec.cc.defines << "MBEDTLS_CONFIG_FILE='\"#{MRUBY_ROOT}/mrbgems/picoruby-mbedtls/include/mbedtls_config.h\"'"
+      # Same -Wundef suppression as picoruby-mbedtls (ssl.h upstream bug)
+      spec.cc.flags << '-Wno-undef'
     end
   end
 

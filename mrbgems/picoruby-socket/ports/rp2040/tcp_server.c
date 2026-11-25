@@ -22,15 +22,112 @@
 #define TCP_SERVER_RECV_BUF_SIZE 4096
 #endif
 
-/* TCP Server structure */
+/* Upper bound for the number of accept slots. The backlog argument of
+ * TCPServer.new selects the actual number (clamped to this value). A slot
+ * pre-allocates only the picorb_socket_t (about 0.7 KB); the receive
+ * buffer is allocated when Ruby picks the connection up, because data that
+ * arrives before that is held in LwIP pbufs (see TCPSocket_store_pbuf). */
+#ifndef TCP_SERVER_MAX_BACKLOG
+#define TCP_SERVER_MAX_BACKLOG 8
+#endif
+
+/* TCP Server structure.
+ *
+ * Sockets move through three stages:
+ *   free_sockets -> (accept callback) -> accepted ring -> (accept_nonblock)
+ *   -> owned by the Ruby TCPSocket object.
+ * free_count + accepted_count never exceeds slots, so the accept callback
+ * only has to abort a connection when every slot is in use. */
 struct picorb_tcp_server {
   struct altcp_pcb *listen_pcb;
-  picorb_socket_t *accepted_socket;
-  picorb_socket_t *pending_socket; /* pre-allocated, ready for next accept */
+  picorb_socket_t *free_sockets[TCP_SERVER_MAX_BACKLOG];
+  int free_count;
+  picorb_socket_t *accepted[TCP_SERVER_MAX_BACKLOG]; /* FIFO ring */
+  int accepted_head;
+  int accepted_count;
+  int slots;
   picorb_state *vm;
+  void *event_queue;
+  bool event_pending;
   int port;
-  int state;
 };
+
+/* Allocate one zeroed socket slot. recv_buf stays NULL (capacity 0) until
+ * accept_nonblock hands the socket to Ruby. */
+static picorb_socket_t *
+server_socket_alloc(picorb_state *vm)
+{
+  picorb_socket_t *sock = (picorb_socket_t *)picorb_alloc(vm, sizeof(picorb_socket_t));
+  if (!sock) {
+    return NULL;
+  }
+  memset(sock, 0, sizeof(picorb_socket_t));
+  return sock;
+}
+
+/* Give an accepted socket its receive buffer. Returns false when the heap
+ * is exhausted; the socket then stays queued and the caller retries later. */
+static bool
+server_socket_attach_recv_buf(picorb_state *vm, picorb_socket_t *sock)
+{
+  if (sock->recv_buf) {
+    return true;
+  }
+  sock->recv_buf = (char *)picorb_alloc(vm, TCP_SERVER_RECV_BUF_SIZE + 1);
+  if (!sock->recv_buf) {
+    return false;
+  }
+  sock->recv_capacity = TCP_SERVER_RECV_BUF_SIZE;
+  sock->recv_len = 0;
+  sock->recv_buf[0] = '\0';
+  return true;
+}
+
+static void
+server_socket_free(picorb_state *vm, picorb_socket_t *sock)
+{
+  if (!sock) {
+    return;
+  }
+  if (sock->recv_buf) {
+    picorb_free(vm, sock->recv_buf);
+  }
+  picorb_free(vm, sock);
+}
+
+/* Top up the free slots. Runs in task context only (never from a LwIP
+ * callback), so it may use the heap. Stops silently when the heap is
+ * exhausted; the accept callback then aborts extra connections. */
+static void
+server_replenish(picorb_state *vm, picorb_tcp_server_t *server)
+{
+  while (server->free_count + server->accepted_count < server->slots) {
+    picorb_socket_t *sock = server_socket_alloc(vm);
+    if (!sock) {
+      break;
+    }
+    server->free_sockets[server->free_count++] = sock;
+  }
+}
+
+/* Release every socket the server still owns. Accepted sockets that Ruby
+ * has not picked up yet are closed as well. */
+static void
+server_release_sockets(picorb_state *vm, picorb_tcp_server_t *server)
+{
+  while (server->free_count > 0) {
+    server_socket_free(vm, server->free_sockets[--server->free_count]);
+  }
+  while (server->accepted_count > 0) {
+    picorb_socket_t *sock = server->accepted[server->accepted_head];
+    server->accepted_head = (server->accepted_head + 1) % server->slots;
+    server->accepted_count--;
+    /* Closes the PCB and releases recv_buf and any pending pbuf. */
+    TCPSocket_close(vm, sock);
+    picorb_free(vm, sock);
+  }
+  server->accepted_head = 0;
+}
 
 /* Forward declarations for TCP socket callbacks */
 static err_t tcp_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err);
@@ -55,6 +152,7 @@ tcp_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err
     if (pbuf) pbuf_free(pbuf);
     sock->state = SOCKET_STATE_ERROR;
     sock->connected = false;
+    picorb_socket_notify_readable(sock);
     D("tcp_server.c tcp_recv_callback: error, state set to ERROR");
     return err;
   }
@@ -64,37 +162,17 @@ tcp_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err
     sock->state = SOCKET_STATE_CLOSED;
     sock->connected = false;
     sock->closed = true;
+    picorb_socket_notify_readable(sock);
     D("tcp_server.c tcp_recv_callback: connection closed");
     return ERR_OK;
   }
 
-  /* Copy data into pre-allocated buffer (no heap allocation) */
-  size_t total_len = pbuf->tot_len;
-  size_t new_size = sock->recv_len + total_len;
-  D("tcp_server.c tcp_recv_callback: receiving %zu bytes, current recv_len=%zu\n", total_len, sock->recv_len);
+  /* Copy what fits into the pre-allocated buffer (no heap allocation) and
+   * keep the rest as a pending pbuf until the application reads. */
+  D("tcp_server.c tcp_recv_callback: receiving %u bytes, current recv_len=%zu\n", pbuf->tot_len, sock->recv_len);
+  TCPSocket_store_pbuf(sock, pbuf);
 
-  if (new_size > sock->recv_capacity) {
-    /* Buffer full - cannot accept more data */
-    D("tcp_server.c tcp_recv_callback: buffer full, dropping data");
-    pbuf_free(pbuf);
-    return ERR_MEM;
-  }
-
-  /* Copy data from pbuf chain */
-  struct pbuf *current = pbuf;
-  size_t offset = sock->recv_len;
-  while (current) {
-    memcpy(sock->recv_buf + offset, current->payload, current->len);
-    offset += current->len;
-    current = current->next;
-  }
-  sock->recv_len = offset;
-  sock->recv_buf[sock->recv_len] = '\0';
-
-  /* Tell LwIP we processed the data */
-  altcp_recved(pcb, total_len);
-  pbuf_free(pbuf);
-
+  picorb_socket_notify_readable(sock);
   D("tcp_server.c tcp_recv_callback: success, total recv_len=%zu\n", sock->recv_len);
   return ERR_OK;
 }
@@ -117,6 +195,7 @@ tcp_err_callback(void *arg, err_t err)
   sock->state = SOCKET_STATE_ERROR;
   sock->connected = false;
   sock->pcb = NULL; /* PCB is already freed by LwIP */
+  picorb_socket_notify_readable(sock);
 }
 
 /* Accept callback - runs in LwIP callback context (may be IRQ/PendSV).
@@ -130,13 +209,17 @@ tcp_accept_callback(void *arg, struct altcp_pcb *newpcb, err_t err)
     return ERR_ABRT;
   }
 
-  /* Use pre-allocated socket to avoid heap allocation in callback context. */
-  picorb_socket_t *sock = server->pending_socket;
-  if (!sock) {
+  /* Take a pre-allocated socket to avoid heap allocation in callback context. */
+  if (server->free_count == 0) {
+    /* Every slot is in use: abort the connection. The callback must return
+     * ERR_ABRT after aborting, otherwise LwIP aborts the same PCB again
+     * (tcp_in.c: tcp_process) and frees it twice, which corrupts the
+     * TCP_PCB pool free list and makes tcp_input loop forever. */
+    D("tcp_accept_callback: no free slot, aborting connection");
     altcp_abort(newpcb);
-    return ERR_MEM;
+    return ERR_ABRT;
   }
-  server->pending_socket = NULL;
+  picorb_socket_t *sock = server->free_sockets[--server->free_count];
 
   /* Save recv_buf across memset, then reinitialize socket fields. */
   char *recv_buf = sock->recv_buf;
@@ -152,23 +235,27 @@ tcp_accept_callback(void *arg, struct altcp_pcb *newpcb, err_t err)
   sock->connected = true;
   sock->closed = false;
 
-  /* Store in server */
-  server->accepted_socket = sock;
-  server->state = 1; /* has connection */
+  /* Queue for accept_nonblock. The ring cannot overflow because
+   * free_count + accepted_count <= slots. */
+  server->accepted[(server->accepted_head + server->accepted_count) % server->slots] = sock;
+  server->accepted_count++;
 
   /* Set up callbacks with correct arg */
   altcp_arg(newpcb, sock);
   altcp_recv(newpcb, tcp_recv_callback);
   altcp_sent(newpcb, tcp_sent_callback);
   altcp_err(newpcb, tcp_err_callback);
+  TCPServer_notify_accepted(server);
 
   return ERR_OK;
 }
 
 /* Create TCP server */
 picorb_tcp_server_t*
-TCPServer_create(picorb_state *vm, int port, int backlog)
+TCPServer_create(picorb_state *vm, const char *host, int port, int backlog)
 {
+  /* host is not resolved here yet: every interface is bound */
+  (void)host;
   if (port <= 0 || port > 65535) {
     return NULL;
   }
@@ -182,20 +269,18 @@ TCPServer_create(picorb_state *vm, int port, int backlog)
   server->vm = vm;
   server->port = port;
 
-  /* Pre-allocate socket for first accepted connection. */
-  server->pending_socket = (picorb_socket_t *)picorb_alloc(vm, sizeof(picorb_socket_t));
-  if (!server->pending_socket) {
+  /* The backlog selects how many connections can be accepted by LwIP
+   * before Ruby picks them up. Clamp it to the slot array size. */
+  if (backlog < 1) backlog = 1;
+  if (backlog > TCP_SERVER_MAX_BACKLOG) backlog = TCP_SERVER_MAX_BACKLOG;
+  server->slots = backlog;
+
+  /* Pre-allocate the accept slots. At least one is required. */
+  server_replenish(vm, server);
+  if (server->free_count == 0) {
     picorb_free(vm, server);
     return NULL;
   }
-  memset(server->pending_socket, 0, sizeof(picorb_socket_t));
-  server->pending_socket->recv_buf = (char *)picorb_alloc(vm, TCP_SERVER_RECV_BUF_SIZE + 1);
-  if (!server->pending_socket->recv_buf) {
-    picorb_free(vm, server->pending_socket);
-    picorb_free(vm, server);
-    return NULL;
-  }
-  server->pending_socket->recv_capacity = TCP_SERVER_RECV_BUF_SIZE;
 
   lwip_begin();
 
@@ -204,8 +289,7 @@ TCPServer_create(picorb_state *vm, int port, int backlog)
   if (!tpcb) {
     D("TCPServer_create: tcp_new failed");
     lwip_end();
-    picorb_free(vm, server->pending_socket->recv_buf);
-    picorb_free(vm, server->pending_socket);
+    server_release_sockets(vm, server);
     picorb_free(vm, server);
     return NULL;
   }
@@ -219,8 +303,7 @@ TCPServer_create(picorb_state *vm, int port, int backlog)
     D("TCPServer_create: altcp_tcp_wrap failed");
     tcp_close(tpcb);
     lwip_end();
-    picorb_free(vm, server->pending_socket->recv_buf);
-    picorb_free(vm, server->pending_socket);
+    server_release_sockets(vm, server);
     picorb_free(vm, server);
     return NULL;
   }
@@ -240,8 +323,7 @@ TCPServer_create(picorb_state *vm, int port, int backlog)
     } else {
       altcp_close(server->listen_pcb);
       lwip_end();
-      picorb_free(vm, server->pending_socket->recv_buf);
-      picorb_free(vm, server->pending_socket);
+      server_release_sockets(vm, server);
       picorb_free(vm, server);
       return NULL;
     }
@@ -251,8 +333,7 @@ TCPServer_create(picorb_state *vm, int port, int backlog)
   if (!server->listen_pcb) {
     D("TCPServer_create: altcp_listen_with_backlog failed");
     lwip_end();
-    picorb_free(vm, server->pending_socket->recv_buf);
-    picorb_free(vm, server->pending_socket);
+    server_release_sockets(vm, server);
     picorb_free(vm, server);
     return NULL;
   }
@@ -282,32 +363,28 @@ TCPServer_accept_nonblock(picorb_state *vm, picorb_tcp_server_t *server)
   cyw43_arch_poll();
 #endif
 
-  /* Check for already accepted socket */
-  if (!server->accepted_socket) {
+  if (server->accepted_count == 0) {
     return NULL; /* No pending connection */
   }
 
-  /* Return the pre-allocated socket that was claimed by the callback. */
-  picorb_socket_t *sock = server->accepted_socket;
-
-  /* Clear from server */
-  server->accepted_socket = NULL;
-  server->state = 0;
-
-  /* Replenish pending_socket for the next accepted connection. */
-  if (!server->pending_socket) {
-    server->pending_socket = (picorb_socket_t *)picorb_alloc(vm, sizeof(picorb_socket_t));
-    if (server->pending_socket) {
-      memset(server->pending_socket, 0, sizeof(picorb_socket_t));
-      server->pending_socket->recv_buf = (char *)picorb_alloc(vm, TCP_SERVER_RECV_BUF_SIZE + 1);
-      if (!server->pending_socket->recv_buf) {
-        picorb_free(vm, server->pending_socket);
-        server->pending_socket = NULL;
-      } else {
-        server->pending_socket->recv_capacity = TCP_SERVER_RECV_BUF_SIZE;
-      }
-    }
+  /* The oldest accepted socket needs its receive buffer before Ruby can
+   * read from it. Leave it queued if the heap cannot provide one now. */
+  picorb_socket_t *sock = server->accepted[server->accepted_head];
+  if (!server_socket_attach_recv_buf(vm, sock)) {
+    D("TCPServer_accept_nonblock: recv_buf allocation failed");
+    return NULL;
   }
+
+  /* Hand it to Ruby. It now owns the socket. */
+  server->accepted_head = (server->accepted_head + 1) % server->slots;
+  server->accepted_count--;
+  server->event_pending = false;
+
+  /* Data that arrived before the buffer existed is waiting in pending_pbuf. */
+  TCPSocket_drain_pending(sock);
+
+  /* Refill the slot that was just released. */
+  server_replenish(vm, server);
 
   return sock;
 }
@@ -320,28 +397,8 @@ TCPServer_close(picorb_state *vm, picorb_tcp_server_t *server)
     return false;
   }
 
-  /* Clean up pending pre-allocated socket if not yet used. */
-  if (server->pending_socket) {
-    if (server->pending_socket->recv_buf) {
-      picorb_free(vm, server->pending_socket->recv_buf);
-    }
-    picorb_free(vm, server->pending_socket);
-    server->pending_socket = NULL;
-  }
-
-  /* Clean up accepted socket if present */
-  if (server->accepted_socket) {
-    lwip_begin();
-    if (server->accepted_socket->pcb) {
-      altcp_close(server->accepted_socket->pcb);
-    }
-    lwip_end();
-    if (server->accepted_socket->recv_buf) {
-      picorb_free(vm, server->accepted_socket->recv_buf);
-    }
-    picorb_free(vm, server->accepted_socket);
-    server->accepted_socket = NULL;
-  }
+  /* Release free slots and close connections Ruby never picked up. */
+  server_release_sockets(vm, server);
 
   if (server->listen_pcb) {
     lwip_begin();
@@ -353,6 +410,11 @@ TCPServer_close(picorb_state *vm, picorb_tcp_server_t *server)
     Net_busy_wait_ms(50);
   }
 
+  TCPServer_notify_accepted(server);
+  if (server->event_queue) {
+    picorb_free(vm, server->event_queue);
+    server->event_queue = NULL;
+  }
   picorb_free(vm, server);
   return true;
 }
@@ -375,4 +437,36 @@ TCPServer_listening(picorb_state *vm, picorb_tcp_server_t *server)
     return false;
   }
   return server->listen_pcb != NULL;
+}
+
+void
+TCPServer_set_event_queue(picorb_tcp_server_t *server, picorb_state *vm, void *queue)
+{
+  if (!server) return;
+  server->vm = vm;
+  server->event_queue = queue;
+}
+
+void*
+TCPServer_event_queue(picorb_tcp_server_t *server)
+{
+  return server ? server->event_queue : NULL;
+}
+
+picorb_state*
+TCPServer_vm(picorb_tcp_server_t *server)
+{
+  return server ? server->vm : NULL;
+}
+
+bool
+TCPServer_event_pending(picorb_tcp_server_t *server)
+{
+  return server && server->event_pending;
+}
+
+void
+TCPServer_set_event_pending(picorb_tcp_server_t *server, bool pending)
+{
+  if (server) server->event_pending = pending;
 }

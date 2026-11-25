@@ -75,6 +75,7 @@ packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t 
       switch (hci_event_packet_get_type(packet)) {
         case BTSTACK_EVENT_STATE:
         case HCI_EVENT_LE_META:
+        case HCI_EVENT_DISCONNECTION_COMPLETE:
         case GAP_EVENT_ADVERTISING_REPORT:
         case GATT_EVENT_QUERY_COMPLETE:
         case GATT_EVENT_SERVICE_QUERY_RESULT:
@@ -153,6 +154,9 @@ BLE_init(const uint8_t *profile_data, int ble_role)
       att_server_register_packet_handler(packet_handler);
       break;
     case BLE_ROLE_BROADCASTER:
+      /* Clear any ATT database left over from a previous peripheral
+       * init so BLE_init() never keeps a stale profile pointer. */
+      att_server_init(NULL, NULL, NULL);
       att_server_register_packet_handler(packet_handler);
       break;
     case BLE_ROLE_OBSERVER:

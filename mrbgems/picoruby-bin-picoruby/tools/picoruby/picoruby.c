@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <termios.h>
 #include <unistd.h>
@@ -38,9 +41,48 @@ mrb_value mrb_load_irep_file(mrb_state *vm, FILE* fp);
 #endif /* PICORB_VM_MRUBYC */
 
 #ifndef HEAP_SIZE
-#define HEAP_SIZE (1024 * 6400 - 1)
+#define HEAP_SIZE (1024 * 6400)
 #endif
-static uint8_t vm_heap[HEAP_SIZE];
+static uint8_t vm_heap_static[HEAP_SIZE] __attribute__((aligned(8)));
+
+/* The VM heap: HEAP_SIZE bytes built in, or the number of kilobytes in
+ * PICORUBY_HEAP_SIZE when that is set, for a script that needs more
+ * than a microcontroller would have. A build on the libc allocator
+ * (mruby without estalloc) does not use this heap, so it ignores the
+ * variable. */
+static uint8_t *
+vm_heap_alloc(size_t *size)
+{
+  *size = HEAP_SIZE;
+#if defined(PICORB_VM_MRUBY) && !defined(PICORB_ALLOC_ESTALLOC)
+  return vm_heap_static;
+#else
+  const char *env = getenv("PICORUBY_HEAP_SIZE");
+  if (!env || !*env) return vm_heap_static;
+#if defined(PICORB_VM_MRUBYC)
+  /* mrbc_init() takes the size as an unsigned int */
+  const unsigned long long max_kb = UINT_MAX / 1024;
+#else
+  const unsigned long long max_kb = SIZE_MAX / 1024;
+#endif
+  char *end;
+  errno = 0;
+  long kb = strtol(env, &end, 10);
+  if (errno != 0 || end == env || *end != '\0' || kb <= 0 ||
+      max_kb < (unsigned long long)kb) {
+    fprintf(stderr, "PICORUBY_HEAP_SIZE=%s ignored: expected kilobytes (1..%llu)\n",
+            env, max_kb);
+    return vm_heap_static;
+  }
+  uint8_t *heap = (uint8_t *)malloc((size_t)kb * 1024);
+  if (!heap) {
+    fprintf(stderr, "PICORUBY_HEAP_SIZE=%s ignored: cannot allocate %ld KB\n", env, kb);
+    return vm_heap_static;
+  }
+  *size = (size_t)kb * 1024;
+  return heap;
+#endif
+}
 
 #if defined(_WIN32) || defined(_WIN64)
 # include <io.h> /* for setmode */
@@ -349,12 +391,6 @@ parse_args(void *vm, int argc, char **argv, struct _args *args)
 static void
 cleanup(mrb_state *vm, struct _args *args)
 {
-#if defined(PICORB_VM_MRUBY)
-  // TODO: fix segv
-//  mrb_close(vm);
-#elif defined(PICORB_VM_MRUBYC)
-  (void)vm;
-#endif
   if (!args->fname)
     picorb_free(vm, args->cmdline);
   picorb_free(vm, args->argv);
@@ -364,6 +400,11 @@ cleanup(mrb_state *vm, struct _args *args)
     }
     picorb_free(vm, args->libv);
   }
+#if defined(PICORB_VM_MRUBY)
+  mrb_close(vm);
+#elif defined(PICORB_VM_MRUBYC)
+  (void)vm;
+#endif
 }
 
 static void
@@ -392,6 +433,20 @@ picorb_print_diagnostics(mrc_ccontext *cc, const char *cmdline, picorb_bool verb
 }
 
 #if defined(PICORB_VM_MRUBY)
+/* The program has ended raising `vm->exc`: report it unless it is a
+   SystemExit, and answer the exit status. `vm->exc` is left set, so that
+   the Kernel#at_exit blocks, which run as the state is closed, see it as
+   `$!`. */
+static int
+program_end(mrb_state *vm)
+{
+  if (MRB_EXC_EXIT_P(vm->exc)) {
+    return MRB_EXC_EXIT_STATUS(vm, vm->exc);
+  }
+  picorb_print_error(vm);
+  return EXIT_FAILURE;
+}
+
 static int /* macro needs `mrb` */
 mrb_lib_run(mrc_ccontext *cc, mrc_irep *irep)
 {
@@ -409,7 +464,12 @@ mrb_lib_run(mrc_ccontext *cc, mrc_irep *irep)
   }
   mrb_value v = mrb_top_run(mrb, proc, mrb_top_self(mrb), 1);
   if (mrb->exc) {
-    MRB_EXC_CHECK_EXIT(mrb, mrb->exc);
+    if (MRB_EXC_EXIT_P(mrb->exc)) {
+      /* closing the state runs the at_exit blocks */
+      int status = MRB_EXC_EXIT_STATUS(mrb, mrb->exc);
+      mrb_close(mrb);
+      exit(status);
+    }
     if (!mrb_undef_p(v)) {
       picorb_print_error(mrb);
     }
@@ -470,7 +530,9 @@ main(int argc, char **argv)
     atexit(restore_termios);
   }
 #endif
-  picorb_vm_init();
+  size_t vm_heap_size;
+  uint8_t *vm_heap = vm_heap_alloc(&vm_heap_size);
+  picorb_vm_init(vm_heap, vm_heap_size);
 
   int n = -1;
   struct _args args;
@@ -722,6 +784,9 @@ main(int argc, char **argv)
       exit(EXIT_FAILURE);
     }
     tcb_list[tcb_list_size++] = task;
+    /* The task's proc holds the irep now; mrc_irep_free() would free it
+       while procs made from it still run, as at_exit blocks do. */
+    mrb_irep_decref(vm, (mrb_irep *)irep);
 #elif defined(PICORB_VM_MRUBYC)
     if (!vm_code) {
       int result;
@@ -759,20 +824,15 @@ main(int argc, char **argv)
     mrb_vm_ci_env_clear(vm, vm->c->cibase);
     n = EXIT_SUCCESS;
     if (vm->exc) {
-      MRB_EXC_CHECK_EXIT(vm, vm->exc);
-      picorb_print_error(vm);
-      n = EXIT_FAILURE;
+      n = program_end(vm);
     }
-    for (int i = 0; i < tcb_list_size; i++) {
+    for (int i = 0; i < tcb_list_size && !(vm->exc && MRB_EXC_EXIT_P(vm->exc)); i++) {
       mrb_value result = mrb_task_value(vm, tcb_list[i]);
       if (mrb_exception_p(result)) {
         vm->exc = mrb_obj_ptr(result);
-        MRB_EXC_CHECK_EXIT(vm, vm->exc);
-        picorb_print_error(vm);
-        n = EXIT_FAILURE;
+        n = program_end(vm);
       }
     }
-    mrc_irep_free(cc, irep);
     if (source) mrc_free(cc, source);
 #elif defined(PICORB_VM_MRUBYC)
     if (mrbc_run() != 0) {

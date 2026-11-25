@@ -4,9 +4,12 @@
  */
 #define MBEDTLS_PLATFORM_C
 
-/* DTLS Connection ID feature and compatibility setting for MbedTLS v3 */
-#define MBEDTLS_SSL_DTLS_CONNECTION_ID
-#define MBEDTLS_SSL_DTLS_CONNECTION_ID_COMPAT 0
+/*
+ * R2P2 uses TLS over TCP; DTLS stays disabled to reduce TLS state.
+ * Do not try to define MBEDTLS_SSL_DTLS_CONNECTION_ID_COMPAT here to
+ * silence the -Wundef warning in ssl.h; config_adjust_ssl.h #undefs it
+ * while MBEDTLS_SSL_PROTO_DTLS is disabled, so the definition is dead.
+ */
 
 // #define MBEDTLS_TIMING_C
 // #define MBEDTLS_TIMING_ALT
@@ -38,18 +41,13 @@
 #define MBEDTLS_ECDH_C
 #define MBEDTLS_ECDSA_C
 #define MBEDTLS_ECP_C
-#define MBEDTLS_ECP_DP_SECP192R1_ENABLED
-#define MBEDTLS_ECP_DP_SECP224R1_ENABLED
-#define MBEDTLS_ECP_DP_SECP256R1_ENABLED
 #define MBEDTLS_ECP_DP_SECP384R1_ENABLED
-#define MBEDTLS_ECP_DP_SECP521R1_ENABLED
-#define MBEDTLS_ECP_DP_SECP192K1_ENABLED
-#define MBEDTLS_ECP_DP_SECP224K1_ENABLED
-#define MBEDTLS_ECP_DP_SECP256K1_ENABLED
-#define MBEDTLS_ECP_DP_BP256R1_ENABLED
-#define MBEDTLS_ECP_DP_BP384R1_ENABLED
-#define MBEDTLS_ECP_DP_BP512R1_ENABLED
+#define MBEDTLS_ECP_DP_SECP256R1_ENABLED
 #define MBEDTLS_ECP_DP_CURVE25519_ENABLED
+/* Fast modular reduction for the NIST curves. Without it an ECDSA verify
+   takes 1.1 s (P-256) / 2.9 s (P-384) on RP2350, and an ECDSA certificate
+   chain does not fit in the 10 s handshake timeout. */
+#define MBEDTLS_ECP_NIST_OPTIM
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
 #define MBEDTLS_X509_CRT_PARSE_C
@@ -69,8 +67,12 @@
 #define MBEDTLS_SHA1_C
 #define MBEDTLS_SHA224_C
 #define MBEDTLS_SHA256_C
-//#define MBEDTLS_SHA256_ALT
+/* SHA-384 is needed to parse ecdsa-with-SHA384 certificates (Let's Encrypt
+   ECDSA chains); without it mbedTLS silently drops them from the chain and
+   verifies the ServerKeyExchange with the key of another certificate. */
+#define MBEDTLS_SHA384_C
 #define MBEDTLS_SHA512_C
+//#define MBEDTLS_SHA256_ALT
 
 /* custom allocator */
 #define MBEDTLS_PLATFORM_MEMORY
@@ -98,7 +100,6 @@
 #define MBEDTLS_PKCS1_V15
 #define MBEDTLS_ENTROPY_C
 #define MBEDTLS_CTR_DRBG_C
-#define MBEDTLS_SHA512_C
 #define MBEDTLS_GENPRIME
 
 /* Required for ENTROPY_C when NO_PLATFORM_ENTROPY is defined */
@@ -108,19 +109,23 @@
 #define MBEDTLS_ENTROPY_HARDWARE_ALT
 #define MBEDTLS_HAVE_TIME
 #define MBEDTLS_PLATFORM_MS_TIME_ALT
-#define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
-#define MBEDTLS_CCM_C
 #define MBEDTLS_AES_FEWER_TABLES
 #define MBEDTLS_SSL_TLS_C
 #define MBEDTLS_SSL_CLI_C
 #define MBEDTLS_SSL_SERVER_NAME_INDICATION
 #define MBEDTLS_SSL_PROTO_TLS1_2
-#define MBEDTLS_SSL_PROTO_DTLS
 
 /* Required for SSL_TLS_C */
 #define MBEDTLS_MD5_C
 #define MBEDTLS_SSL_ALPN
 // #define MBEDTLS_SSL_MAX_FRAGMENT_LENGTH
+
+/*
+ * Keep buffers below the mbedTLS defaults (16KB each) while leaving enough
+ * room for common HTTPS certificate records. Outgoing HTTP requests are small.
+ */
+#define MBEDTLS_SSL_IN_CONTENT_LEN  8192
+#define MBEDTLS_SSL_OUT_CONTENT_LEN 2048
 
 #define MBEDTLS_ERROR_C
 
