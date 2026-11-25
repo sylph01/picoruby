@@ -30,6 +30,27 @@ function(r2p2_apply_tz_ns TARGET)
         # target: BusFault, faulting PC in boot_unlock_unsafe). The monitor
         # already reset the boot locks; NS must not touch them.
         PICO_RUNTIME_SKIP_INIT_BOOT_LOCKS_RESET=1
+        # pico_low_power (linked for Machine.sleep since pico-sdk 2.3.0)
+        # registers three stages of its own. NS never enters an SDK
+        # low-power state -- sleep_ns.c routes Machine.sleep to the
+        # monitor -- so none of them has work to do here, and:
+        #  - low_power_reboot_check reads powman_hw->chip_reset before
+        #    main: POWMAN is Secure-only, so it bus-faults from NS (the
+        #    same failure as the double-tap constructor).
+        #  - low_power_cache_unpin references the __persistent_data_*
+        #    linker symbols, which the NS linker script does not define,
+        #    and would write XIP cache maintenance.
+        #  - rp2350_sleep_fix masks the whole NVIC and waits in WFI for a
+        #    dummy user IRQ after a watchdog reboot; if that IRQ is not
+        #    NS-pendable the image hangs before main.
+        # NO_INIT drops the function, SKIP_INIT drops its registration;
+        # the SDK wants both.
+        PICO_RUNTIME_NO_INIT_LOW_POWER_REBOOT_CHECK=1
+        PICO_RUNTIME_SKIP_INIT_LOW_POWER_REBOOT_CHECK=1
+        PICO_RUNTIME_NO_INIT_LOW_POWER_CACHE_UNPIN=1
+        PICO_RUNTIME_SKIP_INIT_LOW_POWER_CACHE_UNPIN=1
+        PICO_RUNTIME_NO_INIT_RP2350_SLEEP_FIX=1
+        PICO_RUNTIME_SKIP_INIT_RP2350_SLEEP_FIX=1
     )
 
     # Strong overrides for the __weak stages that must behave differently
