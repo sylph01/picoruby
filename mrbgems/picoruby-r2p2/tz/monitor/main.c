@@ -339,7 +339,7 @@ static void partition_configure(void) {
     accessctrl_hw->pio[2]     = AC_ALLOW_ALL;
     accessctrl_hw->io_bank[0] = AC_ALLOW_ALL;
     accessctrl_hw->pads_bank0 = AC_ALLOW_ALL;
-    accessctrl_hw->adc0       = AC_ALLOW_ALL;
+    accessctrl_hw->adc        = AC_ALLOW_ALL;  /* named adc0 before pico-sdk 2.3.0 */
     accessctrl_hw->hstx       = AC_ALLOW_ALL;
     accessctrl_hw->i2c[0]     = AC_ALLOW_ALL;
     accessctrl_hw->i2c[1]     = AC_ALLOW_ALL;
