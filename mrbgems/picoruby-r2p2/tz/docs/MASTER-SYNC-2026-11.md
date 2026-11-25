@@ -81,6 +81,7 @@ Toolchain: arm-none-eabi-gcc 14.2.1, pico-sdk 2.3.0, picotool 2.3.0.
 | `TZ.selftest` returns `true` | pass (2026-11-25) |
 | `__wfi` idle wakes under TZ (shell stays responsive) | shell and irb usable; not timed separately |
 | `Machine.sleep(deep: true, source: :timer, ms: 3000)` naps and wakes | pass (2026-11-25) |
+| Second boot of the same firmware skips the system-file refresh (flash filesystem writes under TZ landed) | pass (2026-11-25) |
 | Raise in `main_task` halts in `exit_ns.c` | **not yet run** |
 | Pico 2 W: WiFi join, socket round-trip, long-idle RX | **not yet run** (no W board at hand) |
 | esp32 port still builds | not checked (no toolchain) |
@@ -89,9 +90,10 @@ First boot after the reflash printed `Found: <path> ... CRC mismatch,
 Writing N bytes` for system files. That is `Shell.setup_system_executables`
 refreshing the executables stored on the flash filesystem because the
 firmware's `RUBY_DESCRIPTION` changed; it is stock master behavior and runs
-once per firmware change. A second boot of the same firmware should print
-none of it. If it does, a write failed and the filesystem path under TZ
-needs another look (`WIFI-UNDER-TZ-HANDOFF.md`, "Open bug 2").
+once per firmware change. A second boot of the same firmware printed none
+of it (checked 2026-11-25), so every write landed. Should the lines ever
+repeat on an unchanged firmware, a write failed and the filesystem path
+under TZ needs another look (`WIFI-UNDER-TZ-HANDOFF.md`, "Open bug 2").
 
 ## Open items
 
